@@ -13,8 +13,39 @@
 #include "imgui_test_engine/imgui_te_context.h"
 
 #include "filter.hpp"
+#include "remote_control.hpp"   // TCP control server under test (+ its rc_socket_t layer)
 #include <cmath>
+#include <mutex>
+#include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/time.h>           // timeval for SO_RCVTIMEO
+#endif
+
+// ---- Tiny loopback TCP client for the remote-control roundtrip test ---------
+// Uses the same rc_socket_t aliases as the server (Winsock on Windows, BSD
+// elsewhere). RemoteControl::start() has already done WSAStartup on Windows.
+static rc_socket_t rcTestConnect(int port) {
+    rc_socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == RC_INVALID) return RC_INVALID;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(0x7F000001);   // 127.0.0.1 (avoids inet_pton portability)
+    if (::connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) { rc_close(fd); return RC_INVALID; }
+#if defined(_WIN32)
+    DWORD tv = 2000;            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+    timeval tv{2, 0};          ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
+    return fd;
+}
+static void rcTestSend(rc_socket_t fd, const std::string& s) { ::send(fd, s.data(), (int)s.size(), 0); }
+static std::string rcTestRecv(rc_socket_t fd) {   // one reply burst (small, single loopback segment)
+    char buf[2048];
+    const int n = (int)::recv(fd, buf, (int)sizeof(buf), 0);
+    return (n > 0) ? std::string(buf, (std::size_t)n) : std::string();
+}
 
 void RegisterAppTests(ImGuiTestEngine* e) {
     ImGuiTest* t = nullptr;
@@ -46,6 +77,70 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         std::vector<float> din(N, 500.0f), dout(N);
         hp2.process(din.data(), dout.data(), (std::size_t)N);
         IM_CHECK_LT(std::fabs((double)dout[N - 1]), 1.0);
+    };
+
+    // Remote-control server roundtrip: start the TCP server, drive it from a
+    // loopback client, and assert both the text replies AND the RemoteState the
+    // server hands back to the main loop. No UI — exercises the real socket path
+    // (Winsock on Windows CI, BSD sockets elsewhere). See remote_control.hpp.
+    t = IM_REGISTER_TEST(e, "remote", "roundtrip");
+    t->TestFunc = [](ImGuiTestContext*) {
+        RemoteState st;
+        st.statusText  = "recording=false file=x.xdf seconds=0.0 streams=0 bytes=0";
+        st.streamsText = "mock-eeg | MockEEG | EEG | 8ch | 500\n"
+                         "mock-acc | MockAcc | ACC | 3ch | 100\n";
+        RemoteControl rc;
+        const int port = 22456;                 // SO_REUSEADDR set, so re-runs rebind fine
+        IM_CHECK(rc.start(port, &st));
+        if (!rc.listening()) return;            // bind failed (port busy?) — don't hang
+
+        rc_socket_t fd = rcTestConnect(port);
+        IM_CHECK(fd != RC_INVALID);
+        if (fd == RC_INVALID) { rc.stop(); return; }
+
+        IM_CHECK(rcTestRecv(fd).find("remote control") != std::string::npos);   // hello banner
+
+        rcTestSend(fd, "status\n");
+        IM_CHECK(rcTestRecv(fd).find("recording=false") != std::string::npos);
+
+        rcTestSend(fd, "streams\n");
+        const std::string streams = rcTestRecv(fd);
+        IM_CHECK(streams.find("mock-eeg") != std::string::npos);
+        IM_CHECK(streams.find("mock-acc") != std::string::npos);
+
+        // `select <key>` must mutate RemoteState.setSelection (set under st.mtx by
+        // the server thread; the reply is sent after, so it's visible once we read it).
+        rcTestSend(fd, "select mock-eeg\n");
+        IM_CHECK(rcTestRecv(fd).find("ok") != std::string::npos);
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            IM_CHECK(st.setSelection.has_value());
+            IM_CHECK(st.setSelection->size() == 1);
+            IM_CHECK_STR_EQ(st.setSelection->front().c_str(), "mock-eeg");
+        }
+
+        rcTestSend(fd, "start /tmp/rc_unit.xdf\n");
+        IM_CHECK(rcTestRecv(fd).find("starting") != std::string::npos);
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            IM_CHECK(st.startReq);
+            IM_CHECK(st.setFilename.has_value());
+            IM_CHECK_STR_EQ(st.setFilename->c_str(), "/tmp/rc_unit.xdf");
+        }
+
+        rcTestSend(fd, "stop\n");
+        IM_CHECK(rcTestRecv(fd).find("stopping") != std::string::npos);
+        { std::lock_guard<std::mutex> lk(st.mtx); IM_CHECK(st.stopReq); }
+
+        rcTestSend(fd, "frobnicate\n");        // unknown -> error, connection stays open
+        IM_CHECK(rcTestRecv(fd).find("error") != std::string::npos);
+
+        rcTestSend(fd, "quit\n");
+        IM_CHECK(rcTestRecv(fd).find("bye") != std::string::npos);
+        rc_close(fd);
+
+        rc.stop();                              // joins the server thread cleanly
+        IM_CHECK(!rc.listening());
     };
 
     // Performance overlay (off by default; shown via View menu) exposes VSync.
