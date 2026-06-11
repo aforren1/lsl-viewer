@@ -90,3 +90,10 @@ static Windows build is a genuinely standalone `lsl_viewer.exe`.
 On Linux the GPU driver and glibc stay dynamic regardless (SDL loads the Vulkan
 loader at runtime), so static linking buys less there — prefer an AppImage for
 distribution. The graphics driver is always a system component on both platforms.
+
+**Link-time optimization** is enabled automatically for `Release` builds (but not
+the test build or the default `RelWithDebInfo` dev build, so iterative links stay
+fast). It mostly drops unreferenced ImGui/ImPlot code — measured **~45% smaller**
+on the static binary (~10 MB → ~5.6 MB stripped). Runtime is unchanged (the app is
+GPU-bound). No flag needed; it's on whenever `-DCMAKE_BUILD_TYPE=Release` and the
+compiler supports IPO.

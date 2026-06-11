@@ -187,3 +187,19 @@ if(LSL_TESTS)
   target_link_libraries(lsl_viewer PRIVATE imgui_te)
   target_compile_options(lsl_viewer PRIVATE -g)
 endif()
+
+# Link-time optimization for shipping builds — trims unreferenced library code
+# (measured ~45% smaller binary, mostly LTO dropping unused ImGui/ImPlot incl.
+# imgui_demo). Negligible runtime gain (the app is GPU-bound and the hot CPU code
+# is already header-only/single-TU). Enabled for Release, but NOT for the test
+# build (LSL_TESTS = the iteration loop) nor the default RelWithDebInfo dev build,
+# so iterative links stay fast.
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT LSL_TESTS)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg LANGUAGES CXX)  # project is CXX-only
+  if(_ipo_ok)
+    set_property(TARGET lsl_viewer ui PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  else()
+    message(STATUS "IPO/LTO not supported: ${_ipo_msg}")
+  endif()
+endif()
