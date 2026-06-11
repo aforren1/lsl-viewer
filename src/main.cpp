@@ -262,8 +262,9 @@ static constexpr ImU32 kDropoutRed = IM_COL32(200, 45, 45, 255);
 static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap) {
     const ImPlotRect lim = ImPlot::GetPlotLimits();
     std::vector<std::pair<double, double>> iv;
-    double prior = 0.0;
-    for (auto& g : s.gaps()) {
+    auto [base, gv] = s.gapSnapshot();    // {folded base offset, recent gaps}, one lock
+    double prior = base;
+    for (auto& g : gv) {
         const double a = g.first + prior;
         prior += g.second;
         iv.push_back({a, a + g.second + extraEnd});   // recorded gap (display time)
@@ -1213,10 +1214,17 @@ int main(int argc, char** argv) {
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_P)) paused = !paused;
 
             const ImGuiViewport* vp = ImGui::GetMainViewport();
-            auto found = discovery.snapshot();
-            found.erase(std::remove_if(found.begin(), found.end(),       // hide our own RC beacon
-                [](lsl::stream_info& i) { return i.source_id().rfind("lsl-viewer-rc", 0) == 0; }),
-                found.end());
+            // discovery.snapshot() deep-copies every resolved stream_info (XML included);
+            // the set changes slowly, so refresh at ~4 Hz and reuse the cache otherwise.
+            static std::vector<lsl::stream_info> found;
+            static double lastDiscovery = -1e18;
+            if (ImGui::GetTime() - lastDiscovery > 0.25) {
+                lastDiscovery = ImGui::GetTime();
+                found = discovery.snapshot();
+                found.erase(std::remove_if(found.begin(), found.end(),   // hide our own RC beacon
+                    [](lsl::stream_info& i) { return i.source_id().rfind("lsl-viewer-rc", 0) == 0; }),
+                    found.end());
+            }
             if (autoConnect) {
                 for (auto& info : found) {
                     if (dismissed.count(streamKey(info))) continue;   // user disconnected it
@@ -1282,30 +1290,36 @@ int main(int argc, char** argv) {
             // ---- Remote control: publish state, apply requests ----------
             if (remote.listening()) {
                 std::lock_guard<std::mutex> lk(rcState.mtx);
-                std::string s;
-                for (auto& info : found) {
-                    char ln[320];
-                    const double sr = info.nominal_srate();
-                    std::snprintf(ln, sizeof(ln), "%s | %s | %s | %dch | %s%s\n",
-                                  streamKey(info).c_str(), info.name().c_str(), info.type().c_str(),
-                                  info.channel_count(),
-                                  sr > 0 ? std::to_string((int)sr).c_str() : "irregular",
-                                  connected(info) ? "  [rec]" : "");
-                    s += ln;
+                // Publish state at ~4 Hz (clients poll; rebuilding these strings every
+                // frame is the costly part). Requests below are still applied per frame.
+                static double lastPublish = -1e18;
+                if (ImGui::GetTime() - lastPublish > 0.25) {
+                    lastPublish = ImGui::GetTime();
+                    std::string s;
+                    for (auto& info : found) {
+                        char ln[320];
+                        const double sr = info.nominal_srate();
+                        std::snprintf(ln, sizeof(ln), "%s | %s | %s | %dch | %s%s\n",
+                                      streamKey(info).c_str(), info.name().c_str(), info.type().c_str(),
+                                      info.channel_count(),
+                                      sr > 0 ? std::to_string((int)sr).c_str() : "irregular",
+                                      connected(info) ? "  [rec]" : "");
+                        s += ln;
+                    }
+                    rcState.streamsText = s;
+                    const std::string fnow = recorder.active() ? recorder.path() : recFullPath();
+                    char st[420];
+                    std::snprintf(st, sizeof(st),
+                                  "recording=%s file=%s seconds=%.1f streams=%d bytes=%llu",
+                                  recorder.active() ? "true" : "false", fnow.c_str(), recorder.seconds(),
+                                  recorder.streams(), (unsigned long long)recorder.bytes());
+                    rcState.statusText = st;
+                    rcState.selectedText = [&]{
+                        std::string j;
+                        for (auto& info : found) if (connected(info)) j += streamKey(info) + " ";
+                        return j.empty() ? std::string("none") : j;
+                    }();
                 }
-                rcState.streamsText = s;
-                const std::string fnow = recorder.active() ? recorder.path() : recFullPath();
-                char st[420];
-                std::snprintf(st, sizeof(st),
-                              "recording=%s file=%s seconds=%.1f streams=%d bytes=%llu",
-                              recorder.active() ? "true" : "false", fnow.c_str(), recorder.seconds(),
-                              recorder.streams(), (unsigned long long)recorder.bytes());
-                rcState.statusText = st;
-                rcState.selectedText = [&]{
-                    std::string j;
-                    for (auto& info : found) if (connected(info)) j += streamKey(info) + " ";
-                    return j.empty() ? std::string("none") : j;
-                }();
                 if (rcState.setFilename) {
                     std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", rcState.setFilename->c_str());
                     ImGui::MarkIniSettingsDirty();
@@ -1421,7 +1435,12 @@ int main(int argc, char** argv) {
                         ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
                         ImGui::TreePop();
                     }
-                    ImGui::TextDisabled("-> %s", recFullPath().c_str());
+                    // Preview path: recFullPath() does strftime + template substitution;
+                    // refresh it at ~4 Hz instead of every frame (it's just a label).
+                    static std::string recPreview;
+                    static double recPreviewAt = -1e18;
+                    if (ImGui::GetTime() - recPreviewAt > 0.25) { recPreviewAt = ImGui::GetTime(); recPreview = recFullPath(); }
+                    ImGui::TextDisabled("-> %s", recPreview.c_str());
                     ImGui::BeginDisabled(nConn == 0);
                     if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
                     ImGui::EndDisabled();

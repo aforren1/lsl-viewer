@@ -144,15 +144,15 @@ public:
     // honest so a stream that was down shows a gap rather than collapsing.
     double realTime(double oldT) const {
         std::lock_guard<std::mutex> lk(gapMtx_);
-        double off = 0.0;
+        double off = gapBase_;   // gaps pruned from the list contribute a constant base
         for (auto& g : gaps_) if (g.first <= oldT) off += g.second;
         return oldT + off;
     }
     // In-place old-frame -> real time for a monotonically increasing array.
     void applyGaps(float* x, int n) const {
         std::lock_guard<std::mutex> lk(gapMtx_);
-        if (gaps_.empty()) return;
-        double off = 0.0; std::size_t gi = 0;
+        double off = gapBase_; std::size_t gi = 0;
+        if (gaps_.empty() && off == 0.0) return;
         for (int i = 0; i < n; ++i) {
             while (gi < gaps_.size() && gaps_[gi].first <= (double)x[i]) { off += gaps_[gi].second; ++gi; }
             x[i] = (float)((double)x[i] + off);
@@ -162,6 +162,12 @@ public:
     std::vector<std::pair<double, double>> gaps() const {
         std::lock_guard<std::mutex> lk(gapMtx_);
         return gaps_;
+    }
+    // Consistent (folded-base offset, recent gaps) for display positioning — taken
+    // under one lock so a concurrent prune can't double-count a just-folded gap.
+    std::pair<double, std::vector<std::pair<double, double>>> gapSnapshot() const {
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        return {gapBase_, gaps_};
     }
     float hpR() const { return hpR_.load(std::memory_order_relaxed); }  // for on-the-fly filtering
 
@@ -242,6 +248,13 @@ private:
                                                  + (double)headBefore * dt_;
                             std::lock_guard<std::mutex> lk(gapMtx_);
                             gaps_.push_back({oldTime, g});
+                            // Fold gaps far older than any visible window into a constant
+                            // base (a gap offsets ALL later times), so the per-frame walk in
+                            // realTime/applyGaps stays bounded over an hours-long session.
+                            const double cutoff = oldTime - 120.0;   // > max history + ring reach
+                            std::size_t k = 0;
+                            while (k < gaps_.size() && gaps_[k].first < cutoff) gapBase_ += gaps_[k++].second;
+                            if (k > 0) gaps_.erase(gaps_.begin(), gaps_.begin() + k);
                         }
                     }
                     lastTs_ = ts[n - 1];
@@ -390,7 +403,8 @@ private:
     // Dropout tracking. gaps_ is producer-appended / render-read under gapMtx_;
     // lastTs_/lastTsValid_ are producer-only.
     mutable std::mutex                          gapMtx_;
-    std::vector<std::pair<double, double>>      gaps_;   // (old-frame time, seconds)
+    std::vector<std::pair<double, double>>      gaps_;   // (old-frame time, seconds), recent only
+    double                                      gapBase_ = 0.0;   // folded offset of pruned gaps
     double                                      lastTs_ = 0.0;
     bool                                        lastTsValid_ = false;
 

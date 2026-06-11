@@ -44,22 +44,29 @@ inline void varlen(std::ostream& o, std::uint64_t v) {
     else if (v <= 0xFFFFFFFF) { o.put(4); le(o, static_cast<std::uint32_t>(v)); }
     else                      { o.put(8); le(o, v); }
 }
-inline void fixlen4(std::ostream& o, std::uint32_t v) { o.put(4); le(o, v); }
-
-// Per-sample timestamp: 0 = deduced (reader interpolates), else 8 + double.
-inline void write_ts(std::ostream& o, double ts) {
-    if (ts == 0.0) o.put(0); else { o.put(8); le(o, ts); }
+// Append helpers for the hot Samples path: serialize into a reused std::vector<char>
+// (no ostringstream allocation, no .str() copy), then one bulk write to the file.
+template <typename T> inline void put_le(std::vector<char>& b, T v) {
+    const char* p = reinterpret_cast<const char*>(&v);   // little-endian host (asserted above)
+    b.insert(b.end(), p, p + sizeof(T));
 }
-
-template <class T>
-inline const T* write_vals(std::ostream& o, const T* s, std::size_t n) {
-    o.write(reinterpret_cast<const char*>(s), n * sizeof(T));
+inline void put_varlen(std::vector<char>& b, std::uint64_t v) {
+    if (v < 256)              { b.push_back(1); b.push_back(static_cast<char>(static_cast<std::uint8_t>(v))); }
+    else if (v <= 0xFFFFFFFF) { b.push_back(4); put_le(b, static_cast<std::uint32_t>(v)); }
+    else                      { b.push_back(8); put_le(b, v); }
+}
+inline void put_ts(std::vector<char>& b, double ts) {
+    if (ts == 0.0) b.push_back(0); else { b.push_back(8); put_le(b, ts); }
+}
+template <class T> inline const T* put_vals(std::vector<char>& b, const T* s, std::size_t n) {
+    const char* p = reinterpret_cast<const char*>(s);
+    b.insert(b.end(), p, p + n * sizeof(T));
     return s + n;
 }
-inline const std::string* write_vals(std::ostream& o, const std::string* s, std::size_t n) {
+inline const std::string* put_vals(std::vector<char>& b, const std::string* s, std::size_t n) {
     for (const std::string* end = s + n; s < end; ++s) {
-        varlen(o, s->size());
-        o.write(s->data(), static_cast<std::streamsize>(s->size()));
+        put_varlen(b, s->size());
+        b.insert(b.end(), s->data(), s->data() + s->size());
     }
     return s;
 }
@@ -94,20 +101,24 @@ public:
     }
 
     // One Samples chunk: nsamp samples of nchan values of type T, with timestamps.
+    // Serialized into a per-thread reused buffer (each recording thread owns one),
+    // then written under the lock in a single bulk write — was an ostringstream plus
+    // a .str() copy per chunk (~3x the bytes moved, +allocator churn at MB/s rates).
     template <class T>
     void data_chunk(streamid_t id, const std::vector<double>& ts,
                     const T* data, std::uint32_t nsamp, std::uint32_t nchan) {
         if (nsamp == 0) return;
-        std::ostringstream out;
-        fixlen4(out, nsamp);                         // sample count
+        static thread_local std::vector<char> b;     // reused; one buffer per recording thread
+        b.clear();
+        b.push_back(4); put_le(b, nsamp);            // fixlen4: sample count
         const T* p = data;
         for (std::uint32_t i = 0; i < nsamp; ++i) {
-            write_ts(out, i < ts.size() ? ts[i] : 0.0);
-            p = write_vals(out, p, nchan);
+            put_ts(b, i < ts.size() ? ts[i] : 0.0);
+            p = put_vals(b, p, nchan);
         }
-        const std::string s = out.str();
         lock l(m_);
-        chunk(tag::samples, s, &id);
+        chunk_header(tag::samples, b.size(), &id);
+        f_.write(b.data(), static_cast<std::streamsize>(b.size()));
     }
 
     std::uint64_t bytes() { lock l(m_); return static_cast<std::uint64_t>(f_.tellp()); }
