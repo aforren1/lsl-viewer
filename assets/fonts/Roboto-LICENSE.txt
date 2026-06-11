@@ -1,0 +1,10 @@
+Roboto-Regular.ttf
+Copyright 2011 Google Inc. All Rights Reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0.
+Full text: https://www.apache.org/licenses/LICENSE-2.0
+
+Source: https://github.com/googlefonts/roboto (also bundled by Tracy, from which
+this copy was taken). Embedded in the viewer as src/roboto_font.h (compressed via
+Dear ImGui's binary_to_compressed_c). The .ttf here is the source for that header.

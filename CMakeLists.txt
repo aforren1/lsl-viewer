@@ -12,6 +12,22 @@ endif()
 
 option(LSL_TRACY "Enable the Tracy frame profiler" OFF)
 option(LSL_TESTS "Build with the Dear ImGui Test Engine and UI tests" OFF)
+option(LSL_STATIC "Static-link SDL3 + liblsl (+ static MSVC CRT) into one self-contained binary" OFF)
+
+# Static linking: fold SDL3 and liblsl into the executable so distribution is a
+# single file (no SDL3.dll/lsl.dll alongside; on Windows also no VC++ redist).
+# SDL aliases SDL3::SDL3 -> the static target when only static is built, and
+# liblsl's `lsl` target keeps its name + propagates LIBLSL_STATIC (PUBLIC), so the
+# link/compile lines below are unchanged. Mostly a Windows convenience; on Linux
+# the GPU driver / glibc stay dynamic regardless, so prefer AppImage for shipping.
+if(LSL_STATIC)
+  set(SDL_STATIC       ON  CACHE BOOL "" FORCE)
+  set(SDL_SHARED       OFF CACHE BOOL "" FORCE)
+  set(LSL_BUILD_STATIC ON  CACHE BOOL "" FORCE)
+  if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
+endif()
 
 include(FetchContent)
 
@@ -139,17 +155,20 @@ if(WIN32)
   # VirtualAlloc2 / MapViewOfFile3 (magic_ring_buffer.hpp) live in onecore.lib
   target_link_libraries(lsl_viewer PRIVATE onecore)
   # SDL3.dll / lsl.dll are built in _deps subdirs; copy them next to the exe.
-  add_custom_command(TARGET lsl_viewer POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:lsl_viewer> $<TARGET_FILE_DIR:lsl_viewer>
-    COMMAND_EXPAND_LISTS)
+  # (No-op when LSL_STATIC: there are no runtime DLLs to copy.)
+  if(NOT LSL_STATIC)
+    add_custom_command(TARGET lsl_viewer POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_RUNTIME_DLLS:lsl_viewer> $<TARGET_FILE_DIR:lsl_viewer>
+      COMMAND_EXPAND_LISTS)
+  endif()
 endif()
 
 # Headless XDF recorder CLI (no GUI deps) — same Recorder/xdf_writer as the viewer.
 add_executable(xdf_record tools/xdf_record.cpp)
 target_include_directories(xdf_record PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(xdf_record PRIVATE lsl spdlog::spdlog)
-if(WIN32)
+if(WIN32 AND NOT LSL_STATIC)
   add_custom_command(TARGET xdf_record POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:xdf_record> $<TARGET_FILE_DIR:xdf_record>

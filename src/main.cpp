@@ -33,6 +33,7 @@
 #include <set>
 #include "fft.hpp"
 #include "profiler.hpp"
+#include "roboto_font.h"   // embedded UI font (Roboto-Regular, Apache-2.0)
 
 #include <spdlog/spdlog.h>
 #include <spdlog/cfg/env.h>     // SPDLOG_LEVEL env var
@@ -223,6 +224,7 @@ struct DisplayOpts {
     bool overlayMarkers = false;           // master marker-overlay toggle for this plot (off by default)
     std::unordered_map<std::string, bool> markerOn;  // per-stream (id -> show; absent = on)
     bool cfgShown = true;                  // show the left config strip (else plot is full-width)
+    float lastPlotPx = 0.0f;               // last frame's plot width (px) — for edge pixel-snapping
 };
 
 // Stable per-channel color (by absolute channel index, so a channel keeps its
@@ -550,13 +552,22 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         return vis;
     };
 
+    // Pixel-snap the scrolling right edge (using last frame's plot width) so the
+    // trace, gridlines, and time-axis labels travel in whole-pixel steps instead
+    // of shimmering by a sub-pixel each frame as they scroll.
+    double xedge = edge;
+    if (followX && o.lastPlotPx > 1.0f && o.history > 0.0f) {
+        const double secPerPx = (double)o.history / (double)o.lastPlotPx;
+        xedge = std::round(edge / secPerPx) * secPerPx;
+    }
+
     // ---- Stacked montage: one lane per visible channel, gain-scaled ----------
     if (o.stacked) {
         if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
             if (followX)
-                ImPlot::SetupAxisLimits(ImAxis_X1, edge - o.history, edge, ImPlotCond_Always);
+                ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, -0.6, (double)show - 0.4, ImPlotCond_Always);
 
             // Y ticks at lane centers labelled with channel names (top = first
@@ -577,6 +588,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImPlot::SetupAxisTicks(ImAxis_Y1, sc.tvals.data(), show, sc.tlabs.data());
 
             const int    px     = std::max(64, (int)ImPlot::GetPlotSize().x);
+            o.lastPlotPx = ImPlot::GetPlotSize().x;   // for next frame's edge snap
             const bool   useEnv = windowSamples > 3.0 * (double)px;   // min/max band once samples overlap (>3/px)
             const float  inv    = (o.gainUv > 0.0f) ? 1.0f / o.gainUv : 0.0f;
             const std::size_t bins = envelopeBins();
@@ -634,9 +646,10 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImPlot::SetupAxes("time (s)", streamUnit,
                           ImPlotAxisFlags_None, ImPlotAxisFlags_AutoFit);
         if (followX)
-            ImPlot::SetupAxisLimits(ImAxis_X1, edge - o.history, edge, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
 
         const int    px     = std::max(64, (int)ImPlot::GetPlotSize().x);
+        o.lastPlotPx = ImPlot::GetPlotSize().x;   // for next frame's edge snap
         const bool   useEnv = windowSamples > 3.0 * (double)px;   // min/max band once samples overlap (>3/px)
         const std::size_t bins = envelopeBins();
 
@@ -972,28 +985,19 @@ int main(int argc, char** argv) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;  // drag windows together to dock
 
-    // Nicer font: a real TTF (good glyph coverage, e.g. ⚠ · →) rasterized at the
-    // framebuffer pixel size for crisp HiDPI text, drawn at logical size via
-    // FontGlobalScale. Falls back to the built-in font if no TTF is found.
+    // Embedded Roboto-Regular (the face Tracy uses) rasterized at the framebuffer
+    // pixel size for crisp HiDPI text, then drawn at logical size via
+    // FontGlobalScale. Embedding (vs a system font path) keeps text identical on
+    // every platform — and works in a static single-file build with no assets.
     {
         int lw = 0, lh = 0, pw = 0, ph = 0;
         SDL_GetWindowSize(window, &lw, &lh);
         SDL_GetWindowSizeInPixels(window, &pw, &ph);
         const float fb = (lw > 0) ? (float)pw / (float)lw : 1.0f;
         ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 1;
-        const char* candidates[] = {
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/mnt/c/Windows/Fonts/segoeui.ttf",
-            "/Library/Fonts/Arial.ttf",
-        };
-        bool got = false;
-        for (const char* fp : candidates) {
-            if (FILE* f = std::fopen(fp, "rb")) { std::fclose(f); }
-            else continue;                       // skip missing paths (TTF loader asserts)
-            if (io.Fonts->AddFontFromFileTTF(fp, 16.0f * fb, &cfg)) { got = true; break; }
-        }
-        if (!got) io.Fonts->AddFontDefault();
+        io.Fonts->AddFontFromMemoryCompressedTTF(
+            RobotoRegular_compressed_data, RobotoRegular_compressed_size,
+            std::round(15.0f * fb), &cfg);
         io.FontGlobalScale = 1.0f / fb;
     }
     // Persist theme + recording path in imgui.ini (handler must be added before the
@@ -1020,6 +1024,8 @@ int main(int argc, char** argv) {
 
 #ifdef LSL_TESTS
     const bool runTests = (argc > 1 && std::strcmp(argv[1], "--tests") == 0);
+    // Optional filter: `--tests <query>` runs only matching tests (e.g. "ui/capture_*").
+    const char* testFilter = (runTests && argc > 2) ? argv[2] : nullptr;
     ImGuiTestEngine* engine = ImGuiTestEngine_CreateContext();
     ImGuiTestEngineIO& tio = ImGuiTestEngine_GetIO(engine);
     tio.ConfigVerboseLevel        = ImGuiTestVerboseLevel_Info;
@@ -1031,7 +1037,7 @@ int main(int argc, char** argv) {
     ImGuiTestEngine_InstallDefaultCrashHandler();
     RegisterAppTests(engine);
     if (runTests)
-        ImGuiTestEngine_QueueTests(engine, ImGuiTestGroup_Tests, nullptr,
+        ImGuiTestEngine_QueueTests(engine, ImGuiTestGroup_Tests, testFilter,
                                    ImGuiTestRunFlags_RunFromCommandLine);
 
     const SDL_GPUTextureFormat swapFmt = SDL_GetGPUSwapchainTextureFormat(gpu, window);
@@ -1094,6 +1100,9 @@ int main(int argc, char** argv) {
     bool showMetrics  = false;   // ImGui metrics/debugger (Debug menu) — vertex counts, draw calls
     // one-shot "raise this window to the front" requests, set from the menu
     bool focusSpectrum = false, focusMetrics = false;
+    // one-shot: a new analysis window was just opened — ensure a bottom dock row
+    // exists for it (ImGui prunes the row once its last window closes).
+    bool wantBottom = false;
     bool paused       = false;   // freeze the scrolling plots (App menu / P)
     bool pausedPrev   = false;
 
@@ -1161,18 +1170,20 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginMenu("View")) {
                     // These toggle visibility, but a click also raises the window so it
                     // can't stay buried behind a stream plot.
-                    if (ImGui::MenuItem("Spectrum", nullptr, showSpectrum))    { showSpectrum = true; focusSpectrum = true; }
+                    if (ImGui::MenuItem("Spectrum", nullptr, showSpectrum))    { showSpectrum = true; focusSpectrum = true; wantBottom = true; }
                     if (ImGui::MenuItem("New spectrogram")) {
                         auto s = std::make_unique<Spectro>(); s->id = nextSpectroId++; spectros.push_back(std::move(s));
+                        wantBottom = true;
                     }
                     if (ImGui::MenuItem("New ERP (marker average)")) {
                         auto e = std::make_unique<Erp>(); e->id = nextErpId++; erps.push_back(std::move(e));
+                        wantBottom = true;
                     }
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("Debug")) {
                     ImGui::MenuItem("Performance", nullptr, &showPerf);   // a section in the Streams rail
-                    if (ImGui::MenuItem("Metrics (ImGui)", nullptr, showMetrics)) { showMetrics = true; focusMetrics = true; }
+                    if (ImGui::MenuItem("Metrics (ImGui)", nullptr, showMetrics)) { showMetrics = true; focusMetrics = true; wantBottom = true; }
                     ImGui::Separator();
                     ImGui::TextDisabled("GPU backend: %s", SDL_GetGPUDeviceDriver(gpu));
                     ImGui::EndMenu();
@@ -1333,18 +1344,32 @@ int main(int argc, char** argv) {
                         ImGui::DockBuilderFinish(dockId);
                     }
                 }
-                ImGui::DockSpace(dockId);
-                // Resolve the central + bottom node ids each frame (works across runs):
-                // the central node is queryable; the bottom row is its sibling.
-                if (ImGuiDockNode* c = ImGui::DockBuilderGetCentralNode(dockId)) {
-                    dockCenter = c->ID;
-                    if (ImGuiDockNode* p = c->ParentNode) {
-                        ImGuiDockNode* other = (p->ChildNodes[0] == c) ? p->ChildNodes[1] : p->ChildNodes[0];
-                        if (other) dockBottom = other->ID;
+                // Resolve the central + bottom node ids (works across runs): the
+                // central node is always queryable; the bottom analysis row is its
+                // sibling. ImGui prunes the bottom node once its last window closes,
+                // so when a NEW analysis window is being opened with no row present,
+                // re-split one off the central node — otherwise it falls back to the
+                // central area and the window opens up top with the time series.
+                auto resolveNodes = [&]() {
+                    dockCenter = dockBottom = 0;
+                    if (ImGuiDockNode* c = ImGui::DockBuilderGetCentralNode(dockId)) {
+                        dockCenter = c->ID;
+                        if (ImGuiDockNode* p = c->ParentNode) {
+                            ImGuiDockNode* o = (p->ChildNodes[0] == c) ? p->ChildNodes[1] : p->ChildNodes[0];
+                            if (o) dockBottom = o->ID;
+                        }
                     }
+                };
+                resolveNodes();
+                if (wantBottom && dockBottom == 0 && dockCenter != 0) {
+                    ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Down, 0.32f,
+                                                &dockBottom, &dockCenter);
+                    ImGui::DockBuilderFinish(dockId);
                 }
+                wantBottom = false;
                 if (dockCenter == 0) dockCenter = dockId;
                 if (dockBottom == 0) dockBottom = dockId;
+                ImGui::DockSpace(dockId);
                 ImGui::End();
             }
             // Streams: a fixed left rail, deliberately NOT part of the docking system.

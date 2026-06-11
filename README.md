@@ -59,8 +59,9 @@ uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers
 
 | Flag | Effect |
 |------|--------|
-| `-DLSL_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests` |
+| `-DLSL_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]` |
 | `-DLSL_TRACY=ON`  | enable the Tracy frame profiler (connect the Tracy server to view) |
+| `-DLSL_STATIC=ON` | static-link SDL3 + liblsl into one self-contained binary (see below) |
 
 ### Windows
 
@@ -69,3 +70,23 @@ artifacts are platform-specific. Copy the **source** (not `build*/` or `.venv/`)
 to a native Windows path, install Visual Studio 2022 + CMake ≥ 3.23, then run the
 same `cmake` configure/build (drop the Linux-only `-DSDL_X11=OFF`). `run.sh` and
 the Wayland environment are not needed — just launch `lsl_viewer.exe`.
+
+### Static build (single-file distribution)
+
+`-DLSL_STATIC=ON` folds SDL3 and liblsl into the executable so there's nothing to
+ship alongside it:
+
+```bash
+cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON
+cmake --build build-static
+```
+
+This is primarily a **Windows** convenience: the default (dynamic) build drops
+`SDL3.dll`/`lsl.dll` next to the exe, whereas the static build needs none — and it
+also switches the MSVC C runtime to static (`/MT`), so the target machine doesn't
+need the Visual C++ redistributable. The UI font is embedded either way, so a
+static Windows build is a genuinely standalone `lsl_viewer.exe`.
+
+On Linux the GPU driver and glibc stay dynamic regardless (SDL loads the Vulkan
+loader at runtime), so static linking buys less there — prefer an AppImage for
+distribution. The graphics driver is always a system component on both platforms.
