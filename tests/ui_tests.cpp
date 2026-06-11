@@ -22,6 +22,9 @@
 #if !defined(_WIN32)
 #include <sys/time.h>           // timeval for SO_RCVTIMEO
 #endif
+#ifdef Yield
+#undef Yield                    // winbase.h macro (via winsock2.h) vs ImGuiTestContext::Yield
+#endif
 
 // ---- Tiny loopback TCP client for the remote-control roundtrip test ---------
 // Uses the same rc_socket_t aliases as the server (Winsock on Windows, BSD
