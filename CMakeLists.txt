@@ -135,11 +135,26 @@ endif()
 add_executable(lsl_viewer src/main.cpp)
 target_include_directories(lsl_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lsl_viewer PRIVATE ui SDL3::SDL3 lsl spdlog::spdlog)
+if(WIN32)
+  # VirtualAlloc2 / MapViewOfFile3 (magic_ring_buffer.hpp) live in onecore.lib
+  target_link_libraries(lsl_viewer PRIVATE onecore)
+  # SDL3.dll / lsl.dll are built in _deps subdirs; copy them next to the exe.
+  add_custom_command(TARGET lsl_viewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:lsl_viewer> $<TARGET_FILE_DIR:lsl_viewer>
+    COMMAND_EXPAND_LISTS)
+endif()
 
 # Headless XDF recorder CLI (no GUI deps) — same Recorder/xdf_writer as the viewer.
 add_executable(xdf_record tools/xdf_record.cpp)
 target_include_directories(xdf_record PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(xdf_record PRIVATE lsl spdlog::spdlog)
+if(WIN32)
+  add_custom_command(TARGET xdf_record POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:xdf_record> $<TARGET_FILE_DIR:xdf_record>
+    COMMAND_EXPAND_LISTS)
+endif()
 
 if(LSL_TRACY)
   target_compile_definitions(lsl_viewer PRIVATE LSL_TRACY)

@@ -25,6 +25,12 @@
   #ifndef _WIN32_WINNT
     #define _WIN32_WINNT 0x0A00
   #endif
+  #ifndef NOMINMAX
+    #define NOMINMAX        // keep windows.h from defining min/max macros
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
   #include <windows.h>
   #include <memoryapi.h>
 #else

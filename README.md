@@ -47,10 +47,12 @@ cmake --build build
 ./build/lsl_viewer          # on WSL: use ./run.sh (sets the WSLg Wayland socket)
 ```
 
-Feed it test data (Python, in a venv with `pylsl numpy`):
+Feed it test data — the script carries inline metadata (PEP 723), so
+[uv](https://docs.astral.sh/uv/) resolves `pylsl`/`numpy` automatically
+(or run it with plain `python` in a venv that has them):
 
 ```bash
-python tools/lsl_test_streams.py --streams eeg,sine,chirp,markers
+uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers
 ```
 
 ### Optional CMake flags

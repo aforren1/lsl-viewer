@@ -39,6 +39,13 @@ Stop with Ctrl+C.
 
 Requires: pylsl, numpy.
 """
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "pylsl",
+#     "numpy",
+# ]
+# ///
 
 import argparse
 import random
