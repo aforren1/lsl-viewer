@@ -1277,6 +1277,27 @@ int main(int argc, char** argv) {
                 for (auto& m : markerSources) if (sameStream(*m, info)) return true;
                 return false;
             };
+            // Connect / disconnect a stream — the same actions as clicking a row, used by
+            // the remote `select` command (recording captures whatever is connected).
+            auto connectStream = [&](lsl::stream_info& info) {
+                dismissed.erase(streamKey(info));
+                if (isMarkerStream(info)) {
+                    auto m = std::make_unique<MarkerSource>(info); m->start();
+                    markerSources.push_back(std::move(m));
+                } else {
+                    auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
+                    sources.push_back(std::move(s));
+                }
+            };
+            auto disconnectKey = [&](const std::string& key) {
+                dismissed.insert(key);   // and don't auto-reconnect
+                auto it = std::find_if(sources.begin(), sources.end(),
+                    [&](const std::unique_ptr<HfStreamSource>& p) { return streamKeyOf(*p) == key; });
+                if (it != sources.end()) {   // data stream: deferred reap (markers handled by the sweep below)
+                    edgeMap.erase(it->get()); pauseHead.erase(it->get()); dispOpts.erase(it->get());
+                    (*it)->requestStop(); closing.push_back(std::move(*it)); sources.erase(it);
+                }
+            };
             auto startRecording = [&]() {
                 std::vector<lsl::stream_info> rec;
                 for (auto& info : found) if (connected(info)) rec.push_back(info);
@@ -1331,8 +1352,22 @@ int main(int argc, char** argv) {
                     if (dst) std::snprintf(dst, 64, "%s", val.c_str());
                 }
                 rcState.setVars.clear();
-                // Record selection retired: recording follows the live connections.
-                if (rcState.setSelection) rcState.setSelection.reset();
+                // `select` now drives CONNECTIONS (recording captures all connected):
+                // "*" = connect all discovered, empty = disconnect all, else make the
+                // connected set exactly the given keys.
+                if (rcState.setSelection) {
+                    const auto& sel = *rcState.setSelection;
+                    const bool all = (sel.size() == 1 && sel[0] == "*");
+                    const std::set<std::string> want(sel.begin(), sel.end());
+                    for (auto& info : found) {
+                        const std::string key = streamKey(info);
+                        const bool shouldConn = all || want.count(key) != 0;
+                        const bool isConn = connected(info);
+                        if (shouldConn && !isConn)      connectStream(info);
+                        else if (!shouldConn && isConn) disconnectKey(key);
+                    }
+                    rcState.setSelection.reset();
+                }
                 if (rcState.stopReq)  { rcState.stopReq = false; if (recorder.active()) { recorder.stop(); spdlog::info("recording stopped (remote)"); } }
                 if (rcState.startReq) { rcState.startReq = false; if (!recorder.active()) startRecording(); }
             }

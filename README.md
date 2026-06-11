@@ -71,6 +71,9 @@ to a native Windows path, install Visual Studio 2022 + CMake ≥ 3.23, then run 
 same `cmake` configure/build (drop the Linux-only `-DSDL_X11=OFF`). `run.sh` and
 the Wayland environment are not needed — just launch `lsl_viewer.exe`.
 
+The remote-control TCP server uses Winsock on Windows; to verify that path at
+runtime see [docs/windows-remote-control-testing.md](docs/windows-remote-control-testing.md).
+
 ### Static build (single-file distribution)
 
 `-DLSL_STATIC=ON` folds SDL3 and liblsl into the executable so there's nothing to

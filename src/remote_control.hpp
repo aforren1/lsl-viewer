@@ -5,8 +5,8 @@
 //   help                      list commands
 //   status                    recording? + file/seconds/MB/streams
 //   streams                   one resolved stream per line: key | name | type | Nch | rate
-//   selected                  the keys currently chosen for recording (or "all")
-//   select all|none|k1,k2,..  choose which streams to record (keys from `streams`)
+//   selected                  the keys currently connected (= what gets recorded)
+//   select all|none|k1,k2,..  connect/disconnect streams (recording captures all connected)
 //   filename <path>           set the output .xdf path
 //   start [path]              begin recording (optional path)
 //   stop                      stop recording
@@ -186,13 +186,13 @@ private:
             reply(fd, st_->streamsText);
         } else if (v == "selected") {
             reply(fd, st_->selectedText + "\n");
-        } else if (v == "select") {
+        } else if (v == "select") {                 // connect/disconnect (recording = connected set)
             if (arg == "all") {
                 st_->setSelection = std::vector<std::string>{"*"};
-                reply(fd, "ok: selecting all\n");
+                reply(fd, "ok: connecting all\n");
             } else if (arg == "none") {
                 st_->setSelection = std::vector<std::string>{};
-                reply(fd, "ok: selecting none\n");
+                reply(fd, "ok: disconnecting all\n");
             } else {
                 const auto keys  = splitCsv(arg);
                 const auto avail = availKeys();      // from the published streams list
@@ -200,7 +200,7 @@ private:
                 for (const auto& k : keys)
                     ((std::find(avail.begin(), avail.end(), k) != avail.end()) ? matched : unknown) += k + " ";
                 st_->setSelection = keys;            // unknown keys simply won't match a stream
-                std::string r = "ok: matched " + (matched.empty() ? std::string("(none)") : matched);
+                std::string r = "ok: connecting " + (matched.empty() ? std::string("(none)") : matched);
                 if (!unknown.empty()) r += "; unknown: " + unknown;
                 reply(fd, r + "\n");
             }
