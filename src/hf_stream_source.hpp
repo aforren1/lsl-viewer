@@ -78,6 +78,8 @@ public:
         for (int c = 0; c < channels_; ++c)
             labels_[c] = "ch " + std::to_string(c);
         units_.assign(channels_, "");
+        labelsDefault_ = labels_;   // immutable snapshot used until metadata is parsed
+        unitsDefault_  = units_;
 
         chanGain_.assign(channels_, 1.0f);   // per-channel display gain (render-only)
         chanAmp_.assign(channels_, 0.0f);    // measured µV amplitude (render-only)
@@ -164,13 +166,16 @@ public:
     float hpR() const { return hpR_.load(std::memory_order_relaxed); }  // for on-the-fly filtering
 
     // Snapshot of channel labels / units (written once on connect, under a lock).
-    std::vector<std::string> labels() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return labels_;
+    // Channel labels/units are write-once: ctor defaults, finalized once by
+    // parseLabels just after connect. Once finalized they're immutable, so we hand
+    // out a lock-free const-ref — was a vector<string> copy under a mutex on EVERY
+    // call (per stream/spectrogram/ERP/Spectrum window, every frame). Before the
+    // metadata lands we return the immutable defaults snapshot.
+    const std::vector<std::string>& labels() const {
+        return metaReady_.load(std::memory_order_acquire) ? labels_ : labelsDefault_;
     }
-    std::vector<std::string> units() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return units_;
+    const std::vector<std::string>& units() const {
+        return metaReady_.load(std::memory_order_acquire) ? units_ : unitsDefault_;
     }
     std::string error() {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -336,6 +341,7 @@ private:
     }
 
     void parseLabels(lsl::stream_info full) {  // desc() is non-const in liblsl
+        if (metaReady_.load(std::memory_order_acquire)) return;  // finalize once (reconnect re-calls)
         lsl::xml_element ch = full.desc().child("channels").child("channel");
         std::vector<std::string> plabels, punits;
         for (; !ch.empty(); ch = ch.next_sibling("channel")) {
@@ -344,11 +350,14 @@ private:
             plabels.emplace_back(label ? label : "");
             punits.emplace_back(unit ? unit : "");
         }
-        std::lock_guard<std::mutex> lk(mtx_);
-        for (int c = 0; c < channels_ && c < (int)plabels.size(); ++c) {
-            if (!plabels[c].empty()) labels_[c] = plabels[c];
-            if (c < (int)punits.size() && !punits[c].empty()) units_[c] = punits[c];
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            for (int c = 0; c < channels_ && c < (int)plabels.size(); ++c) {
+                if (!plabels[c].empty()) labels_[c] = plabels[c];
+                if (c < (int)punits.size() && !punits[c].empty()) units_[c] = punits[c];
+            }
         }
+        metaReady_.store(true, std::memory_order_release);  // labels_/units_ now immutable
     }
 
     static constexpr double kMaxHistory   = 60.0;   // seconds buffers are sized for
@@ -388,8 +397,10 @@ private:
     std::jthread        worker_;
     std::atomic<bool>   finished_{false};   // worker has exited -> safe to reap (instant join)
 
-    std::mutex               mtx_;     // guards labels_, units_, error_
+    std::mutex               mtx_;     // guards labels_/units_ until metaReady_, and error_
     std::vector<std::string> labels_, units_;
+    std::vector<std::string> labelsDefault_, unitsDefault_;  // immutable pre-parse snapshot
+    std::atomic<bool>        metaReady_{false};   // labels_/units_ finalized -> lock-free ref
     std::string              error_;
 };
 
@@ -428,6 +439,22 @@ public:
         auto it = std::lower_bound(events_.begin(), events_.end(), tmin,
                                    [](const Event& e, double t) { return e.t < t; });
         return std::vector<Event>(it, events_.end());
+    }
+
+    // A cached, ~64 s-trimmed view rebuilt ONLY when a new event has arrived (events_
+    // grows monotonically); otherwise a lock + size check. The render thread reads it
+    // by const-ref every frame instead of copying every event (+ its std::string) per
+    // marker stream and per ERP. Main-thread only (cached_ isn't touched by worker).
+    const std::vector<Event>& cachedEvents() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (total_ != cachedSeen_) {   // total_ is monotonic (events_ is pruned, so size isn't)
+            cachedSeen_ = total_;
+            const double tmin = (events_.empty() ? 0.0 : events_.back().t) - 64.0;
+            auto it = std::lower_bound(events_.begin(), events_.end(), tmin,
+                                       [](const Event& e, double t) { return e.t < t; });
+            cached_.assign(it, events_.end());
+        }
+        return cached_;
     }
 
     // Recent rate (events/s over the last `window` s) — more useful than a raw count
@@ -493,6 +520,8 @@ private:
 
     mutable std::mutex  mtx_;            // guards events_, total_, error_
     std::vector<Event>  events_;
+    std::vector<Event>  cached_;         // render-thread snapshot (see cachedEvents)
+    std::size_t         cachedSeen_ = (std::size_t)-1;  // total_ when cached_ was built
     std::size_t         total_ = 0;     // lifetime count (events_ is pruned)
     std::string         error_;
     std::atomic<double> lastData_{0.0};

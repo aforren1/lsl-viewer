@@ -70,6 +70,19 @@ FetchContent_Declare(spdlog
   GIT_SHALLOW    TRUE
 )
 
+# --- KissFFT (real FFT for the Spectrum/Spectrogram PSD) --------------------
+# BSD-3-Clause (permissive, like the rest); float datatype, static, no tools/tests.
+set(KISSFFT_DATATYPE float        CACHE STRING "" FORCE)
+set(KISSFFT_STATIC    ON          CACHE BOOL   "" FORCE)
+set(KISSFFT_TEST      OFF         CACHE BOOL   "" FORCE)
+set(KISSFFT_TOOLS     OFF         CACHE BOOL   "" FORCE)
+set(KISSFFT_PKGCONFIG OFF         CACHE BOOL   "" FORCE)
+FetchContent_Declare(kissfft
+  GIT_REPOSITORY https://github.com/mborgerding/kissfft.git
+  GIT_TAG        131.1.0
+  GIT_SHALLOW    TRUE
+)
+
 # --- Tracy (optional frame profiler) ----------------------------------------
 if(LSL_TRACY)
   # On-demand: collect only while a profiler server is connected, so an
@@ -91,7 +104,7 @@ if(LSL_TESTS)
   )
 endif()
 
-FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog)
+FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog kissfft)
 if(LSL_TRACY)
   FetchContent_MakeAvailable(tracy)
 endif()
@@ -150,7 +163,7 @@ endif()
 
 add_executable(lsl_viewer src/main.cpp)
 target_include_directories(lsl_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(lsl_viewer PRIVATE ui SDL3::SDL3 lsl spdlog::spdlog)
+target_link_libraries(lsl_viewer PRIVATE ui SDL3::SDL3 lsl spdlog::spdlog kissfft::kissfft)
 if(WIN32)
   # VirtualAlloc2 / MapViewOfFile3 (magic_ring_buffer.hpp) live in onecore.lib;
   # ws2_32 = Winsock for the remote-control TCP server (remote_control.hpp).

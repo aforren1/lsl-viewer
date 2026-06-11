@@ -13,6 +13,7 @@
 #include "imgui_test_engine/imgui_te_context.h"
 
 #include "filter.hpp"
+#include "fft.hpp"               // Psd (KissFFT-backed) under test
 #include "remote_control.hpp"   // TCP control server under test (+ its rc_socket_t layer)
 #include <cmath>
 #include <mutex>
@@ -77,6 +78,26 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         std::vector<float> din(N, 500.0f), dout(N);
         hp2.process(din.data(), dout.data(), (std::size_t)N);
         IM_CHECK_LT(std::fabs((double)dout[N - 1]), 1.0);
+    };
+
+    // PSD correctness (KissFFT backend): a pure 40 Hz sine must peak in the 40 Hz
+    // bin and dwarf an off-tone bin. Guards the FFT scaling/packing. No UI.
+    t = IM_REGISTER_TEST(e, "fft", "psd_peak");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const float  fs = 500.0f, f0 = 40.0f;
+        const int    N  = 1024;
+        const double TWO_PI = 6.283185307179586;
+        Psd psd; psd.init(N, fs);
+        std::vector<float> sig(N);
+        for (int i = 0; i < N; ++i) sig[i] = std::sin((float)(TWO_PI * f0 * i / fs));
+        std::vector<float> out;
+        psd.compute(sig.data(), /*stride=*/1, out);
+        IM_CHECK_EQ((int)out.size(), N / 2 + 1);
+        int peak = 0;
+        for (int k = 1; k < (int)out.size(); ++k) if (out[k] > out[peak]) peak = k;
+        IM_CHECK_LT(std::fabs(psd.binHz(peak) - f0), fs / N + 1.0f);   // within a bin of 40 Hz
+        const int kFar = (int)(150.0f * N / fs);                       // a 150 Hz bin
+        IM_CHECK_GT(out[peak], 100.0f * out[kFar]);                    // tone dominates
     };
 
     // Remote-control server roundtrip: start the TCP server, drive it from a

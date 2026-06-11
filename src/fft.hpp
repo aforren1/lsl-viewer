@@ -1,22 +1,30 @@
 #pragma once
-// Self-contained power spectral density for the FFT view.
+// Power spectral density for the Spectrum / Spectrogram views.
 //
 // One-sided PSD of a strided channel: detrend (remove mean) -> Hann window ->
-// radix-2 FFT -> |X|^2 with Welch scaling. Self-contained (no dependency) and
-// plenty fast for a handful of channels at a few kHz; swap in pffft/KissFFT
-// later if many channels or a spectrogram need it. N must be a power of two.
+// real FFT -> |X|^2 with Welch scaling. Uses KissFFT (BSD-3) for the transform;
+// it was a hand-rolled radix-2 before. N must be even (we only use powers of two).
 
 #include <cmath>
 #include <cstddef>
 #include <numbers>
 #include <vector>
 
+#include <kiss_fftr.h>   // KISSFFT_DATATYPE=float -> kiss_fft_scalar is float
+
 class Psd {
 public:
+    Psd() = default;
+    ~Psd() { if (cfg_) kiss_fftr_free(cfg_); }
+    Psd(const Psd&) = delete;             // owns a malloc'd kiss config
+    Psd& operator=(const Psd&) = delete;
+
     void init(int N, float fs) {
         N_ = N; fs_ = fs;
-        re_.assign(N, 0.0f);
-        im_.assign(N, 0.0f);
+        if (cfg_) kiss_fftr_free(cfg_);
+        cfg_ = kiss_fftr_alloc(N, /*inverse=*/0, nullptr, nullptr);  // real -> complex
+        in_.assign(N, 0.0f);
+        spec_.assign(N / 2 + 1, {});
         win_.resize(N);
         winPow_ = 0.0f;
         for (int i = 0; i < N; ++i) {                 // Hann
@@ -33,18 +41,17 @@ public:
     // Most-recent N samples of one channel: src[i*stride], i in [0, N).
     // Writes bins() power values into out.
     void compute(const float* src, int stride, std::vector<float>& out) {
+        if (!cfg_) return;
         double mean = 0.0;
         for (int i = 0; i < N_; ++i) mean += src[(std::size_t)i * stride];
         mean /= N_;
-        for (int i = 0; i < N_; ++i) {
-            re_[i] = (float)(src[(std::size_t)i * stride] - mean) * win_[i];
-            im_[i] = 0.0f;
-        }
-        fft(re_, im_);
+        for (int i = 0; i < N_; ++i)
+            in_[i] = (float)(src[(std::size_t)i * stride] - mean) * win_[i];
+        kiss_fftr(cfg_, in_.data(), spec_.data());     // unnormalized, same convention as before
         out.resize(bins());
         const float norm = 2.0f / (fs_ * winPow_);     // Welch one-sided
         for (int k = 0; k < bins(); ++k) {
-            float p = (re_[k] * re_[k] + im_[k] * im_[k]) * norm;
+            float p = (spec_[k].r * spec_[k].r + spec_[k].i * spec_[k].i) * norm;
             if (k == 0 || k == N_ / 2) p *= 0.5f;       // DC/Nyquist not doubled
             out[k] = p;
         }
@@ -53,34 +60,9 @@ public:
 private:
     static constexpr float kPi = std::numbers::pi_v<float>;
 
-    // In-place iterative radix-2 Cooley-Tukey (incremental twiddles).
-    static void fft(std::vector<float>& re, std::vector<float>& im) {
-        const int n = (int)re.size();
-        for (int i = 1, j = 0; i < n; ++i) {            // bit reversal
-            int bit = n >> 1;
-            for (; j & bit; bit >>= 1) j ^= bit;
-            j ^= bit;
-            if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
-        }
-        for (int len = 2; len <= n; len <<= 1) {
-            const float ang = -2.0f * kPi / len;
-            const float wr = std::cos(ang), wi = std::sin(ang);
-            for (int i = 0; i < n; i += len) {
-                float cwr = 1.0f, cwi = 0.0f;
-                for (int k = 0; k < len / 2; ++k) {
-                    const int a = i + k, b = i + k + len / 2;
-                    const float vr = re[b] * cwr - im[b] * cwi;
-                    const float vi = re[b] * cwi + im[b] * cwr;
-                    re[b] = re[a] - vr; im[b] = im[a] - vi;
-                    re[a] += vr;        im[a] += vi;
-                    const float nwr = cwr * wr - cwi * wi;
-                    cwi = cwr * wi + cwi * wr; cwr = nwr;
-                }
-            }
-        }
-    }
-
     int   N_ = 0;
     float fs_ = 0.0f, winPow_ = 0.0f;
-    std::vector<float> re_, im_, win_;
+    kiss_fftr_cfg              cfg_ = nullptr;
+    std::vector<float>         in_, win_;
+    std::vector<kiss_fft_cpx>  spec_;
 };

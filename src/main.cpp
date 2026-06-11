@@ -198,7 +198,7 @@ struct MarkerStreamView {
     std::string                     id;       // sourceId (or uid) — stable toggle key
     std::string                     name;
     ImU32                           col;
-    std::vector<MarkerSource::Event> events;  // windowed, time-ordered
+    const std::vector<MarkerSource::Event>* events = nullptr;  // -> source's cached snapshot
 };
 
 // Reusable per-frame scratch so the plot path allocates nothing steady-state.
@@ -362,8 +362,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     }
 
     const int C = s.channels();
-    auto  labels = s.labels();
-    auto  units  = s.units();
+    const auto& labels = s.labels();   // lock-free ref (see HfStreamSource::labels)
+    const auto& units  = s.units();
     const char* streamUnit = "a.u.";           // representative unit for labels
     for (auto& u : units) if (!u.empty()) { streamUnit = u.c_str(); break; }
     if ((int)o.visible.size() != C) {          // default: first 16 channels visible
@@ -467,14 +467,14 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::EndDisabled();
     }
     // Merge the enabled streams' events into one time-sorted list for decluttered
-    // drawing (strings stay owned by markerViews, which outlives this call).
+    // drawing (mv.events points into the MarkerSource's cache, which outlives this call).
     sc.markers.clear();
     if (o.overlayMarkers) {
         for (std::size_t vi = 0; vi < markerViews.size(); ++vi) {
             const auto& mv = markerViews[vi];
             const bool on = o.markerOn.count(mv.id) ? o.markerOn[mv.id] : true;
             if (!on) continue;
-            for (const auto& e : mv.events)            // stable row from event seq (+stream offset)
+            for (const auto& e : *mv.events)           // stable row from event seq (+stream offset)
                 sc.markers.push_back({e.t, &e.text, mv.col, (int)((e.seq + vi) % kMarkerRows)});
         }
         std::sort(sc.markers.begin(), sc.markers.end(),
@@ -704,9 +704,11 @@ struct Spectro {
     int                cols      = 240;
     std::string        uid;                     // stream-change detection
     int                freqBins  = 0;
-    std::vector<float> data;     // freqBins*cols, row-major (row 0 = top = Nyquist)
+    std::vector<float> data;     // cols*freqBins COLUMN-major ring (col c contiguous; r=0 = Nyquist)
+    std::vector<float> drawBuf;  // visible columns de-rotated -> row-major, for PlotHeatmap
     std::vector<float> psdOut;
     int                filled    = 0;
+    int                writeCol  = 0;           // ring cursor: physical index of the next column
     std::uint64_t      nextEnd   = 0;           // absolute sample index = end of next window
     int                hopSamples = 0;          // window stride (decoupled from nfft for smooth scroll)
     double             hopSec    = 0.0;
@@ -734,6 +736,7 @@ static void spectroReset(Spectro& sp, HfStreamSource& s) {
     sp.cols       = std::clamp((int)(kMaxSpan / std::max(sp.hopSec, 1e-6)), 30, 1500);
     sp.data.assign((std::size_t)sp.freqBins * sp.cols, sp.dbMin);
     sp.filled   = 0;
+    sp.writeCol = 0;
     sp.nextEnd  = s.head();
     sp.uid      = s.uid();
     sp.lastGapInserted = -1e18;
@@ -752,12 +755,14 @@ static void spectroUpdate(Spectro& sp, HfStreamSource& s) {
     const std::uint64_t cap  = s.ring().capacity();
     const double        t0   = s.time0();
     const double        dt   = s.dt();
-    auto shiftWrite = [&](bool blank, double colTime) {  // append on the right (older shift left)
-        for (int r = 0; r < sp.freqBins; ++r) {
-            float* row = &sp.data[(std::size_t)r * sp.cols];
-            std::memmove(row, row + 1, (std::size_t)(sp.cols - 1) * sizeof(float));
-            row[sp.cols - 1] = blank ? sp.dbMin : sp.psdOut[sp.freqBins - 1 - r];  // row 0 = Nyquist
-        }
+    // Append a column by writing into the ring cursor (no memmove — the old
+    // shift-everything-left was up to GBs/frame after a long dropout). Column-major
+    // so the write is one contiguous run; the draw de-rotates the visible slice.
+    auto writeColumn = [&](bool blank, double colTime) {
+        float* col = &sp.data[(std::size_t)sp.writeCol * sp.freqBins];
+        for (int r = 0; r < sp.freqBins; ++r)
+            col[r] = blank ? sp.dbMin : sp.psdOut[sp.freqBins - 1 - r];   // r=0 = Nyquist
+        sp.writeCol = (sp.writeCol + 1) % sp.cols;
         if (sp.filled < sp.cols) sp.filled++;
         sp.colNewestTime = colTime;   // pin the newest column to its real time
     };
@@ -776,7 +781,7 @@ static void spectroUpdate(Spectro& sp, HfStreamSource& s) {
             const std::uint64_t G = (std::uint64_t)((g.first - t0) / dt + 0.5);  // gap sample
             if (sp.nextEnd >= G) {
                 const int nb = std::min(sp.cols, (int)((g.second + latency) / sp.hopSec + 0.5));
-                for (int b = 0; b < nb; ++b) shiftWrite(true, sp.colNewestTime + sp.hopSec);
+                for (int b = 0; b < nb; ++b) writeColumn(true, sp.colNewestTime + sp.hopSec);
                 sp.lastGapInserted = g.first;
                 sp.nextEnd = G + (std::uint64_t)sp.nfft;   // first fully post-gap window
                 consumed = true;
@@ -790,7 +795,7 @@ static void spectroUpdate(Spectro& sp, HfStreamSource& s) {
         const float* p = s.ring().windowAt(startAbs);
         sp.psd.compute(p + sp.channel, ch, sp.psdOut);
         for (auto& v : sp.psdOut) v = sp.db ? 10.0f * std::log10(v + 1e-12f) : v;
-        shiftWrite(false, s.realTime(t0 + (double)sp.nextEnd * dt));
+        writeColumn(false, s.realTime(t0 + (double)sp.nextEnd * dt));
         sp.nextEnd += hop;
         ++added;
     }
@@ -851,11 +856,10 @@ static void erpReset(Erp& e, HfStreamSource& s, const std::string& mUid) {
 static constexpr int kErpMaxSpaghetti = 60;
 
 static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
-    const double now = lsl::local_clock();
     // 1) ingest new trigger events (by stable seq) into the pending queue. The first
     // pass after a reset only SYNCS lastSeq (no backfill) so we accumulate from now on.
     const bool firstPass = !e.seqInit;
-    for (const auto& ev : mk.eventsSince(now - 30.0)) {
+    for (const auto& ev : mk.cachedEvents()) {   // const-ref to source cache (no per-frame copy)
         if (e.seqInit && ev.seq <= e.lastSeq) continue;
         e.lastSeq = std::max(e.lastSeq, ev.seq);
         if (firstPass) continue;
@@ -1122,6 +1126,8 @@ int main(int argc, char** argv) {
     int                        psdN = 0;
     float                      psdFs = 0.0f;
     std::vector<float>         psdFreq, psdOut;
+    std::vector<float>         fftCache;          // [channel*bins] last computed spectra
+    double                     fftLastCompute = -1e18;  // wall-clock of last recompute (throttle)
 
     FrameStats fps;
     bool   curVsync = vsync;
@@ -1243,7 +1249,6 @@ int main(int argc, char** argv) {
             // the widest plot window, so a long recording stays cheap). Each gets a
             // distinct color; plots pick which streams to overlay.
             std::vector<MarkerStreamView> markerViews;
-            const double mtmin = lsl::local_clock() - 64.0;   // > max history (60 s)
             for (std::size_t i = 0; i < markerSources.size(); ++i) {
                 MarkerStreamView v;
                 v.id   = !markerSources[i]->sourceId().empty() ? markerSources[i]->sourceId()
@@ -1252,7 +1257,7 @@ int main(int argc, char** argv) {
                 v.col  = ImGui::GetColorU32(ImPlot::SampleColormap(
                     (markerSources.size() > 1 ? (float)i / (markerSources.size() - 1) : 0.0f),
                     ImPlotColormap_Pastel));
-                v.events = markerSources[i]->eventsSince(mtmin);
+                v.events = &markerSources[i]->cachedEvents();   // pointer to source cache (no copy)
                 markerViews.push_back(std::move(v));
             }
 
@@ -1696,7 +1701,7 @@ int main(int argc, char** argv) {
                     if (src->channels() > 0) fftSel[0] = 1;
                     fftRefit = true;
                 }
-                auto labels = src->labels();
+                const auto& labels = src->labels();
 
                 // Select all/none act on the filtered set (like the montage list).
                 auto fpass = [&](int c) { return fftFilter.PassFilter(labels[c].c_str()); };
@@ -1734,21 +1739,35 @@ int main(int argc, char** argv) {
                         ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, src->srate() * 0.5, cond);
                         if (fftDb)
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -110.0, 30.0, cond);
-                        fftRefit = false;
                         std::size_t count = 0; std::uint64_t start = 0;
                         const float* p = src->ring().recent((std::size_t)fftN, count, start);
-                        const int ch = src->channels();
+                        const int ch   = src->channels();
+                        const int bins = psd.bins();
                         if ((int)count >= fftN) {
-                            for (int c = 0; c < ch; ++c) {
-                                if (!fftSel[c]) continue;
-                                LSL_ZONE("psd");
-                                psd.compute(p + c, ch, psdOut);
-                                if (fftDb)
-                                    for (auto& v : psdOut) v = 10.0f * std::log10(v + 1e-12f);
-                                ImPlot::PlotLine(labels[c].c_str(), psdFreq.data(),
-                                                 psdOut.data(), psd.bins());
+                            // Recompute the selected channels at most ~15 Hz (a fresh FFT
+                            // every frame on a 128-ch "All" selection was N×60 scalar FFTs/s
+                            // for no visible gain) — cache the result and plot from it.
+                            const double now = ImGui::GetTime();
+                            const bool recompute = fftRefit || (now - fftLastCompute) > (1.0 / 15.0);
+                            if ((int)fftCache.size() != ch * bins) fftCache.assign((std::size_t)ch * bins, 0.0f);
+                            if (recompute) {
+                                fftLastCompute = now;
+                                for (int c = 0; c < ch; ++c) {
+                                    if (!fftSel[c]) continue;
+                                    LSL_ZONE("psd");
+                                    psd.compute(p + c, ch, psdOut);
+                                    if (fftDb)
+                                        for (auto& v : psdOut) v = 10.0f * std::log10(v + 1e-12f);
+                                    std::copy(psdOut.begin(), psdOut.begin() + bins,
+                                              fftCache.begin() + (std::size_t)c * bins);
+                                }
                             }
+                            for (int c = 0; c < ch; ++c)
+                                if (fftSel[c])
+                                    ImPlot::PlotLine(labels[c].c_str(), psdFreq.data(),
+                                                     fftCache.data() + (std::size_t)c * bins, bins);
                         }
+                        fftRefit = false;
                         ImPlot::EndPlot();
                     }
                 }
@@ -1786,7 +1805,7 @@ int main(int argc, char** argv) {
                     }
                     src = sources[spectro.streamIdx].get();
                     if (spectro.channel >= src->channels()) { spectro.channel = 0; reset = true; }
-                    auto labels = src->labels();
+                    const auto& labels = src->labels();
 
                     ImGui::SameLine(); ImGui::SetNextItemWidth(110);
                     const char* chn = (spectro.channel < (int)labels.size())
@@ -1821,9 +1840,8 @@ int main(int argc, char** argv) {
                         if (reset) spectroReset(spectro, *src);
                         if (!paused) spectroUpdate(spectro, *src);  // freeze columns when paused
 
-                        // Heatmap bounds: cells centered on their real times.
+                        // Right edge of the newest cell (cells centered on their real times).
                         const double bMax = spectro.colNewestTime + 0.5 * spectro.hopSec;
-                        const double bMin = bMax - spectro.cols * spectro.hopSec;
                         // View edge. Normally ease toward the DATA edge (newest column)
                         // and never pass it, so sub-column scrolling stays smooth with no
                         // blank live-edge strip. While stalled, glide the edge PAST the
@@ -1858,6 +1876,25 @@ int main(int argc, char** argv) {
                                                            std::max(filledSec, spectro.hopSec));
                         const double viewX0 = viewNewest - viewSpan;
                         const double y1   = src->srate() * 0.5;
+
+                        // De-rotate only the columns covering the visible span into a
+                        // row-major scratch (was: hand the whole up-to-120 s ring to
+                        // PlotHeatmap every frame -> ~770k cells, mostly off-screen).
+                        int Ndraw = (int)std::ceil((bMax - viewX0) / spectro.hopSec) + 1;
+                        Ndraw = std::clamp(Ndraw, 0, std::min(spectro.filled, spectro.cols));
+                        const double bMaxDraw = bMax;
+                        const double bMinDraw = bMax - (double)Ndraw * spectro.hopSec;
+                        if (Ndraw > 0) {
+                            const int fb = spectro.freqBins, C = spectro.cols;
+                            spectro.drawBuf.resize((std::size_t)fb * Ndraw);
+                            const int first = ((spectro.writeCol - Ndraw) % C + C) % C;  // oldest drawn
+                            for (int k = 0; k < Ndraw; ++k) {
+                                const float* csrc = &spectro.data[(std::size_t)((first + k) % C) * fb];
+                                float* dst = spectro.drawBuf.data() + k;     // row-major, stride Ndraw
+                                for (int r = 0; r < fb; ++r) dst[(std::size_t)r * Ndraw] = csrc[r];
+                            }
+                        }
+
                         ImPlot::PushColormap(ImPlotColormap_Viridis);
                         if (ImPlot::BeginPlot("##spectro", ImVec2(-70, -1))) {
                             ImPlot::SetupAxes("time (s)", "Hz");
@@ -1865,9 +1902,10 @@ int main(int argc, char** argv) {
                             // Re-fit Y on a stream/NFFT change (new Nyquist); else leave it.
                             ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, y1,
                                                     reset ? ImPlotCond_Always : ImPlotCond_Once);
-                            ImPlot::PlotHeatmap("##h", spectro.data.data(), spectro.freqBins,
-                                                spectro.cols, spectro.dbMin, spectro.dbMax, nullptr,
-                                                ImPlotPoint(bMin, 0.0), ImPlotPoint(bMax, y1));
+                            if (Ndraw > 0)
+                                ImPlot::PlotHeatmap("##h", spectro.drawBuf.data(), spectro.freqBins,
+                                                    Ndraw, spectro.dbMin, spectro.dbMax, nullptr,
+                                                    ImPlotPoint(bMinDraw, 0.0), ImPlotPoint(bMaxDraw, y1));
                             // Recorded gaps (extended by the STFT recovery latency, less
                             // half a column so the red ends at the last blank column) plus
                             // the live edge gap scrolling in — same opaque red as the time
@@ -1918,7 +1956,7 @@ int main(int argc, char** argv) {
                     }
                     src = sources[erp.streamIdx].get();
                     if (erp.channel >= src->channels()) { erp.channel = 0; reset = true; }
-                    auto labels = src->labels();
+                    const auto& labels = src->labels();
                     ImGui::SameLine(); ImGui::SetNextItemWidth(110);
                     const char* chn = (erp.channel < (int)labels.size()) ? labels[erp.channel].c_str() : "ch";
                     if (ImGui::BeginCombo("channel", chn)) {
