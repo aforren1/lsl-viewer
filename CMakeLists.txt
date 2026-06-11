@@ -152,8 +152,9 @@ add_executable(lsl_viewer src/main.cpp)
 target_include_directories(lsl_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lsl_viewer PRIVATE ui SDL3::SDL3 lsl spdlog::spdlog)
 if(WIN32)
-  # VirtualAlloc2 / MapViewOfFile3 (magic_ring_buffer.hpp) live in onecore.lib
-  target_link_libraries(lsl_viewer PRIVATE onecore)
+  # VirtualAlloc2 / MapViewOfFile3 (magic_ring_buffer.hpp) live in onecore.lib;
+  # ws2_32 = Winsock for the remote-control TCP server (remote_control.hpp).
+  target_link_libraries(lsl_viewer PRIVATE onecore ws2_32)
   # SDL3.dll / lsl.dll are built in _deps subdirs; copy them next to the exe.
   # (No-op when LSL_STATIC: there are no runtime DLLs to copy.)
   if(NOT LSL_STATIC)

@@ -912,6 +912,10 @@ static void applyTheme(bool light) {
     if (light) { ImGui::StyleColorsLight(); ImPlot::StyleColorsLight(); }
     else       { ImGui::StyleColorsDark();  ImPlot::StyleColorsDark(); }
     ImGuiStyle& s = ImGui::GetStyle();
+    // ImGui hardcodes DockingEmptyBg to a dark gray in BOTH styles, so the empty
+    // dockspace (visible when no plots are open) stayed dark in the light theme.
+    // Match it to the window background so it follows the theme.
+    s.Colors[ImGuiCol_DockingEmptyBg] = s.Colors[ImGuiCol_WindowBg];
     s.WindowRounding    = 5.0f; s.ChildRounding = 4.0f; s.FrameRounding = 4.0f;
     s.PopupRounding     = 4.0f; s.GrabRounding  = 3.0f; s.TabRounding   = 4.0f;
     s.ScrollbarRounding = 9.0f;
@@ -1381,10 +1385,77 @@ int main(int argc, char** argv) {
             ImGuiWindow* streamsWin = ImGui::GetCurrentWindow();  // kept on top below
             ImGui::TextDisabled("live \xc2\xb7 %d stream%s on the network",
                                 (int)found.size(), found.size() == 1 ? "" : "s");
-            if (recorder.active())   // make the recording status hard to miss at the top
-                ImGui::TextColored(ImVec4(1, 0.30f, 0.30f, 1), "REC %.0fs \xc2\xb7 %.1f MB",
-                                   recorder.seconds(), recorder.bytes() / 1e6);
-            ImGui::Separator();
+
+            // ---- Recording: pinned at the top so it has a stable location (always
+            // visible, never shifts with the stream count). Records every connected
+            // stream — no per-stream selection.
+            ImGui::SeparatorText("Recording");
+            {
+                int nConn = 0; for (auto& info : found) if (connected(info)) ++nConn;
+                if (!recorder.active()) {
+                    const float bw = ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2;
+                    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
+                    if (ImGui::InputTextWithHint("##recdir", "folder (blank = cwd)", g_recDir, sizeof(g_recDir)))
+                        ImGui::MarkIniSettingsDirty();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Browse"))
+                        SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
+                                                 g_recDir[0] ? g_recDir : nullptr, false);
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::InputTextWithHint("##recpath", "recording_{datetime}.xdf",
+                                                 g_recTmpl, sizeof(g_recTmpl)))
+                        ImGui::MarkIniSettingsDirty();
+                    if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                        const float fw = (ImGui::GetContentRegionAvail().x
+                                          - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
+                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
+                        ImGui::TreePop();
+                    }
+                    ImGui::TextDisabled("-> %s", recFullPath().c_str());
+                    ImGui::BeginDisabled(nConn == 0);
+                    if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
+                    ImGui::EndDisabled();
+                    if (nConn == 0)
+                        ImGui::TextDisabled("connect a stream to record");
+                    else
+                        ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
+                } else {
+                    if (ImGui::Button("Stop recording", ImVec2(-1, 0))) {
+                        recorder.stop(); spdlog::info("recording stopped ({:.1f}s, {:.1f} MB)",
+                                                      recorder.seconds(), recorder.bytes() / 1e6);
+                    }
+                    ImGui::TextColored(ImVec4(1, 0.30f, 0.30f, 1),   // hard to miss while live
+                                       "REC %.0fs \xc2\xb7 %d stream%s \xc2\xb7 %.2f MB",
+                                       recorder.seconds(), recorder.streams(),
+                                       recorder.streams() == 1 ? "" : "s", recorder.bytes() / 1e6);
+                }
+                const std::string rerr = recorder.error();
+                if (!rerr.empty()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "rec error: %s", rerr.c_str());
+                bool rc = remote.listening();
+                if (ImGui::Checkbox("Remote control", &rc)) {
+                    if (rc) {
+                        if (remote.start(rcPort, &rcState)) spdlog::info("remote control listening on tcp:{}", rcPort);
+                        else spdlog::warn("remote control unavailable: {}", remote.error());  // e.g. Windows
+                    } else { remote.stop(); spdlog::info("remote control stopped"); }
+                }
+                if (remote.listening()) { ImGui::SameLine(); ImGui::TextDisabled("tcp :%d", remote.port()); }
+                else {
+                    // Wrap on its own line — the rail is too narrow for a SameLine note,
+                    // which clipped messages like "not supported on Windows yet".
+                    const std::string re = remote.error();
+                    if (!re.empty()) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                        ImGui::TextWrapped("%s", re.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                }
+            }
+            ImGui::SeparatorText("Streams");
 
             for (auto& info : found) {
                 ImGui::PushID(info.uid().c_str());
@@ -1480,65 +1551,8 @@ int main(int argc, char** argv) {
                 markerSources.end());
             std::erase_if(closingMrk, [](const std::unique_ptr<MarkerSource>& p) { return p->finished(); });
 
-            // ---- Recording (collapsed by default; below the stream list so discovery
-            // greets you first). While recording, force it open so Stop stays reachable.
-            // Records every connected stream — no per-stream selection.
-            ImGui::Separator();
-            if (recorder.active()) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-            if (ImGui::CollapsingHeader("Recording")) {
-                int nConn = 0; for (auto& info : found) if (connected(info)) ++nConn;
-                if (!recorder.active()) {
-                    const float bw = ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2;
-                    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
-                    if (ImGui::InputTextWithHint("##recdir", "folder (blank = cwd)", g_recDir, sizeof(g_recDir)))
-                        ImGui::MarkIniSettingsDirty();
-                    ImGui::SameLine();
-                    if (ImGui::Button("Browse"))
-                        SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
-                                                 g_recDir[0] ? g_recDir : nullptr, false);
-                    ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::InputTextWithHint("##recpath", "recording_{datetime}.xdf",
-                                                 g_recTmpl, sizeof(g_recTmpl)))
-                        ImGui::MarkIniSettingsDirty();
-                    if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
-                        const float fw = (ImGui::GetContentRegionAvail().x
-                                          - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
-                        ImGui::TreePop();
-                    }
-                    ImGui::TextDisabled("-> %s", recFullPath().c_str());
-                    ImGui::BeginDisabled(nConn == 0);
-                    if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
-                    ImGui::EndDisabled();
-                    if (nConn == 0)
-                        ImGui::TextDisabled("connect a stream to record");
-                    else
-                        ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
-                } else {
-                    if (ImGui::Button("Stop recording", ImVec2(-1, 0))) {
-                        recorder.stop(); spdlog::info("recording stopped ({:.1f}s, {:.1f} MB)",
-                                                      recorder.seconds(), recorder.bytes() / 1e6);
-                    }
-                    ImGui::TextDisabled("rec %.0fs \xc2\xb7 %d streams \xc2\xb7 %.2f MB",
-                                        recorder.seconds(), recorder.streams(),
-                                        recorder.bytes() / 1e6);
-                }
-                const std::string rerr = recorder.error();
-                if (!rerr.empty()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "rec error: %s", rerr.c_str());
-                bool rc = remote.listening();
-                if (ImGui::Checkbox("Remote control", &rc)) {
-                    if (rc) { remote.start(rcPort, &rcState); spdlog::info("remote control listening on tcp:{}", rcPort); }
-                    else    { remote.stop();                  spdlog::info("remote control stopped"); }
-                }
-                ImGui::SameLine();
-                if (remote.listening()) ImGui::TextDisabled("tcp :%d", remote.port());
-                else { const std::string re = remote.error(); if (!re.empty()) ImGui::TextDisabled("(%s)", re.c_str()); }
-            }
+            // (Recording is pinned at the TOP of the rail — see above the stream list.)
+
             // ---- Performance (Debug menu) — lives at the bottom of the rail ----
             if (showPerf) {
                 ImGui::Separator();

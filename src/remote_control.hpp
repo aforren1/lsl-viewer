@@ -19,7 +19,8 @@
 // Threading: the server thread only touches a mutex-guarded RemoteState — it sets
 // request fields and reads snapshots that the main loop publishes each frame. The
 // main loop owns the Recorder/Discovery and applies the requests, so there are no
-// cross-thread races on the recorder. POSIX sockets (Linux/macOS); no-op on Windows.
+// cross-thread races on the recorder. TCP via BSD sockets (Linux/macOS) or Winsock
+// (Windows) — the socket layer is abstracted below so the server logic is shared.
 
 #include <lsl_cpp.h>
 
@@ -33,11 +34,33 @@
 #include <thread>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
+
+// ---- Thin cross-platform socket layer (Winsock <-> BSD) ---------------------
+#if defined(_WIN32)
+using rc_socket_t = SOCKET;
+static constexpr rc_socket_t RC_INVALID = INVALID_SOCKET;
+static constexpr int         RC_SHUT_RDWR = SD_BOTH;
+inline int rc_close(rc_socket_t s) { return ::closesocket(s); }
+// Winsock needs per-process init; a function-local static does it once, thread-safe,
+// and tears it down at exit. Referenced from RemoteControl::start().
+struct RcWsaInit { RcWsaInit() { WSADATA w; WSAStartup(MAKEWORD(2, 2), &w); } ~RcWsaInit() { WSACleanup(); } };
+#else
+using rc_socket_t = int;
+static constexpr rc_socket_t RC_INVALID = -1;
+static constexpr int         RC_SHUT_RDWR = SHUT_RDWR;
+inline int rc_close(rc_socket_t s) { return ::close(s); }
 #endif
 
 // Shared between the server thread and the main loop.
@@ -63,25 +86,25 @@ public:
     std::string error() const { std::lock_guard<std::mutex> lk(emtx_); return error_; }
 
     bool start(int port, RemoteState* state) {
-#if defined(_WIN32)
-        std::lock_guard<std::mutex> lk(emtx_); error_ = "remote control not supported on Windows yet";
-        return false;
-#else
         if (up_) return true;
+#if defined(_WIN32)
+        static RcWsaInit s_wsa;   // process-lifetime Winsock init on first start()
+        (void)s_wsa;
+#endif
         st_ = state; port_ = port;
         listenfd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listenfd_ < 0) { setError("socket() failed"); return false; }
+        if (listenfd_ == RC_INVALID) { setError("socket() failed"); return false; }
         int yes = 1;
-        ::setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        ::setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);   // reachable on the network (lab tool)
         addr.sin_port = htons((uint16_t)port);
-        if (::bind(listenfd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
-            setError("bind() failed (port in use?)"); ::close(listenfd_); listenfd_ = -1; return false;
+        if (::bind(listenfd_, (sockaddr*)&addr, sizeof(addr)) != 0) {
+            setError("bind() failed (port in use?)"); rc_close(listenfd_); listenfd_ = RC_INVALID; return false;
         }
-        if (::listen(listenfd_, 1) < 0) {
-            setError("listen() failed"); ::close(listenfd_); listenfd_ = -1; return false;
+        if (::listen(listenfd_, 1) != 0) {
+            setError("listen() failed"); rc_close(listenfd_); listenfd_ = RC_INVALID; return false;
         }
         up_.store(true, std::memory_order_release);
         th_ = std::jthread([this](std::stop_token s) { serve(s); });
@@ -99,33 +122,29 @@ public:
             announce_ = std::make_unique<lsl::stream_outlet>(ai);
         } catch (...) { /* discovery is best-effort */ }
         return true;
-#endif
     }
 
     void stop() {
-#if !defined(_WIN32)
         if (!up_.exchange(false)) return;
         announce_.reset();
-        if (listenfd_ >= 0) { ::shutdown(listenfd_, SHUT_RDWR); ::close(listenfd_); listenfd_ = -1; }
+        if (listenfd_ != RC_INVALID) { ::shutdown(listenfd_, RC_SHUT_RDWR); rc_close(listenfd_); listenfd_ = RC_INVALID; }
         th_.request_stop();
         if (th_.joinable()) th_.join();
-#endif
     }
 
 private:
-#if !defined(_WIN32)
     void setError(const std::string& e) { std::lock_guard<std::mutex> lk(emtx_); error_ = e; }
 
     void serve(std::stop_token stoke) {
         while (!stoke.stop_requested() && up_) {
-            int fd = ::accept(listenfd_, nullptr, nullptr);
-            if (fd < 0) break;                              // listenfd closed on stop()
-            ::send(fd, kHello, sizeof(kHello) - 1, 0);
+            rc_socket_t fd = ::accept(listenfd_, nullptr, nullptr);
+            if (fd == RC_INVALID) break;                    // listenfd closed on stop()
+            ::send(fd, kHello, (int)(sizeof(kHello) - 1), 0);
             std::string buf;
             char tmp[1024];
             bool open = true;
             while (open && !stoke.stop_requested()) {
-                const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+                const int n = (int)::recv(fd, tmp, (int)sizeof(tmp), 0);
                 if (n <= 0) break;
                 buf.append(tmp, (std::size_t)n);
                 std::size_t nl;
@@ -136,7 +155,7 @@ private:
                     if (!dispatch(fd, line)) { open = false; break; }
                 }
             }
-            ::close(fd);
+            rc_close(fd);
         }
     }
 
@@ -148,9 +167,9 @@ private:
         return s.substr(0, sp);
     }
 
-    void reply(int fd, const std::string& s) { ::send(fd, s.data(), s.size(), 0); }
+    void reply(rc_socket_t fd, const std::string& s) { ::send(fd, s.data(), (int)s.size(), 0); }
 
-    bool dispatch(int fd, const std::string& line) {
+    bool dispatch(rc_socket_t fd, const std::string& line) {
         if (line.empty()) return true;
         std::string arg, v = verb(line, arg);
         std::lock_guard<std::mutex> lk(st_->mtx);
@@ -229,9 +248,8 @@ private:
     }
 
     static constexpr char kHello[] = "lsl-viewer remote control. type `help`.\n";
-    int listenfd_ = -1;
-    std::jthread th_;
-#endif
+    rc_socket_t       listenfd_ = RC_INVALID;
+    std::jthread      th_;
     RemoteState*      st_ = nullptr;
     int               port_ = 0;
     std::atomic<bool> up_{false};
