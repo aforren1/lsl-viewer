@@ -38,6 +38,19 @@ FetchContent_Declare(SDL3
   GIT_TAG        release-3.4.10     # latest stable 3.4.x
   GIT_SHALLOW    TRUE
 )
+# Trim SDL to the subsystems the viewer actually uses — video + SDL_GPU (Vulkan/D3D12)
+# for the window, events/timer (always built), and the file dialog (the recorder's
+# folder picker, SDL_ShowOpenFolderDialog). Everything else is dead weight; disabling
+# it shrinks the build and the binary. SDL_RENDER is the 2D SDL_Renderer API, which we
+# never touch — Dear ImGui drives SDL_GPU directly — so it goes too.
+set(SDL_AUDIO    OFF CACHE BOOL "" FORCE)
+set(SDL_RENDER   OFF CACHE BOOL "" FORCE)
+set(SDL_CAMERA   OFF CACHE BOOL "" FORCE)
+set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
+set(SDL_HAPTIC   OFF CACHE BOOL "" FORCE)
+set(SDL_HIDAPI   OFF CACHE BOOL "" FORCE)
+set(SDL_SENSOR   OFF CACHE BOOL "" FORCE)
+set(SDL_POWER    OFF CACHE BOOL "" FORCE)
 
 # --- liblsl -----------------------------------------------------------------
 # Provides the `lsl` target. Pin to a current release tag.
