@@ -234,6 +234,7 @@ struct DisplayOpts {
     std::unordered_map<std::string, bool> markerOn;  // per-stream (id -> show; absent = on)
     bool cfgShown = true;                  // show the left config strip (else plot is full-width)
     float lastPlotPx = 0.0f;               // last frame's plot width (px) — for edge pixel-snapping
+    bool  overlayYFit = true;              // overlay mode: auto-fit Y once (on entry / scale change), then free
 };
 
 // Stable per-channel color (by absolute channel index, so a channel keeps its
@@ -416,11 +417,11 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::EndDisabled();
         ImGui::BeginDisabled(o.stacked);           // channel spacing: overlay only
         ImGui::SetNextItemWidth(110);
-        ImGui::SliderFloat("Spacing", &o.spacing, 0.0f, 5000.0f, "%.0f");
+        if (ImGui::SliderFloat("Spacing", &o.spacing, 0.0f, 5000.0f, "%.0f")) o.overlayYFit = true;
         ImGui::EndDisabled();
         ImGui::SetNextItemWidth(110);
         ImGui::SliderFloat("Line width", &o.lineWidth, 0.5f, 4.0f, "%.1f");
-        ImGui::Checkbox("High-pass", &o.filter);   // off = show raw, unfiltered signal
+        if (ImGui::Checkbox("High-pass", &o.filter)) o.overlayYFit = true;  // raw<->filtered = big scale change; refit overlay Y
         ImGui::SameLine();
         ImGui::BeginDisabled(!o.filter);
         ImGui::SetNextItemWidth(90);
@@ -667,6 +668,10 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         xedge = std::round(edge / secPerPx) * secPerPx;
     }
 
+    // Arm the overlay Y auto-fit while we're in a non-overlay mode, so switching INTO
+    // overlay fits once before the axis is left free (the overlay branch consumes it).
+    if (o.stacked) o.overlayYFit = true;
+
     // ---- Raster: a render style OF the stacked montage — all visible channels as one
     // heatmap (color = per-bin peak-to-peak activity), a single PlotHeatmap drawcall
     // regardless of channel count. The scalable view for many (32-256) channels, where
@@ -816,8 +821,11 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
 
     // ---- Overlay: shared amplitude axis (raw values, optional offset) ---------
     if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1))) {
-        ImPlot::SetupAxes("time (s)", streamUnit,
-                          ImPlotAxisFlags_None, ImPlotAxisFlags_AutoFit);
+        // Auto-fit Y only when armed (entering overlay / a scale change); then leave it
+        // FREE so the mouse can zoom/pan the amplitude axis (double-click re-fits).
+        const ImPlotAxisFlags yf = o.overlayYFit ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
+        ImPlot::SetupAxes("time (s)", streamUnit, ImPlotAxisFlags_None, yf);
+        o.overlayYFit = false;
         if (followX)
             ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
 
@@ -1013,6 +1021,7 @@ struct Erp {
     bool                 seqInit = false;
     std::string          sUid, mUid;            // identity (auto-reset on change)
     float                yHalf = 50.0f;         // robust Y half-range (excludes spike outliers)
+    float                yHalfApplied = -1.0f;  // last yHalf forced onto the axis (auto-fit while evolving)
     std::vector<float>   yscratch;              // |sample| buffer for the percentile
     std::vector<double>      tvals;             // raster Y-tick positions (reused each frame)
     std::vector<const char*> tlabs;             // raster Y-tick labels (-> into labels(), per-frame valid)
@@ -1670,7 +1679,7 @@ int main(int argc, char** argv) {
                     if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
                     ImGui::EndDisabled();
                     if (nConn == 0)
-                        ImGui::TextDisabled("connect a stream to record");
+                        ImGui::TextDisabled("Connect a stream to record.");
                     else
                         ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
                 } else {
@@ -1893,7 +1902,7 @@ int main(int argc, char** argv) {
             if (focusSpectrum) { ImGui::SetNextWindowFocus(); focusSpectrum = false; }
             ImGui::Begin("Spectrum", &showSpectrum);
             if (sources.empty()) {
-                ImGui::TextUnformatted("connect a stream to view its spectrum");
+                ImGui::TextUnformatted("Connect a stream to view its spectrum.");
             } else {
                 if (fftStream >= (int)sources.size()) fftStream = 0;
                 HfStreamSource* src = sources[fftStream].get();
@@ -1962,8 +1971,23 @@ int main(int argc, char** argv) {
                         if (fftDb)
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -110.0, 30.0, cond);
                         std::size_t count = 0; std::uint64_t start = 0;
-                        const float* p = (fftFiltered ? src->ringHp() : src->ring())
-                                             .recent((std::size_t)fftN, count, start);
+                        InterleavedRing& frg = fftFiltered ? src->ringHp() : src->ring();
+                        const float* p;
+                        if (paused) {
+                            // Freeze on the same window the rest of the UI is frozen at (the
+                            // producer keeps filling the ring, so recent() would keep updating
+                            // the spectrum while everything else is paused).
+                            auto ph = pauseHead.find(src);
+                            const std::uint64_t fh = (ph != pauseHead.end()) ? ph->second : src->head();
+                            const std::uint64_t cap = frg.capacity();
+                            const std::uint64_t oldest = (fh > cap) ? fh - cap : 0;
+                            start = (fh > (std::uint64_t)fftN) ? fh - (std::uint64_t)fftN : 0;
+                            if (start < oldest) start = oldest;
+                            count = (std::size_t)(fh - start);
+                            p = frg.windowAt(start);
+                        } else {
+                            p = frg.recent((std::size_t)fftN, count, start);
+                        }
                         const int ch   = src->channels();
                         const int bins = psd.bins();
                         if ((int)count >= fftN) {
@@ -2009,7 +2033,7 @@ int main(int argc, char** argv) {
                 std::snprintf(title, sizeof(title), "Spectrogram %d", spectro.id);
                 ImGui::Begin(title, &spectro.open);
                 if (sources.empty()) {
-                    ImGui::TextUnformatted("connect a stream to view its spectrogram");
+                    ImGui::TextUnformatted("Connect a stream to view its spectrogram.");
                 } else {
                     if (spectro.streamIdx >= (int)sources.size()) spectro.streamIdx = 0;
                     HfStreamSource* src = sources[spectro.streamIdx].get();
@@ -2140,7 +2164,8 @@ int main(int argc, char** argv) {
                         ImPlot::PushColormap(ImPlotColormap_Viridis);
                         if (ImPlot::BeginPlot("##spectro", ImVec2(-70, -1))) {
                             ImPlot::SetupAxes("time (s)", "Hz");
-                            ImPlot::SetupAxisLimits(ImAxis_X1, viewX0, viewNewest, ImPlotCond_Always);
+                            if (!paused)   // live: follow the scroll; paused: free to pan/zoom the frozen view
+                                ImPlot::SetupAxisLimits(ImAxis_X1, viewX0, viewNewest, ImPlotCond_Always);
                             // Y range is the user's freq window (control or mouse-zoom). Force it
                             // only when the control changed or on reset; otherwise leave it free so
                             // the mouse can zoom — then read the live limits back into the control.
@@ -2272,6 +2297,10 @@ int main(int argc, char** argv) {
                             dl->AddLine(a, b, IM_COL32(0, 0, 0, 170), 3.5f);
                             dl->AddLine(a, b, IM_COL32(255, 255, 255, 235), 1.5f);
                         };
+                        // ERP is a static analysis view: fit the axes on a reset (stream / channel
+                        // / pre-post change), then leave them FREE so the mouse can zoom/pan/
+                        // double-click-fit into a latency window or amplitude range.
+                        const ImPlotCond erpCond = reset ? ImPlotCond_Always : ImPlotCond_Once;
 
                         if (erp.raster) {
                             // channels x time heatmap (one row per channel) of the averaged ERP —
@@ -2282,8 +2311,8 @@ int main(int argc, char** argv) {
                             } else if (ImPlot::BeginPlot("##erpr", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
                                 ImPlot::SetupAxes("time (ms)", nullptr,
                                                   ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
-                                ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, ImPlotCond_Always);
-                                ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)erp.nchan, ImPlotCond_Always);
+                                ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, erpCond);
+                                ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)erp.nchan, erpCond);
                                 // channel-name ticks at row centers (row 0 = top = first channel)
                                 erp.tvals.resize(erp.nchan); erp.tlabs.resize(erp.nchan);
                                 for (int j = 0; j < erp.nchan; ++j) {
@@ -2310,8 +2339,13 @@ int main(int argc, char** argv) {
                             ImPlot::SetupAxes("time (ms)",
                                 single ? ((erp.chans[0] < (int)labels.size()) ? labels[erp.chans[0]].c_str() : "uV")
                                        : "uV");
-                            ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, ImPlotCond_Always);
-                            ImPlot::SetupAxisLimits(ImAxis_Y1, -erp.yHalf, erp.yHalf, ImPlotCond_Always);
+                            ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, erpCond);
+                            // Y auto-fits while the robust range (yHalf) is still evolving with
+                            // accumulation, then is free to zoom once it settles (or after a reset).
+                            const ImPlotCond yCond =
+                                (reset || erp.yHalf != erp.yHalfApplied) ? ImPlotCond_Always : ImPlotCond_Once;
+                            ImPlot::SetupAxisLimits(ImAxis_Y1, -erp.yHalf, erp.yHalf, yCond);
+                            erp.yHalfApplied = erp.yHalf;
                             if (erp.nbins > 0 && erp.count > 0) {
                                 if (single) {
                                     // single channel: faint individual epochs (spaghetti) behind the average
