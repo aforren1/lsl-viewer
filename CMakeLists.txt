@@ -158,7 +158,7 @@ if(LSL_TESTS)
   target_compile_definitions(imgui_te PUBLIC
     IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1
     IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
-  target_compile_options(imgui_te PRIVATE -g)
+  target_compile_options(imgui_te PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/Z7,-g>)  # debug symbols (MSVC: /Z7 not -g)
 endif()
 
 add_executable(lsl_viewer src/main.cpp)
@@ -198,7 +198,7 @@ if(LSL_TESTS)
   target_sources(lsl_viewer PRIVATE tests/ui_tests.cpp)
   target_compile_definitions(lsl_viewer PRIVATE LSL_TESTS)
   target_link_libraries(lsl_viewer PRIVATE imgui_te)
-  target_compile_options(lsl_viewer PRIVATE -g)
+  target_compile_options(lsl_viewer PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/Z7,-g>)
 endif()
 
 # Link-time optimization for shipping builds — trims unreferenced library code

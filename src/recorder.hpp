@@ -26,7 +26,7 @@ public:
     int  streams() const { return nstreams_; }
     const std::string& path() const { return path_; }
     double seconds() const { return active() ? lsl::local_clock() - t0_ : elapsed_; }
-    std::uint64_t bytes() const { return writer_ ? writer_->bytes() : 0; }
+    std::uint64_t bytes() const { return writer_ ? writer_->bytes() : lastBytes_; }  // final size survives the deferred close
     std::string error() const { std::lock_guard<std::mutex> lk(emtx_); return error_; }
 
     // Begin recording every stream in `infos` to `path`. Opens its OWN inlets, so
@@ -34,6 +34,10 @@ public:
     // if the file can't be opened or nothing is selected.
     bool start(const std::string& path, const std::vector<lsl::stream_info>& infos) {
         if (active() || infos.empty()) return false;
+        // Finish any prior deferred close before reopening — else opening a new
+        // (truncating) Writer on the same path would clobber a file the old workers
+        // are still flushing. Practically instant unless a stop happened <0.5 s ago.
+        if (closer_.joinable()) closer_.join();
         { std::lock_guard<std::mutex> lk(emtx_); error_.clear(); }
         try { writer_ = std::make_shared<xdf::Writer>(path); }
         catch (const std::exception& e) {
@@ -54,6 +58,7 @@ public:
     void stop() {
         if (!active_.exchange(false)) return;   // mark inactive immediately
         elapsed_ = lsl::local_clock() - t0_;
+        lastBytes_ = writer_ ? writer_->bytes() : 0;   // snapshot before the writer is moved away
         for (auto& w : workers_) w.request_stop();
         // Hand the workers + writer to a detached-ish closer so the UI thread doesn't
         // block on each worker's join (a worker can be parked ~0.5 s in pull_chunk's
@@ -131,6 +136,7 @@ private:
     std::thread                  closer_;   // deferred join + flush (keeps stop() off the UI thread)
     std::atomic<bool>            active_{false};
     double                       t0_ = 0.0, elapsed_ = 0.0;
+    std::uint64_t                lastBytes_ = 0;   // file size at the last stop() (writer_ is moved away)
     std::string                  path_;
     int                          nstreams_ = 0;
     mutable std::mutex           emtx_;

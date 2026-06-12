@@ -710,6 +710,7 @@ struct Spectro {
     std::vector<float> psdOut;
     int                filled    = 0;
     int                writeCol  = 0;           // ring cursor: physical index of the next column
+    int                lastDrawWriteCol = -1, lastDrawNdraw = -1;  // drawBuf dirty-check (skip redundant transpose)
     std::uint64_t      nextEnd   = 0;           // absolute sample index = end of next window
     int                hopSamples = 0;          // window stride (decoupled from nfft for smooth scroll)
     double             hopSec    = 0.0;
@@ -738,6 +739,7 @@ static void spectroReset(Spectro& sp, HfStreamSource& s) {
     sp.data.assign((std::size_t)sp.freqBins * sp.cols, sp.dbMin);
     sp.filled   = 0;
     sp.writeCol = 0;
+    sp.lastDrawNdraw = -1; sp.lastDrawWriteCol = -1;   // force a drawBuf rebuild (freqBins may have changed)
     sp.nextEnd  = s.head();
     sp.uid      = s.uid();
     sp.lastGapInserted = -1e18;
@@ -917,6 +919,109 @@ static void applyTheme(bool light) {
     if (light) { ImGui::StyleColorsLight(); ImPlot::StyleColorsLight(); }
     else       { ImGui::StyleColorsDark();  ImPlot::StyleColorsDark(); }
     ImGuiStyle& s = ImGui::GetStyle();
+
+    // --- Brand palette: light-blue / blue / navy / electric-blue / magenta / purple.
+    // Blues carry the resting + hover chrome and backgrounds; magenta/purple mark the
+    // strongest active/selected states (button press, slider drag, tab accent line,
+    // text selection) so all six colors appear without the UI getting noisy.
+    auto rgb = [](int r, int g, int b, float a = 1.0f) {
+        return ImVec4(r / 255.0f, g / 255.0f, b / 255.0f, a);
+    };
+    // Mostly-grayscale neutrals; blue + purple are the ONLY accents (checkmark,
+    // hover, active/pressed, selected-tab overline, text selection) so the chrome
+    // stays quiet and the highlights read.
+    ImVec4* c = s.Colors;
+    auto A = [](ImVec4 v, float a) { v.w = a; return v; };
+    if (light) {
+        const ImVec4 blue = rgb(0x1B, 0x33, 0xE6), purp = rgb(0x7B, 0x22, 0xA8);  // electric blue + purple (palette)
+        c[ImGuiCol_Text]                 = rgb(0x1E, 0x1E, 0x22);   // near-black ink
+        c[ImGuiCol_TextDisabled]         = rgb(0x77, 0x77, 0x7F);
+        c[ImGuiCol_WindowBg]             = rgb(0xF4, 0xF4, 0xF6);
+        c[ImGuiCol_ChildBg]              = ImVec4(0, 0, 0, 0);
+        c[ImGuiCol_PopupBg]              = rgb(0xFF, 0xFF, 0xFF, 0.98f);
+        c[ImGuiCol_Border]               = rgb(0x1E, 0x1E, 0x22, 0.16f);
+        c[ImGuiCol_FrameBg]              = rgb(0xE7, 0xE7, 0xEA);
+        c[ImGuiCol_FrameBgHovered]       = rgb(0xDB, 0xDB, 0xDF);
+        c[ImGuiCol_FrameBgActive]        = rgb(0xCF, 0xCF, 0xD4);
+        c[ImGuiCol_TitleBg]              = rgb(0xE7, 0xE7, 0xEA);
+        c[ImGuiCol_TitleBgActive]        = rgb(0xD6, 0xD6, 0xDB);
+        c[ImGuiCol_MenuBarBg]            = rgb(0xEC, 0xEC, 0xEF);
+        c[ImGuiCol_Header]               = A(blue, 0.18f);
+        c[ImGuiCol_HeaderHovered]        = A(blue, 0.32f);
+        c[ImGuiCol_HeaderActive]         = A(purp, 0.42f);
+        c[ImGuiCol_Button]               = rgb(0xDD, 0xDD, 0xE2);
+        c[ImGuiCol_ButtonHovered]        = A(blue, 0.32f);
+        c[ImGuiCol_ButtonActive]         = A(purp, 0.55f);
+        c[ImGuiCol_CheckMark]            = blue;
+        c[ImGuiCol_SliderGrab]           = rgb(0xA6, 0xA6, 0xAE);
+        c[ImGuiCol_SliderGrabActive]     = purp;
+        c[ImGuiCol_Tab]                  = rgb(0xDD, 0xDD, 0xE2);
+        c[ImGuiCol_TabHovered]           = A(blue, 0.32f);
+        c[ImGuiCol_TabSelected]          = rgb(0xCC, 0xCC, 0xD2);
+        c[ImGuiCol_TabSelectedOverline]  = purp;
+        c[ImGuiCol_TabDimmed]            = rgb(0xE6, 0xE6, 0xE9);
+        c[ImGuiCol_TabDimmedSelected]    = rgb(0xD4, 0xD4, 0xD9);
+        c[ImGuiCol_Separator]            = rgb(0x1E, 0x1E, 0x22, 0.16f);
+        c[ImGuiCol_SeparatorHovered]     = A(blue, 0.55f);
+        c[ImGuiCol_ResizeGrip]           = rgb(0x1E, 0x1E, 0x22, 0.12f);
+        c[ImGuiCol_ResizeGripHovered]    = A(blue, 0.45f);
+        c[ImGuiCol_ResizeGripActive]     = A(purp, 0.80f);
+        c[ImGuiCol_ScrollbarBg]          = rgb(0xEC, 0xEC, 0xEF);
+        c[ImGuiCol_ScrollbarGrab]        = rgb(0xC4, 0xC4, 0xCA);
+        c[ImGuiCol_ScrollbarGrabHovered] = rgb(0xB2, 0xB2, 0xBA);
+        c[ImGuiCol_ScrollbarGrabActive]  = A(blue, 0.70f);
+        c[ImGuiCol_TextSelectedBg]       = A(blue, 0.25f);
+        c[ImGuiCol_NavCursor]            = blue;
+        c[ImGuiCol_DockingPreview]       = A(blue, 0.45f);
+        c[ImGuiCol_PlotLines]            = blue;
+        c[ImGuiCol_PlotHistogram]        = purp;
+    } else {
+        // Palette electric-blue + purple, lifted in lightness for dark-gray contrast but
+        // kept at the palette's royal/violet HUE (not imgui's lighter azure).
+        const ImVec4 blue = rgb(0x3D, 0x50, 0xEE), purp = rgb(0x9E, 0x3A, 0xD0);
+        c[ImGuiCol_Text]                 = rgb(0xE8, 0xE8, 0xEC);
+        c[ImGuiCol_TextDisabled]         = rgb(0x86, 0x86, 0x8E);
+        c[ImGuiCol_WindowBg]             = rgb(0x18, 0x18, 0x1B);   // neutral dark gray
+        c[ImGuiCol_ChildBg]              = ImVec4(0, 0, 0, 0);
+        c[ImGuiCol_PopupBg]              = rgb(0x20, 0x20, 0x24, 0.98f);
+        c[ImGuiCol_Border]               = rgb(0x4A, 0x4A, 0x52, 0.50f);
+        c[ImGuiCol_FrameBg]              = rgb(0x28, 0x28, 0x2D);
+        c[ImGuiCol_FrameBgHovered]       = rgb(0x33, 0x33, 0x39);
+        c[ImGuiCol_FrameBgActive]        = rgb(0x3D, 0x3D, 0x44);
+        c[ImGuiCol_TitleBg]              = rgb(0x14, 0x14, 0x16);
+        c[ImGuiCol_TitleBgActive]        = rgb(0x2A, 0x2A, 0x30);
+        c[ImGuiCol_MenuBarBg]            = rgb(0x16, 0x16, 0x19);
+        c[ImGuiCol_Header]               = A(blue, 0.26f);
+        c[ImGuiCol_HeaderHovered]        = A(blue, 0.45f);
+        c[ImGuiCol_HeaderActive]         = A(purp, 0.55f);
+        c[ImGuiCol_Button]               = rgb(0x34, 0x34, 0x3A);
+        c[ImGuiCol_ButtonHovered]        = A(blue, 0.45f);
+        c[ImGuiCol_ButtonActive]         = A(purp, 0.80f);
+        c[ImGuiCol_CheckMark]            = blue;
+        c[ImGuiCol_SliderGrab]           = rgb(0x57, 0x57, 0x60);
+        c[ImGuiCol_SliderGrabActive]     = purp;
+        c[ImGuiCol_Tab]                  = rgb(0x22, 0x22, 0x27);
+        c[ImGuiCol_TabHovered]           = A(blue, 0.45f);
+        c[ImGuiCol_TabSelected]          = rgb(0x33, 0x33, 0x3A);
+        c[ImGuiCol_TabSelectedOverline]  = purp;
+        c[ImGuiCol_TabDimmed]            = rgb(0x18, 0x18, 0x1B);
+        c[ImGuiCol_TabDimmedSelected]    = rgb(0x28, 0x28, 0x2E);
+        c[ImGuiCol_Separator]            = rgb(0x3C, 0x3C, 0x44, 0.70f);
+        c[ImGuiCol_SeparatorHovered]     = A(blue, 0.60f);
+        c[ImGuiCol_ResizeGrip]           = rgb(0xFF, 0xFF, 0xFF, 0.10f);
+        c[ImGuiCol_ResizeGripHovered]    = A(blue, 0.55f);
+        c[ImGuiCol_ResizeGripActive]     = A(purp, 0.85f);
+        c[ImGuiCol_ScrollbarBg]          = ImVec4(0, 0, 0, 0);
+        c[ImGuiCol_ScrollbarGrab]        = rgb(0x3A, 0x3A, 0x42);
+        c[ImGuiCol_ScrollbarGrabHovered] = rgb(0x4A, 0x4A, 0x54);
+        c[ImGuiCol_ScrollbarGrabActive]  = A(blue, 0.75f);
+        c[ImGuiCol_TextSelectedBg]       = A(blue, 0.35f);
+        c[ImGuiCol_NavCursor]            = blue;
+        c[ImGuiCol_DockingPreview]       = A(blue, 0.60f);
+        c[ImGuiCol_PlotLines]            = blue;
+        c[ImGuiCol_PlotHistogram]        = purp;
+    }
+
     // ImGui hardcodes DockingEmptyBg to a dark gray in BOTH styles, so the empty
     // dockspace (visible when no plots are open) stayed dark in the light theme.
     // Match it to the window background so it follows the theme.
@@ -953,6 +1058,15 @@ static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBu
 // SDL folder-picker callback → sets the output directory.
 static void onFolderPicked(void*, const char* const* list, int) {
     if (list && list[0]) { std::snprintf(g_recDir, sizeof(g_recDir), "%s", list[0]); ImGui::MarkIniSettingsDirty(); }
+}
+
+// Rate-limit per-frame work: returns true at most once per `period` seconds,
+// advancing `last`. (`last` starts at a large negative so the first call fires.)
+static bool dueEvery(double& last, double period) {
+    const double now = ImGui::GetTime();
+    if (now - last < period) return false;
+    last = now;
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -1218,40 +1332,45 @@ int main(int argc, char** argv) {
             // the set changes slowly, so refresh at ~4 Hz and reuse the cache otherwise.
             static std::vector<lsl::stream_info> found;
             static double lastDiscovery = -1e18;
-            if (ImGui::GetTime() - lastDiscovery > 0.25) {
-                lastDiscovery = ImGui::GetTime();
+            if (dueEvery(lastDiscovery, 0.25)) {
                 found = discovery.snapshot();
                 found.erase(std::remove_if(found.begin(), found.end(),   // hide our own RC beacon
                     [](lsl::stream_info& i) { return i.source_id().rfind("lsl-viewer-rc", 0) == 0; }),
                     found.end());
             }
-            if (autoConnect) {
-                for (auto& info : found) {
-                    if (dismissed.count(streamKey(info))) continue;   // user disconnected it
-                    if (isMarkerStream(info)) {
-                        bool conn = false;
-                        for (auto& m : markerSources)
-                            if (sameStream(*m, info)) { conn = true; break; }
-                        if (!conn) {
-                            auto m = std::make_unique<MarkerSource>(info);
-                            m->start();
-                            markerSources.push_back(std::move(m));
-                        }
-                    } else {
-                        bool conn = false;
-                        for (auto& s : sources)
-                            if (sameStream(*s, info)) { conn = true; break; }
-                        if (!conn) {
-                            auto _t0 = std::chrono::steady_clock::now();
-                            auto src = std::make_unique<HfStreamSource>(info, 10.0);
-                            src->start();
-                            sources.push_back(std::move(src));
-                            spdlog::debug("connect '{}' {:.2f} ms", info.name(),
-                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count());
-                        }
-                    }
+            // Connect / disconnect a stream — ONE implementation, shared by autoconnect,
+            // the row-click handler, the window-close (X), and the remote `select` command.
+            auto connected = [&](lsl::stream_info& info) {
+                for (auto& s : sources)       if (sameStream(*s, info)) return true;
+                for (auto& m : markerSources) if (sameStream(*m, info)) return true;
+                return false;
+            };
+            auto connectStream = [&](lsl::stream_info& info) {
+                dismissed.erase(streamKey(info));
+                if (isMarkerStream(info)) {
+                    auto m = std::make_unique<MarkerSource>(info); m->start();
+                    markerSources.push_back(std::move(m));
+                } else {
+                    const auto t = std::chrono::steady_clock::now();
+                    auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
+                    sources.push_back(std::move(s));
+                    spdlog::debug("connect '{}' {:.2f} ms", info.name(),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count());
                 }
-            }
+            };
+            auto disconnectKey = [&](const std::string& key) {
+                dismissed.insert(key);   // and don't auto-reconnect
+                auto it = std::find_if(sources.begin(), sources.end(),
+                    [&](const std::unique_ptr<HfStreamSource>& p) { return streamKeyOf(*p) == key; });
+                if (it != sources.end()) {   // data stream: deferred reap (markers reaped by the dismissed-sweep)
+                    edgeMap.erase(it->get()); pauseHead.erase(it->get()); dispOpts.erase(it->get());
+                    (*it)->requestStop(); closing.push_back(std::move(*it)); sources.erase(it);
+                }
+            };
+            if (autoConnect)
+                for (auto& info : found)
+                    if (!dismissed.count(streamKey(info)) && !connected(info))
+                        connectStream(info);
 
             // Snapshot each connected marker stream once per frame (only events within
             // the widest plot window, so a long recording stays cheap). Each gets a
@@ -1269,35 +1388,8 @@ int main(int argc, char** argv) {
                 markerViews.push_back(std::move(v));
             }
 
-            // Recording captures exactly the streams the viewer is connected to (a
-            // data window or a marker overlay) — "what you're viewing is what you
-            // record". There's no separate record selection.
-            auto connected = [&](lsl::stream_info& info) {
-                for (auto& s : sources)       if (sameStream(*s, info)) return true;
-                for (auto& m : markerSources) if (sameStream(*m, info)) return true;
-                return false;
-            };
-            // Connect / disconnect a stream — the same actions as clicking a row, used by
-            // the remote `select` command (recording captures whatever is connected).
-            auto connectStream = [&](lsl::stream_info& info) {
-                dismissed.erase(streamKey(info));
-                if (isMarkerStream(info)) {
-                    auto m = std::make_unique<MarkerSource>(info); m->start();
-                    markerSources.push_back(std::move(m));
-                } else {
-                    auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
-                    sources.push_back(std::move(s));
-                }
-            };
-            auto disconnectKey = [&](const std::string& key) {
-                dismissed.insert(key);   // and don't auto-reconnect
-                auto it = std::find_if(sources.begin(), sources.end(),
-                    [&](const std::unique_ptr<HfStreamSource>& p) { return streamKeyOf(*p) == key; });
-                if (it != sources.end()) {   // data stream: deferred reap (markers handled by the sweep below)
-                    edgeMap.erase(it->get()); pauseHead.erase(it->get()); dispOpts.erase(it->get());
-                    (*it)->requestStop(); closing.push_back(std::move(*it)); sources.erase(it);
-                }
-            };
+            // Recording captures exactly the streams the viewer is connected to (a data
+            // window or a marker overlay) — "what you're viewing is what you record".
             auto startRecording = [&]() {
                 std::vector<lsl::stream_info> rec;
                 for (auto& info : found) if (connected(info)) rec.push_back(info);
@@ -1314,8 +1406,7 @@ int main(int argc, char** argv) {
                 // Publish state at ~4 Hz (clients poll; rebuilding these strings every
                 // frame is the costly part). Requests below are still applied per frame.
                 static double lastPublish = -1e18;
-                if (ImGui::GetTime() - lastPublish > 0.25) {
-                    lastPublish = ImGui::GetTime();
+                if (dueEvery(lastPublish, 0.25)) {
                     std::string s;
                     for (auto& info : found) {
                         char ln[320];
@@ -1474,7 +1565,7 @@ int main(int argc, char** argv) {
                     // refresh it at ~4 Hz instead of every frame (it's just a label).
                     static std::string recPreview;
                     static double recPreviewAt = -1e18;
-                    if (ImGui::GetTime() - recPreviewAt > 0.25) { recPreviewAt = ImGui::GetTime(); recPreview = recFullPath(); }
+                    if (dueEvery(recPreviewAt, 0.25)) recPreview = recFullPath();
                     ImGui::TextDisabled("-> %s", recPreview.c_str());
                     ImGui::BeginDisabled(nConn == 0);
                     if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
@@ -1548,14 +1639,8 @@ int main(int argc, char** argv) {
                                                  info.uid().c_str(), info.hostname().c_str());
                     }
                     if (clicked) {
-                        if (!m) {                       // connect
-                            dismissed.erase(streamKey(info));
-                            auto ms = std::make_unique<MarkerSource>(info);
-                            ms->start();
-                            markerSources.push_back(std::move(ms));
-                        } else {                        // disconnect (no window to close)
-                            dismissed.insert(streamKey(info));   // and don't auto-reconnect
-                        }
+                        if (!m) connectStream(info);            // connect
+                        else    disconnectKey(streamKey(info)); // disconnect (no window to close)
                     }
                 } else {
                     HfStreamSource* csrc = nullptr;
@@ -1583,17 +1668,8 @@ int main(int argc, char** argv) {
                                           info.uid().c_str(), info.hostname().c_str(),
                                           csrc ? "focus" : "connect");
                     if (clicked) {
-                        if (!csrc) {
-                            dismissed.erase(streamKey(info));
-                            auto _t0 = std::chrono::steady_clock::now();
-                            auto src = std::make_unique<HfStreamSource>(info, 10.0);
-                            src->start();
-                            spdlog::debug("connect '{}' {:.2f} ms", info.name(),
-                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count());
-                            sources.push_back(std::move(src));
-                        } else {
-                            ImGui::SetWindowFocus(info.name().c_str());
-                        }
+                        if (!csrc) connectStream(info);                        // connect
+                        else       ImGui::SetWindowFocus(info.name().c_str());  // already on: focus its plot
                     }
                 }
                 ImGui::Separator();
@@ -1705,19 +1781,9 @@ int main(int argc, char** argv) {
                 ++winIdx;
             }
             pausedPrev = paused;
-            if (toRemove) {   // closing the window = disconnect
-                dismissed.insert(streamKeyOf(*toRemove));
-                edgeMap.erase(toRemove);
-                pauseHead.erase(toRemove);
-                dispOpts.erase(toRemove);
-                // Don't join the worker on the UI thread (it can block ~0.5 s while a
-                // pull/time_correction winds down). Signal stop, drop the window now,
-                // and reap below once the worker has actually exited (join is instant).
-                toRemove->requestStop();
-                auto it = std::find_if(sources.begin(), sources.end(),
-                    [&](const std::unique_ptr<HfStreamSource>& p) { return p.get() == toRemove; });
-                if (it != sources.end()) { closing.push_back(std::move(*it)); sources.erase(it); }
-                spdlog::debug("disconnect '{}' (deferred reap)", closing.back()->name());
+            if (toRemove) {   // closing the window (X) = disconnect (deferred worker reap)
+                spdlog::debug("disconnect '{}' (deferred reap)", toRemove->name());
+                disconnectKey(streamKeyOf(*toRemove));
             }
             std::erase_if(closing, [](const std::unique_ptr<HfStreamSource>& p) { return p->finished(); });
 
@@ -1770,7 +1836,7 @@ int main(int argc, char** argv) {
                 for (int c = 0; c < src->channels(); ++c) {
                     if (!fpass(c)) continue;
                     bool on = fftSel[c] != 0;
-                    if (ImGui::Checkbox(labels[c].c_str(), &on)) fftSel[c] = on ? 1 : 0;
+                    if (ImGui::Checkbox(labels[c].c_str(), &on)) { fftSel[c] = on ? 1 : 0; fftRefit = true; }  // recompute now (no stale/zero flash)
                 }
                 ImGui::EndChild();
 
@@ -1938,7 +2004,12 @@ int main(int argc, char** argv) {
                         Ndraw = std::clamp(Ndraw, 0, std::min(spectro.filled, spectro.cols));
                         const double bMaxDraw = bMax;
                         const double bMinDraw = bMax - (double)Ndraw * spectro.hopSec;
-                        if (Ndraw > 0) {
+                        // Columns are immutable once written, so drawBuf only changes when
+                        // the cursor or the visible count does — skip the transpose otherwise
+                        // (e.g. paused, or scrolling between hops with the same column set).
+                        if (Ndraw > 0 && (Ndraw != spectro.lastDrawNdraw ||
+                                          spectro.writeCol != spectro.lastDrawWriteCol)) {
+                            spectro.lastDrawNdraw = Ndraw; spectro.lastDrawWriteCol = spectro.writeCol;
                             const int fb = spectro.freqBins, C = spectro.cols;
                             spectro.drawBuf.resize((std::size_t)fb * Ndraw);
                             const int first = ((spectro.writeCol - Ndraw) % C + C) % C;  // oldest drawn
