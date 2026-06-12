@@ -209,11 +209,14 @@ struct PlotScratch {
     std::vector<std::string> tstr;    // backing storage for tick labels
     std::vector<int>         visIdx;  // indices of visible channels
     std::vector<MarkerEvent> markers; // merged enabled marker events for this plot
+    std::vector<float>       raster;  // channels x pixels p2p image (raster mode)
+    std::vector<int>         pmap;    // raster: pixel-column -> summary-bin index
 };
 
 struct DisplayOpts {
     float history     = 10.0f;
     bool  stacked     = true;   // EEG-style montage (vs shared-axis overlay)
+    bool  raster      = false;  // many-channel mode: one heatmap (color=p2p) vs N line series
     bool  filter      = true;   // show high-pass filtered signal
     float gainUv      = 150.0f; // µV mapped to one lane height (stacked)
     float spacing     = 0.0f;   // vertical offset between channels (overlay)
@@ -225,6 +228,12 @@ struct DisplayOpts {
     std::unordered_map<std::string, bool> markerOn;  // per-stream (id -> show; absent = on)
     bool cfgShown = true;                  // show the left config strip (else plot is full-width)
     float lastPlotPx = 0.0f;               // last frame's plot width (px) — for edge pixel-snapping
+    // Per-channel high-pass display-filter state cache (raw view): lets fillRaw resume the
+    // running filter from last frame's visible-window start instead of re-warming a 2 s tail
+    // every frame. Reset when the channel count or cutoff (hpCacheR) changes.
+    std::vector<float>         hpX1, hpY1;        // filter (x[n-1], y[n-1]) valid at hpIdx[c]
+    std::vector<std::uint64_t> hpIdx;             // old-frame index the cached state sits at
+    float                      hpCacheR = -1.0f;  // s.hpR() the cache was built with
 };
 
 // Stable per-channel color (by absolute channel index, so a channel keeps its
@@ -371,6 +380,15 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         o.visible.assign(C, 0);
         for (int c = 0; c < std::min(C, 16); ++c) o.visible[c] = 1;
     }
+    // (Re)size + invalidate the high-pass filter-state cache on a channel-count or cutoff
+    // change, so fillRaw can resume the filter instead of re-warming 2 s every frame.
+    if (o.filter) {
+        const float R = s.hpR();
+        if ((int)o.hpIdx.size() != C || o.hpCacheR != R) {
+            o.hpX1.assign(C, 0.0f); o.hpY1.assign(C, 0.0f);
+            o.hpIdx.assign(C, UINT64_MAX); o.hpCacheR = R;
+        }
+    }
     std::vector<float>& gain = s.chanGain();
     std::vector<float>& amp  = s.chanAmp();
 
@@ -393,6 +411,12 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::SetNextItemWidth(110);
         ImGui::SliderFloat("History (s)", &o.history, 1.0f, 60.0f, "%.0f");
         ImGui::Checkbox("Stacked montage", &o.stacked);
+        ImGui::BeginDisabled(!o.stacked);          // raster is a stacked-montage render style
+        ImGui::Checkbox("Raster", &o.raster);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("render the stacked montage as one heatmap (color = activity)\n"
+                              "instead of N line lanes — far cheaper at high channel counts");
+        ImGui::EndDisabled();
         ImGui::BeginDisabled(!o.stacked);          // lane gain: stacked montage only
         ImGui::SetNextItemWidth(110);
         ImGui::SliderFloat("Gain/lane", &o.gainUv, 5.0f, 2000.0f, "%.0f",
@@ -537,11 +561,26 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         xs.resize(vis); ys.resize(vis);
         if (o.filter) {
             const float R = s.hpR();
-            float x1 = p[c], y1 = 0.0f;                        // prime on the first sample
-            for (std::size_t i = 0; i < count; ++i) {
+            const std::uint64_t visIdx = start + (std::uint64_t)skip;  // first VISIBLE sample's index
+            // Resume the running filter from last frame's cached state if it sits inside
+            // this read window and at/before the visible start (forward scroll); else
+            // prime on the first sample and warm up over the whole `skip` tail.
+            float x1, y1; std::size_t fStart;
+            if (c < (int)o.hpIdx.size() && o.hpIdx[c] != UINT64_MAX &&
+                o.hpIdx[c] >= start && o.hpIdx[c] <= visIdx) {
+                x1 = o.hpX1[c]; y1 = o.hpY1[c]; fStart = (std::size_t)(o.hpIdx[c] - start);
+            } else {
+                x1 = p[c]; y1 = 0.0f; fStart = 0;
+            }
+            for (std::size_t i = fStart; i < skip; ++i) {     // advance to the visible start
                 const float xc = p[i * (std::size_t)C + c];
                 const float yy = xc - x1 + R * y1; x1 = xc; y1 = yy;
-                if (i >= skip) ys[i - skip] = yy;
+            }
+            if (c < (int)o.hpIdx.size()) { o.hpX1[c] = x1; o.hpY1[c] = y1; o.hpIdx[c] = visIdx; }
+            for (std::size_t i = skip; i < count; ++i) {      // filter + emit the visible window
+                const float xc = p[i * (std::size_t)C + c];
+                const float yy = xc - x1 + R * y1; x1 = xc; y1 = yy;
+                ys[i - skip] = yy;
             }
         } else {
             for (int j = 0; j < vis; ++j)
@@ -560,6 +599,73 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     if (followX && o.lastPlotPx > 1.0f && o.history > 0.0f) {
         const double secPerPx = (double)o.history / (double)o.lastPlotPx;
         xedge = std::round(edge / secPerPx) * secPerPx;
+    }
+
+    // ---- Raster: a render style OF the stacked montage — all visible channels as one
+    // heatmap (color = per-bin peak-to-peak activity), a single PlotHeatmap drawcall
+    // regardless of channel count. The scalable view for many (32-256) channels, where
+    // line traces are too short to read. Only applies to the stacked layout (there's no
+    // meaningful overlay heatmap), so overlay mode below ignores it. Reuses the envelope.
+    if (o.stacked && o.raster) {
+        if (ImPlot::BeginPlot("##plot", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
+            ImPlot::SetupAxes("time (s)", nullptr,
+                              ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+            if (followX)
+                ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)show, ImPlotCond_Always);
+            sc.tvals.resize(show); sc.tlabs.resize(show); sc.tstr.resize(show);
+            for (int j = 0; j < show; ++j) {                  // channel names at row centers
+                sc.tvals[j] = (double)show - 0.5 - (double)j;  // row j (0 = top = first visible)
+                sc.tstr[j]  = labels[sc.visIdx[j]];
+                sc.tlabs[j] = sc.tstr[j].c_str();
+            }
+            ImPlot::SetupAxisTicks(ImAxis_Y1, sc.tvals.data(), show, sc.tlabs.data());
+            const int px = std::max(64, (int)ImPlot::GetPlotSize().x);
+            o.lastPlotPx = ImPlot::GetPlotSize().x;
+
+            // Build ONE heatmap cell per pixel column, mapped to the pixel-snapped axis
+            // range, so cells align to the pixel grid and don't shimmer as the view
+            // scrolls (the native ~0.03 s summary bins are ~2 px wide -> sub-pixel drift).
+            const std::size_t maxBins = envelopeBins();
+            const float  inv      = (o.gainUv > 0.0f) ? 1.0f / o.gainUv : 0.0f;
+            const double bMin     = xedge - o.history, bMax = xedge;        // snapped axis range
+            const double secPerPx = o.history / (double)px;
+            sc.x.resize(maxBins); sc.mn.resize(maxBins); sc.mx.resize(maxBins);
+            // Channel 0 also builds the pixel-column -> summary-bin resample map (the bin
+            // grid is shared by all channels, so it's computed once).
+            const int n0 = (show > 0)
+                ? summ.read(sc.visIdx[0], maxBins, dt, t0, sc.x.data(), sc.mn.data(), sc.mx.data(), endBin) : 0;
+            if (n0 > 0) {
+                s.applyGaps(sc.x.data(), n0);
+                sc.pmap.resize(px);
+                int bi = 0;
+                for (int k = 0; k < px; ++k) {
+                    const double tk = bMin + ((double)k + 0.5) * secPerPx;     // pixel-center time
+                    while (bi < n0 - 1 && (double)sc.x[bi + 1] <= tk) ++bi;     // nearest bin
+                    sc.pmap[k] = (bi < n0 - 1 && (tk - sc.x[bi]) > (sc.x[bi + 1] - tk)) ? bi + 1 : bi;
+                }
+                sc.raster.resize((std::size_t)show * px);                       // row-major, row 0 = top
+                for (int k = 0; k < px; ++k) sc.raster[k] = (sc.mx[sc.pmap[k]] - sc.mn[sc.pmap[k]]) * inv;
+                for (int j = 1; j < show; ++j) {
+                    summ.read(sc.visIdx[j], maxBins, dt, t0, sc.x.data(), sc.mn.data(), sc.mx.data(), endBin);
+                    float* dst = sc.raster.data() + (std::size_t)j * px;
+                    for (int k = 0; k < px; ++k) dst[k] = (sc.mx[sc.pmap[k]] - sc.mn[sc.pmap[k]]) * inv;
+                }
+                ImPlot::PushColormap(ImPlotColormap_Viridis);
+                ImPlot::PlotHeatmap("##r", sc.raster.data(), show, px, 0.0, 1.0, nullptr,
+                                    ImPlotPoint(bMin, 0.0), ImPlotPoint(bMax, (double)show));
+                drawDropoutRed(s, 0.0, 0.0);
+                drawMarkers(sc.markers);
+                ImPlot::EndPlot();
+                ImGui::SameLine();
+                ImPlot::ColormapScale("p2p", 0.0, (double)o.gainUv, ImVec2(60, -1), "%.0f");
+                ImPlot::PopColormap();
+            } else {
+                ImPlot::EndPlot();
+            }
+        }
+        ImGui::EndChild();  // plt
+        return;
     }
 
     // ---- Stacked montage: one lane per visible channel, gain-scaled ----------
@@ -815,15 +921,20 @@ struct Erp {
     int    streamIdx = 0, channel = 0, markerIdx = 0;
     float  preMs = 100.0f, postMs = 500.0f;
     bool   baseline = true;
+    bool   allCh   = false;                     // average ALL channels (up to maxCh) vs the single 'channel'
+    int    maxCh   = 32;                         // channel cap when allCh (matches the time-series raster)
+    bool   raster  = false;                     // render as a channels x time heatmap (one row per channel)
+    float  imgHalf = 50.0f;                       // raster color half-range (from the averages)
     ImGuiTextFilter streamFilter, chanFilter, markerFilter, labelFilter;
 
     // epoch shape (recomputed on reset)
-    int    nbins = 0, pre = 0;
+    int    nbins = 0, pre = 0, nchan = 0;       // nchan = active channel count (1 = single, else allCh set)
+    std::vector<int>                chans;      // active channel indices (size nchan)
     std::vector<float>              taxis;      // ms, -pre .. +post
-    std::vector<double>            sumv;        // running sum (double for accuracy)
+    std::vector<double>            sumv;        // running sum, nchan x nbins row-major (double for accuracy)
     int                            count = 0;   // epochs folded
-    std::vector<std::vector<float>> epochs;     // recent epochs (capped) for spaghetti
-    std::vector<float>             avg;         // scratch: sum/count for plotting
+    std::vector<std::vector<float>> epochs;     // recent SINGLE-channel epochs (capped) for spaghetti
+    std::vector<float>             avg;         // scratch: sum/count, nchan x nbins row-major
 
     std::vector<double>  pending;               // event display-times awaiting post-data
     std::uint64_t        lastSeq = 0;
@@ -837,8 +948,8 @@ struct Erp {
 };
 
 static void erpClear(Erp& e) {
-    e.sumv.assign(e.nbins, 0.0);
-    e.avg.assign(e.nbins, 0.0f);
+    e.sumv.assign((std::size_t)e.nchan * e.nbins, 0.0);
+    e.avg.assign((std::size_t)e.nchan * e.nbins, 0.0f);
     e.count = 0;
     e.epochs.clear();
     e.pending.clear();
@@ -851,6 +962,15 @@ static void erpReset(Erp& e, HfStreamSource& s, const std::string& mUid) {
     e.nbins = e.pre + post;
     e.taxis.resize(e.nbins);
     for (int i = 0; i < e.nbins; ++i) e.taxis[i] = (float)((double)(i - e.pre) * dt * 1000.0);
+    // Active channel set: all channels (capped) when allCh, else just the selected one.
+    e.chans.clear();
+    if (e.allCh) {
+        const int n = std::min(s.channels(), std::max(1, e.maxCh));
+        for (int c = 0; c < n; ++c) e.chans.push_back(c);
+    } else {
+        e.chans.push_back(std::min(e.channel, std::max(0, s.channels() - 1)));
+    }
+    e.nchan = (int)e.chans.size();
     erpClear(e);
     e.lastSeq = 0; e.seqInit = false;
     e.sUid = s.uid(); e.mUid = mUid;
@@ -885,31 +1005,56 @@ static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
         if (head > cap && (std::uint64_t)start < head - cap) continue;   // scrolled out of ring: drop
         if ((std::uint64_t)start + (std::uint64_t)e.nbins > head) { still.push_back(T); continue; }
         const float* p = s.ring().windowAt((std::uint64_t)start);
-        std::vector<float> ep(e.nbins);
-        for (int i = 0; i < e.nbins; ++i) ep[i] = p[(std::size_t)i * C + e.channel];
-        if (e.baseline) {                                               // subtract pre-event mean
-            double m = 0.0; for (int i = 0; i < e.pre; ++i) m += ep[i];
-            const float b = (float)(m / std::max(1, e.pre));
-            for (auto& v : ep) v -= b;
+        // Fold this epoch into every active channel's running sum (baseline-corrected
+        // per channel). One window read, strided by channel.
+        for (int ci = 0; ci < e.nchan; ++ci) {
+            const int ch = e.chans[ci];
+            double* sv = e.sumv.data() + (std::size_t)ci * e.nbins;
+            float b = 0.0f;
+            if (e.baseline) {                                           // subtract pre-event mean
+                double m = 0.0; for (int i = 0; i < e.pre; ++i) m += p[(std::size_t)i * C + ch];
+                b = (float)(m / std::max(1, e.pre));
+            }
+            for (int i = 0; i < e.nbins; ++i) sv[i] += p[(std::size_t)i * C + ch] - b;
         }
-        for (int i = 0; i < e.nbins; ++i) e.sumv[i] += ep[i];
         ++e.count;
-        e.epochs.push_back(std::move(ep));
-        if ((int)e.epochs.size() > kErpMaxSpaghetti) e.epochs.erase(e.epochs.begin());
+        if (e.nchan == 1) {                                             // keep epochs for spaghetti (single channel only)
+            const int ch = e.chans[0];
+            std::vector<float> ep(e.nbins);
+            float b = 0.0f;
+            if (e.baseline) { double m = 0.0; for (int i = 0; i < e.pre; ++i) m += p[(std::size_t)i * C + ch];
+                              b = (float)(m / std::max(1, e.pre)); }
+            for (int i = 0; i < e.nbins; ++i) ep[i] = p[(std::size_t)i * C + ch] - b;
+            e.epochs.push_back(std::move(ep));
+            if ((int)e.epochs.size() > kErpMaxSpaghetti) e.epochs.erase(e.epochs.begin());
+        }
         added = true;
     }
     e.pending.swap(still);
 
-    // Robust Y range: ~95th percentile of |sample| across recent epochs, so an
-    // occasional spike/artifact epoch doesn't blow the scale out (the average then
-    // looks flat). Recomputed only when an epoch folds in.
-    if (added && !e.epochs.empty()) {
+    // Robust ranges, recomputed when an epoch folds in:
+    //  - yHalf  (line Y axis): single channel uses the spread of individual epochs so the
+    //    spaghetti fits; multi-channel uses the average spread (no spaghetti there).
+    //  - imgHalf (raster color): always the average spread (the raster shows averages).
+    if (added && e.count > 0) {
+        for (std::size_t k = 0; k < e.avg.size(); ++k) e.avg[k] = (float)(e.sumv[k] / e.count);
+        auto pct95 = [&](const std::vector<float>& absv) {
+            if (absv.empty()) return 1.0f;
+            std::vector<float> w = absv;
+            const std::size_t k = (std::size_t)(0.95 * (w.size() - 1));
+            std::nth_element(w.begin(), w.begin() + k, w.end());
+            return std::max(1e-3f, w[k] * 1.2f);
+        };
         e.yscratch.clear();
-        for (const auto& ep : e.epochs)
-            for (float v : ep) e.yscratch.push_back(std::fabs(v));
-        const std::size_t k = (std::size_t)(0.95 * (e.yscratch.size() - 1));
-        std::nth_element(e.yscratch.begin(), e.yscratch.begin() + k, e.yscratch.end());
-        e.yHalf = std::max(1e-3f, e.yscratch[k] * 1.2f);
+        for (float v : e.avg) e.yscratch.push_back(std::fabs(v));
+        e.imgHalf = pct95(e.yscratch);
+        if (e.nchan == 1 && !e.epochs.empty()) {
+            e.yscratch.clear();
+            for (const auto& ep : e.epochs) for (float v : ep) e.yscratch.push_back(std::fabs(v));
+            e.yHalf = pct95(e.yscratch);
+        } else {
+            e.yHalf = e.imgHalf;
+        }
     }
 }
 
@@ -1945,7 +2090,10 @@ int main(int argc, char** argv) {
                     src = sources[erp.streamIdx].get();
                     if (erp.channel >= src->channels()) { erp.channel = 0; reset = true; }
                     const auto& labels = src->labels();
-                    ImGui::SameLine(); ImGui::SetNextItemWidth(110);
+                    // single-channel picker (disabled when averaging all channels)
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(erp.allCh);
+                    ImGui::SetNextItemWidth(110);
                     const char* chn = (erp.channel < (int)labels.size()) ? labels[erp.channel].c_str() : "ch";
                     if (ImGui::BeginCombo("channel", chn)) {
                         erp.chanFilter.Draw("##chf", -1.0f);
@@ -1956,6 +2104,13 @@ int main(int argc, char** argv) {
                             }
                         }
                         ImGui::EndCombo();
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("all channels", &erp.allCh)) reset = true;  // average every channel
+                    if (erp.allCh) {
+                        ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+                        if (ImGui::SliderInt("max ch", &erp.maxCh, 1, std::max(1, src->channels()))) reset = true;
                     }
                     // trigger marker stream
                     ImGui::SetNextItemWidth(140);
@@ -1983,7 +2138,11 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Clear")) erpClear(erp);
                     ImGui::SameLine();
-                    ImGui::TextDisabled("%d epoch%s averaged", erp.count, erp.count == 1 ? "" : "s");
+                    ImGui::Checkbox("raster", &erp.raster);   // channels x time heatmap, one row per channel
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("render the averaged ERP as a channels x time heatmap (color = µV),\none row per channel — the trigger-aligned twin of the time-series raster");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%d epoch%s", erp.count, erp.count == 1 ? "" : "s");
 
                     if (src->srate() <= 0.0) {
                         ImGui::TextUnformatted("data stream has no regular rate");
@@ -1991,34 +2150,77 @@ int main(int argc, char** argv) {
                         if (reset) erpReset(erp, *src, mk->uid());
                         if (!paused) erpUpdate(erp, *src, *mk);
 
-                        if (ImPlot::BeginPlot("##erp", ImVec2(-1, -1))) {
-                            ImPlot::SetupAxes("time (ms)", labels[erp.channel].c_str());
+                        // Prominent t=0 onset marker: a white core over a dark halo so it
+                        // reads on any colormap cell or line color behind it.
+                        auto onsetLine = [](double y0, double y1) {
+                            ImDrawList* dl = ImPlot::GetPlotDrawList();
+                            const ImVec2 a = ImPlot::PlotToPixels(0.0, y0), b = ImPlot::PlotToPixels(0.0, y1);
+                            dl->AddLine(a, b, IM_COL32(0, 0, 0, 170), 3.5f);
+                            dl->AddLine(a, b, IM_COL32(255, 255, 255, 235), 1.5f);
+                        };
+
+                        if (erp.raster) {
+                            // channels x time heatmap (one row per channel) of the averaged ERP —
+                            // the trigger-aligned twin of the time-series raster. erp.avg is already
+                            // nchan x nbins row-major, so it feeds PlotHeatmap directly.
+                            if (erp.nchan == 0 || erp.nbins == 0 || erp.count == 0) {
+                                ImGui::TextDisabled("waiting for epochs...");
+                            } else if (ImPlot::BeginPlot("##erpr", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
+                                ImPlot::SetupAxes("time (ms)", nullptr,
+                                                  ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+                                ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, ImPlotCond_Always);
+                                ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)erp.nchan, ImPlotCond_Always);
+                                // channel-name ticks at row centers (row 0 = top = first channel)
+                                std::vector<double> tvals(erp.nchan);
+                                std::vector<const char*> tlabs(erp.nchan);
+                                for (int j = 0; j < erp.nchan; ++j) {
+                                    tvals[j] = (double)erp.nchan - 0.5 - j;
+                                    const int ch = erp.chans[j];
+                                    tlabs[j] = (ch < (int)labels.size()) ? labels[ch].c_str() : "";
+                                }
+                                ImPlot::SetupAxisTicks(ImAxis_Y1, tvals.data(), erp.nchan, tlabs.data());
+                                // Diverging map, symmetric about 0; scale inverted so +µV = red (warm).
+                                ImPlot::PushColormap(ImPlotColormap_RdBu);
+                                ImPlot::PlotHeatmap("##i", erp.avg.data(), erp.nchan, erp.nbins,
+                                                    erp.imgHalf, -erp.imgHalf, nullptr,
+                                                    ImPlotPoint(-erp.preMs, 0.0),
+                                                    ImPlotPoint(erp.postMs, (double)erp.nchan));
+                                onsetLine(0.0, (double)erp.nchan);
+                                ImPlot::EndPlot();
+                                ImGui::SameLine();
+                                ImPlot::ColormapScale("uV", -erp.imgHalf, erp.imgHalf, ImVec2(60, -1), "%.0f");
+                                ImPlot::PopColormap();
+                            }
+                        } else if (ImPlot::BeginPlot("##erp", ImVec2(-1, -1))) {
+                            const bool single = (erp.nchan == 1);
+                            ImPlot::SetupAxes("time (ms)",
+                                single ? ((erp.chans[0] < (int)labels.size()) ? labels[erp.chans[0]].c_str() : "uV")
+                                       : "uV");
                             ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, ImPlotCond_Always);
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -erp.yHalf, erp.yHalf, ImPlotCond_Always);
-                            // event-onset marker at t = 0
-                            double zx[2] = {0, 0};
-                            if (erp.nbins > 0) {
-                                // faint individual epochs (spaghetti) behind
-                                for (auto& ep : erp.epochs) {
-                                    ImPlotSpec sp; sp.LineColor = ImVec4(0.6f, 0.6f, 0.7f, 0.18f);
-                                    sp.LineWeight = 1.0f;
-                                    ImPlot::PlotLine("##sp", erp.taxis.data(), ep.data(), erp.nbins, sp);
-                                }
-                                // bold running average on top
-                                if (erp.count > 0) {
-                                    for (int i = 0; i < erp.nbins; ++i)
-                                        erp.avg[i] = (float)(erp.sumv[i] / erp.count);
+                            if (erp.nbins > 0 && erp.count > 0) {
+                                if (single) {
+                                    // single channel: faint individual epochs (spaghetti) behind the average
+                                    for (auto& ep : erp.epochs) {
+                                        ImPlotSpec sp; sp.LineColor = ImVec4(0.6f, 0.6f, 0.7f, 0.18f);
+                                        sp.LineWeight = 1.0f;
+                                        ImPlot::PlotLine("##sp", erp.taxis.data(), ep.data(), erp.nbins, sp);
+                                    }
                                     ImPlotSpec sp; sp.LineColor = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
                                     sp.LineWeight = 2.5f;
-                                    ImPlot::PlotLine("average", erp.taxis.data(), erp.avg.data(),
-                                                     erp.nbins, sp);
+                                    ImPlot::PlotLine("average", erp.taxis.data(), erp.avg.data(), erp.nbins, sp);
+                                } else {
+                                    // multi channel: one average line per channel (ImPlot auto-colors; legend = names)
+                                    for (int ci = 0; ci < erp.nchan; ++ci) {
+                                        const int ch = erp.chans[ci];
+                                        const char* nm = (ch < (int)labels.size()) ? labels[ch].c_str() : "ch";
+                                        ImPlot::PlotLine(nm, erp.taxis.data(),
+                                                         erp.avg.data() + (std::size_t)ci * erp.nbins, erp.nbins);
+                                    }
                                 }
                             }
                             const ImPlotRect lr = ImPlot::GetPlotLimits();
-                            (void)zx;
-                            ImPlot::GetPlotDrawList()->AddLine(
-                                ImPlot::PlotToPixels(0.0, lr.Y.Min), ImPlot::PlotToPixels(0.0, lr.Y.Max),
-                                ImGui::GetColorU32(ImGuiCol_Text, 0.45f), 1.0f);   // onset line (theme)
+                            onsetLine(lr.Y.Min, lr.Y.Max);
                             ImPlot::EndPlot();
                         }
                     }

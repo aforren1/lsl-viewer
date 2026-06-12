@@ -314,4 +314,27 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->CaptureScreenshotWindow("//Spectrum", ImGuiCaptureFlags_HideMouseCursor);
     };
 
+    // ERP raster: channels x time heatmap of the trigger-averaged response. Run the
+    // evoked demo so MockEvoked / MockEvokedMarkers are the default ERP stream+trigger
+    // (index 0); the 32-ch MockEEG also feeds the multi-channel views.
+    //   python tools/lsl_test_streams.py --streams eeg,evoked
+    t = IM_REGISTER_TEST(e, "ui", "capture_erp_raster");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SleepNoSkip(3.0f, 1.0f / 30.0f);    // wait for discovery + autoconnect
+        if (ctx->GetWindowByRef("//MockEvoked") == nullptr) { ctx->LogInfo("no evoked stream; skip"); return; }
+        ctx->MenuClick("//##MainMenuBar/View/New ERP (marker average)");
+        ctx->Yield(2);
+        if (ctx->GetWindowByRef("//ERP 1") == nullptr) { ctx->LogInfo("no ERP window; skip"); return; }
+        ctx->SetRef("//ERP 1");
+        ctx->SleepNoSkip(25.0f, 1.0f / 30.0f);   // accumulate ~30 epochs (single channel + spaghetti)
+        ctx->CaptureScreenshotWindow("//ERP 1", ImGuiCaptureFlags_HideMouseCursor);  // 1) single-ch lines + spaghetti
+        ctx->ItemCheck("all channels");
+        ctx->SleepNoSkip(8.0f, 1.0f / 30.0f);    // refill averages for every channel
+        ctx->CaptureScreenshotWindow("//ERP 1", ImGuiCaptureFlags_HideMouseCursor);  // 2) multi-ch average lines
+        ctx->ItemCheck("raster");
+        ctx->MouseMoveToPos(ImVec2(5, 5));       // park cursor off the controls (no hover tooltip)
+        ctx->Yield(3);
+        ctx->CaptureScreenshotWindow("//ERP 1", ImGuiCaptureFlags_HideMouseCursor);  // 3) channels x time raster
+    };
+
 }
