@@ -62,6 +62,10 @@ public:
         // Raw ring: hold kMaxHistory seconds of interleaved samples.
         const std::size_t hist = (std::size_t)(rate * kMaxHistory);
         ring_.init(channels_, std::max<std::size_t>(hist, 4096));
+        // Parallel filtered ring (same shape/indices) holding the display-filter chain
+        // output, so the FFT / spectrogram / zoomed line view can read filtered samples
+        // at full rate without re-running the filter per window.
+        ringHp_.init(channels_, std::max<std::size_t>(hist, 4096));
 
         // One min/max level sized for the most zoomed-out window: pick B so the
         // full window is ~kTargetBins bins (≈ 1 bin/pixel at max zoom-out).
@@ -72,6 +76,8 @@ public:
 
         hp_.init(channels_, 0.999f);   // running high-pass; R set per chunk
         setHighpassHz(0.5);            // default 0.5 Hz display high-pass
+        notch_.init(channels_);        // optional mains notch + low-pass (off by default)
+        lp_.init(channels_);
 
         // Default channel labels; refined from desc() XML once connected.
         labels_.resize(channels_);
@@ -120,11 +126,23 @@ public:
     void setHighpassHz(double fc) {
         hpR_.store(DcBlocker::cutoffToR(fc, srate_), std::memory_order_relaxed);
     }
+    // Optional notch (mains 50/60 Hz) and low-pass stages of the display filter chain
+    // (high-pass -> notch -> low-pass), feeding the filtered envelope. The producer
+    // reads these atomics per chunk and reconfigures the biquads when they change.
+    void setNotch(bool on)        { notchOn_.store(on, std::memory_order_relaxed); }
+    void setNotchHz(double f0)    { notchHz_.store((float)f0, std::memory_order_relaxed); }
+    void setLowpass(bool on)      { lpOn_.store(on, std::memory_order_relaxed); }
+    void setLowpassHz(double fc)  { lpHz_.store((float)fc, std::memory_order_relaxed); }
+    // Re-reference montage applied as the FIRST stage of the conditioned (filtered)
+    // chain: 0 = none, 1 = common-average (CAR), 2 = single reference channel.
+    void setReference(int mode)   { refMode_.store(mode, std::memory_order_relaxed); }
+    void setRefChannel(int c)     { refChan_.store(c, std::memory_order_relaxed); }
 
     // --- live state (lock-free reads from the render thread) -----------------
-    InterleavedRing&     ring()       { return ring_; }
+    InterleavedRing&     ring()       { return ring_; }       // raw full-rate
+    InterleavedRing&     ringHp()     { return ringHp_; }     // filter-chain full-rate (FFT/spectro/zoom)
     MinMaxSummary&       summary()    { return summary_; }    // raw envelope
-    MinMaxSummary&       summaryHp()  { return summaryHp_; }  // high-pass filtered
+    MinMaxSummary&       summaryHp()  { return summaryHp_; }  // filtered envelope
     std::vector<float>&  chanGain()   { return chanGain_; }   // per-channel display gain
     std::vector<float>&  chanAmp()    { return chanAmp_; }    // measured µV amplitude
     bool          anchored() const { return anchored_.load(std::memory_order_acquire); }
@@ -171,6 +189,11 @@ public:
     }
     float hpR() const { return hpR_.load(std::memory_order_relaxed); }  // for on-the-fly filtering
 
+    // --- stream health (lock-free reads) -------------------------------------
+    double        measuredRate() const { return measuredRate_.load(std::memory_order_relaxed); }   // EMA samples/s
+    double        clockOffset()  const { return clockOffset_.load(std::memory_order_relaxed); }     // remote->local (s)
+    std::uint64_t dropouts()     const { return dropouts_.load(std::memory_order_relaxed); }        // recorded gaps
+
     // Snapshot of channel labels / units (written once on connect, under a lock).
     // Channel labels/units are write-once: ctor defaults, finalized once by
     // parseLabels just after connect. Once finalized they're immutable, so we hand
@@ -191,6 +214,55 @@ public:
 private:
     double effectiveRate() const { return srate_ > 0.0 ? srate_ : 100.0; }
 
+    // Re-reference montage, the first stage of the conditioned chain: subtract a common
+    // reference from every channel. Returns `in` unchanged when off, else fills `scratch`
+    // and returns it. Producer-only (reads the mode/channel atomics).
+    const float* reference(const float* in, float* scratch, std::size_t n) {
+        const int mode = refMode_.load(std::memory_order_relaxed);
+        const int C = channels_;
+        if (mode == 0 || C <= 1) return in;
+        if (mode == 2) {                                   // single reference channel
+            int rc = refChan_.load(std::memory_order_relaxed);
+            if (rc < 0 || rc >= C) rc = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float* x = in + i * (std::size_t)C;
+                float* o = scratch + i * (std::size_t)C;
+                const float r = x[rc];
+                for (int c = 0; c < C; ++c) o[c] = x[c] - r;
+            }
+        } else {                                           // common-average reference
+            for (std::size_t i = 0; i < n; ++i) {
+                const float* x = in + i * (std::size_t)C;
+                float* o = scratch + i * (std::size_t)C;
+                float sum = 0.0f; for (int c = 0; c < C; ++c) sum += x[c];
+                const float m = sum / (float)C;
+                for (int c = 0; c < C; ++c) o[c] = x[c] - m;
+            }
+        }
+        return scratch;
+    }
+
+    // Reconfigure the notch/low-pass biquads from the UI atomics (only on change) and
+    // apply the enabled stages in place to the already-high-passed buffer. Producer-only.
+    void applyPostFilters(float* x, std::size_t n) {
+        const bool  non = notchOn_.load(std::memory_order_relaxed);
+        const float nf  = notchHz_.load(std::memory_order_relaxed);
+        if (non != notchApplied_ || nf != notchHzApplied_) {
+            notch_.enabled = non;
+            if (non) notch_.setNotch(nf, srate_, 30.0);   // narrow (Q=30): only the mains line
+            notchApplied_ = non; notchHzApplied_ = nf;
+        }
+        const bool  lon = lpOn_.load(std::memory_order_relaxed);
+        const float lf  = lpHz_.load(std::memory_order_relaxed);
+        if (lon != lpApplied_ || lf != lpHzApplied_) {
+            lp_.enabled = lon;
+            if (lon) lp_.setLowpass(lf, srate_, 0.70710678);  // Butterworth
+            lpApplied_ = lon; lpHzApplied_ = lf;
+        }
+        if (notch_.enabled) notch_.process(x, n);
+        if (lp_.enabled)    lp_.process(x, n);
+    }
+
     void run(std::stop_token st) {
         // Set on ANY exit (return/exception) so the owner can reap us off the UI
         // thread: it stops + drops the window now, then joins once finished() is true
@@ -208,11 +280,13 @@ private:
             try { parseLabels(inlet.info(2.0)); } catch (...) { /* keep defaults */ }
 
             double offset = inlet.time_correction(2.0);   // remote -> local clock
+            clockOffset_.store(offset, std::memory_order_relaxed);
             double lastCorr = lsl::local_clock();
 
             std::vector<float>  buf(chunkSamples_ * (std::size_t)channels_);
             std::vector<double> ts(chunkSamples_);
             std::vector<float>  hpBuf(chunkSamples_ * (std::size_t)channels_);
+            std::vector<float>  refBuf(chunkSamples_ * (std::size_t)channels_);  // re-reference scratch
 
             while (!st.stop_requested()) {
                 const std::size_t got = inlet.pull_chunk_multiplexed(
@@ -220,7 +294,20 @@ private:
                 if (got == 0) continue;
                 const std::size_t n = got / (std::size_t)channels_;
                 if (n == 0) continue;
-                lastData_.store(lsl::local_clock(), std::memory_order_relaxed);
+                const double tnow = lsl::local_clock();
+                lastData_.store(tnow, std::memory_order_relaxed);
+                // Measured incoming rate (EMA samples/s) — the actual delivery rate, which
+                // a quick glance against nominal exposes a misconfigured or struggling source.
+                if (lastChunkT_ > 0.0) {
+                    const double dtc = tnow - lastChunkT_;
+                    if (dtc > 1e-6) {
+                        const double inst = (double)n / dtc;
+                        const double cur  = measuredRate_.load(std::memory_order_relaxed);
+                        measuredRate_.store(cur <= 0.0 ? inst : cur + 0.1 * (inst - cur),
+                                            std::memory_order_relaxed);
+                    }
+                }
+                lastChunkT_ = tnow;
 
                 const std::uint64_t headBefore = ring_.head();
 
@@ -246,6 +333,7 @@ private:
                         if (g > 0.25) {   // s; above jitter, below real dropouts
                             const double oldTime = t0_.load(std::memory_order_acquire)
                                                  + (double)headBefore * dt_;
+                            dropouts_.fetch_add(1, std::memory_order_relaxed);
                             std::lock_guard<std::mutex> lk(gapMtx_);
                             gaps_.push_back({oldTime, g});
                             // Fold gaps far older than any visible window into a constant
@@ -264,15 +352,19 @@ private:
                 // Publish: head advances now, with the gap (if any) already recorded.
                 ring_.write(buf.data(), n);        // one memcpy
                 summary_.append(buf.data(), n);    // fold, cache-hot
+                // Conditioned chain: re-reference -> high-pass -> notch -> low-pass.
+                const float* condIn = reference(buf.data(), refBuf.data(), n);
                 hp_.setR(hpR_.load(std::memory_order_relaxed));   // running high-pass
-                hp_.process(buf.data(), hpBuf.data(), n);
+                hp_.process(condIn, hpBuf.data(), n);
+                applyPostFilters(hpBuf.data(), n);                // optional notch + low-pass
+                ringHp_.write(hpBuf.data(), n);                   // full-rate filtered (FFT/spectro/zoom)
                 summaryHp_.append(hpBuf.data(), n);
 
                 const double now = lsl::local_clock();
                 if (now - lastCorr > 5.0) {        // refresh for cross-stream align
                     // A transient timeout here (stream briefly down) must NOT kill the
                     // worker — recover=true on the inlet reconnects the pull on its own.
-                    try { offset = inlet.time_correction(1.0); }
+                    try { offset = inlet.time_correction(1.0); clockOffset_.store(offset, std::memory_order_relaxed); }
                     catch (const std::exception&) { /* keep previous offset */ }
                     lastCorr = now;
                 }
@@ -300,7 +392,7 @@ private:
 
             std::vector<float> cur(channels_, 0.0f);     // most recent (held) value
             std::vector<float> in(channels_);            // one pulled sample
-            std::vector<float> out, hpOut;
+            std::vector<float> out, hpOut, refOut;
             std::uint64_t      written = 0;              // grid samples emitted
             double             t0local = 0.0;            // local time of grid sample 0
             bool               started = false;
@@ -339,9 +431,13 @@ private:
                             out[i * (std::size_t)channels_ + c] = cur[c];
                     ring_.write(out.data(), batch);
                     summary_.append(out.data(), batch);
+                    refOut.resize(batch * (std::size_t)channels_);
+                    const float* condIn = reference(out.data(), refOut.data(), batch);
                     hp_.setR(hpR_.load(std::memory_order_relaxed));
                     hpOut.resize(batch * (std::size_t)channels_);
-                    hp_.process(out.data(), hpOut.data(), batch);
+                    hp_.process(condIn, hpOut.data(), batch);
+                    applyPostFilters(hpOut.data(), batch);        // optional notch + low-pass
+                    ringHp_.write(hpOut.data(), batch);           // full-rate filtered
                     summaryHp_.append(hpOut.data(), batch);
                     written += batch;
                 }
@@ -385,13 +481,22 @@ private:
     int              bin_ = 32;
     std::size_t      chunkSamples_ = 1024;
 
-    InterleavedRing  ring_;
-    MinMaxSummary    summary_;     // raw
-    MinMaxSummary    summaryHp_;   // high-pass filtered
+    InterleavedRing  ring_;        // raw full-rate
+    InterleavedRing  ringHp_;      // filter-chain full-rate (parallel to ring_)
+    MinMaxSummary    summary_;     // raw envelope
+    MinMaxSummary    summaryHp_;   // filtered envelope
 
-    // Producer-only DC blocker; cutoff R is read atomically (UI may change).
+    // Producer-only display filter chain: DC blocker (high-pass) -> notch -> low-pass.
+    // Cutoffs/enables are read atomically (UI may change); biquad state is producer-only.
     DcBlocker           hp_;
     std::atomic<float>  hpR_{0.999f};
+    Biquad              notch_, lp_;
+    std::atomic<bool>   notchOn_{false}, lpOn_{false};
+    std::atomic<float>  notchHz_{60.0f}, lpHz_{40.0f};
+    std::atomic<int>    refMode_{0}, refChan_{0};   // 0 none / 1 CAR / 2 single-channel
+    // last-applied params, so the producer only recomputes coeffs on change
+    bool                notchApplied_ = false, lpApplied_ = false;
+    float               notchHzApplied_ = -1.0f, lpHzApplied_ = -1.0f;
 
     // Render-thread-only display state (one plot per source).
     std::vector<float>  chanGain_, chanAmp_;
@@ -399,6 +504,12 @@ private:
     std::atomic<bool>   anchored_{false};
     std::atomic<double> t0_{0.0};
     std::atomic<double> lastData_{0.0};   // local_clock of the last chunk received
+
+    // Stream health (producer-written, render-read).
+    std::atomic<double>        measuredRate_{0.0};   // EMA of incoming samples/s
+    std::atomic<double>        clockOffset_{0.0};    // last remote->local time_correction (s)
+    std::atomic<std::uint64_t> dropouts_{0};         // count of recorded gaps
+    double                     lastChunkT_ = 0.0;    // producer-only: local time of previous chunk
 
     // Dropout tracking. gaps_ is producer-appended / render-read under gapMtx_;
     // lastTs_/lastTsValid_ are producer-only.

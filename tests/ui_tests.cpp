@@ -83,6 +83,35 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK_LT(std::fabs((double)dout[N - 1]), 1.0);
     };
 
+    // Notch + low-pass biquads: the notch zeroes its center tone but passes a tone
+    // 20 Hz away; the low-pass passes lows and attenuates a tone well above cutoff.
+    t = IM_REGISTER_TEST(e, "filter", "biquad_notch_lowpass");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const float  fs = 500.0f;
+        const int    N  = 6000;
+        const double TWO_PI = 6.283185307179586;
+        auto tone = [&](float f) {
+            std::vector<float> s(N);
+            for (int i = 0; i < N; ++i) s[i] = std::sin((float)(TWO_PI * f * i / fs));
+            return s;
+        };
+        auto pp = [&](const std::vector<float>& v) {   // peak-to-peak after settling
+            float mn = 1e9f, mx = -1e9f;
+            for (int i = N / 2; i < N; ++i) { mn = std::min(mn, v[i]); mx = std::max(mx, v[i]); }
+            return mx - mn;
+        };
+        const float full = 2.0f;   // a unit sine has pp = 2
+
+        { auto s = tone(60.0f); Biquad b; b.init(1); b.setNotch(60.0, fs, 30.0);
+          b.process(s.data(), (std::size_t)N); IM_CHECK_LT(pp(s), 0.3f * full); }   // 60 Hz removed
+        { auto s = tone(40.0f); Biquad b; b.init(1); b.setNotch(60.0, fs, 30.0);
+          b.process(s.data(), (std::size_t)N); IM_CHECK_GT(pp(s), 0.8f * full); }   // 40 Hz passes
+        { auto s = tone(5.0f);  Biquad b; b.init(1); b.setLowpass(30.0, fs, 0.70710678);
+          b.process(s.data(), (std::size_t)N); IM_CHECK_GT(pp(s), 0.8f * full); }   // 5 Hz passes
+        { auto s = tone(80.0f); Biquad b; b.init(1); b.setLowpass(30.0, fs, 0.70710678);
+          b.process(s.data(), (std::size_t)N); IM_CHECK_LT(pp(s), 0.3f * full); }   // 80 Hz attenuated
+    };
+
     // PSD correctness (KissFFT backend): a pure 40 Hz sine must peak in the 40 Hz
     // bin and dwarf an off-tone bin. Guards the FFT scaling/packing. No UI.
     t = IM_REGISTER_TEST(e, "fft", "psd_peak");

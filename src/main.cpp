@@ -221,6 +221,12 @@ struct DisplayOpts {
     float gainUv      = 150.0f; // µV mapped to one lane height (stacked)
     float spacing     = 0.0f;   // vertical offset between channels (overlay)
     float hpHz        = 0.5f;   // running high-pass cutoff (Hz)
+    bool  notch       = false;  // mains line-noise notch (display filter stage)
+    float notchHz     = 60.0f;  // notch center (50 or 60 Hz)
+    bool  lowpass     = false;  // low-pass (anti-EMG / smoothing) display filter stage
+    float lpHz        = 40.0f;  // low-pass cutoff (Hz)
+    int   refMode     = 0;      // re-reference: 0 none, 1 common-average, 2 single channel
+    int   refChan     = 0;      // reference channel when refMode == 2
     float lineWidth   = 1.0f;   // trace line weight (px)
     std::vector<unsigned char> visible;  // per-channel show flags (sized lazily)
     ImGuiTextFilter            chanFilter;  // pattern filter for the channel list
@@ -228,12 +234,6 @@ struct DisplayOpts {
     std::unordered_map<std::string, bool> markerOn;  // per-stream (id -> show; absent = on)
     bool cfgShown = true;                  // show the left config strip (else plot is full-width)
     float lastPlotPx = 0.0f;               // last frame's plot width (px) — for edge pixel-snapping
-    // Per-channel high-pass display-filter state cache (raw view): lets fillRaw resume the
-    // running filter from last frame's visible-window start instead of re-warming a 2 s tail
-    // every frame. Reset when the channel count or cutoff (hpCacheR) changes.
-    std::vector<float>         hpX1, hpY1;        // filter (x[n-1], y[n-1]) valid at hpIdx[c]
-    std::vector<std::uint64_t> hpIdx;             // old-frame index the cached state sits at
-    float                      hpCacheR = -1.0f;  // s.hpR() the cache was built with
 };
 
 // Stable per-channel color (by absolute channel index, so a channel keeps its
@@ -380,15 +380,6 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         o.visible.assign(C, 0);
         for (int c = 0; c < std::min(C, 16); ++c) o.visible[c] = 1;
     }
-    // (Re)size + invalidate the high-pass filter-state cache on a channel-count or cutoff
-    // change, so fillRaw can resume the filter instead of re-warming 2 s every frame.
-    if (o.filter) {
-        const float R = s.hpR();
-        if ((int)o.hpIdx.size() != C || o.hpCacheR != R) {
-            o.hpX1.assign(C, 0.0f); o.hpY1.assign(C, 0.0f);
-            o.hpIdx.assign(C, UINT64_MAX); o.hpCacheR = R;
-        }
-    }
     std::vector<float>& gain = s.chanGain();
     std::vector<float>& amp  = s.chanAmp();
 
@@ -436,6 +427,51 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImGui::SliderFloat("##hpcut", &o.hpHz, 0.1f, 5.0f, "%.2f Hz",
                                ImGuiSliderFlags_Logarithmic))
             s.setHighpassHz(o.hpHz);
+        // Notch + low-pass are further stages of the same filtered view (they feed the
+        // high-pass envelope), so they only apply when High-pass is on.
+        if (ImGui::Checkbox("Notch", &o.notch)) s.setNotch(o.notch);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("band-reject the mains line frequency (50/60 Hz) and its hum");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!o.notch);
+        ImGui::SetNextItemWidth(60);
+        if (ImGui::SliderFloat("##notchhz", &o.notchHz, 45.0f, 65.0f, "%.0f Hz")) s.setNotchHz(o.notchHz);
+        ImGui::SameLine();
+        const bool is50 = o.notchHz < 55.0f;
+        if (ImGui::SmallButton(is50 ? "60" : "50")) {   // quick mains toggle (label = target)
+            o.notchHz = is50 ? 60.0f : 50.0f; s.setNotchHz(o.notchHz);
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("jump to %s Hz mains", is50 ? "60" : "50");
+        ImGui::EndDisabled();
+        if (ImGui::Checkbox("Low-pass", &o.lowpass)) s.setLowpass(o.lowpass);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("smooth / anti-EMG: attenuate everything above the cutoff");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!o.lowpass);
+        ImGui::SetNextItemWidth(90);
+        if (ImGui::SliderFloat("##lphz", &o.lpHz, 5.0f, 120.0f, "%.0f Hz",
+                               ImGuiSliderFlags_Logarithmic)) s.setLowpassHz(o.lpHz);
+        ImGui::EndDisabled();
+        // Re-reference montage — the FIRST stage of the conditioned chain (reference ->
+        // high-pass -> notch -> low-pass), so it lives with the filter controls.
+        const char* refModes[] = { "None", "Avg (CAR)", "Channel" };
+        ImGui::SetNextItemWidth(110);
+        if (ImGui::Combo("Reference", &o.refMode, refModes, 3)) s.setReference(o.refMode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("re-reference the montage: subtract the common average (CAR)\n"
+                              "or a chosen channel from every channel");
+        if (o.refMode == 2) {
+            ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+            if (o.refChan >= C) o.refChan = 0;
+            const char* rc = (o.refChan < (int)labels.size()) ? labels[o.refChan].c_str() : "ch";
+            if (ImGui::BeginCombo("##refch", rc)) {
+                for (int c = 0; c < C; ++c)
+                    if (ImGui::Selectable(labels[c].c_str(), c == o.refChan)) {
+                        o.refChan = c; s.setRefChannel(c);
+                    }
+                ImGui::EndCombo();
+            }
+        }
         ImGui::EndDisabled();
     }
     if (ImGui::CollapsingHeader("Channels", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -491,6 +527,36 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         }
         ImGui::EndDisabled();
     }
+    // ---- Info / health: stream metadata + live delivery quality -------------
+    if (ImGui::CollapsingHeader("Info")) {
+        const ImVec4 warn(1.0f, 0.6f, 0.2f, 1.0f);
+        ImGui::Text("type: %s", s.type().empty() ? "(none)" : s.type().c_str());
+        ImGui::TextWrapped("source id: %s", s.sourceId().empty() ? "(none)" : s.sourceId().c_str());
+        ImGui::Text("channels: %d", C);
+        ImGui::Text("unit: %s", streamUnit);
+        ImGui::Separator();
+        const double nom = s.srate(), meas = s.measuredRate();
+        if (s.irregular()) {
+            ImGui::Text("rate: irregular (resampled @ %.0f Hz)", nom);
+        } else {
+            ImGui::Text("nominal: %.0f Hz", nom);
+            if (meas > 0.0) {
+                const double pct = (nom > 0.0) ? (meas - nom) / nom * 100.0 : 0.0;
+                const bool bad = std::fabs(pct) > 5.0;
+                ImGui::TextColored(bad ? warn : ImGui::GetStyleColorVec4(ImGuiCol_Text),
+                                   "measured: %.1f Hz (%+.1f%%)", meas, pct);
+            } else {
+                ImGui::TextDisabled("measured: --");
+            }
+        }
+        ImGui::Text("clock offset: %+.2f ms", s.clockOffset() * 1000.0);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("LSL time_correction (remote -> local clock)");
+        ImGui::Text("dropouts: %llu", (unsigned long long)s.dropouts());
+        const double st = s.staleSeconds();
+        if (st > 0.5) ImGui::TextColored(warn, "no data for %.1f s", st);
+    }
+
     // Merge the enabled streams' events into one time-sorted list for decluttered
     // drawing (mv.events points into the MarkerSource's cache, which outlives this call).
     sc.markers.clear();
@@ -539,55 +605,29 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     // actual waveform — the min/max band can't (its midline is flat for signals
     // oscillating faster than a bin, e.g. a 40 Hz sine).
     auto fillRaw = [&](int c, std::vector<float>& xs, std::vector<float>& ys) -> int {
-        const std::size_t warm = o.filter ? (std::size_t)(2.0 * rate) : 0;  // filter settle
-        const std::size_t want =
-            std::min<std::size_t>((std::size_t)viewSamples + warm, s.ring().capacity());
+        // Read the pre-filtered ring when the display filter is on (full chain:
+        // high-pass -> notch -> low-pass), else the raw ring. Both rings share indices
+        // (written in lockstep), so no per-frame filtering or warm-up is needed.
+        InterleavedRing& rg = o.filter ? s.ringHp() : s.ring();
+        const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples, rg.capacity());
         std::size_t count = 0; std::uint64_t start = 0;
         const float* p;
         if (headFreeze) {            // paused: read the window ending at the frozen head
-            const std::size_t   cap    = s.ring().capacity();
+            const std::size_t   cap    = rg.capacity();
             const std::uint64_t live   = s.head();
             const std::uint64_t oldest = (live > cap) ? live - cap : 0;  // still resident
             start = (headFreeze > want) ? headFreeze - want : 0;
             if (start < oldest) start = oldest;                          // clamp to buffer
             count = (std::size_t)(headFreeze - start);
-            p = s.ring().windowAt(start);
+            p = rg.windowAt(start);
         } else {
-            p = s.ring().recent(want, count, start);
+            p = rg.recent(want, count, start);
         }
         if (count == 0) return 0;
-        const std::size_t skip = (count > warm) ? warm : 0;  // warm-up, not displayed
-        const int vis = (int)(count - skip);
+        const int vis = (int)count;
         xs.resize(vis); ys.resize(vis);
-        if (o.filter) {
-            const float R = s.hpR();
-            const std::uint64_t visIdx = start + (std::uint64_t)skip;  // first VISIBLE sample's index
-            // Resume the running filter from last frame's cached state if it sits inside
-            // this read window and at/before the visible start (forward scroll); else
-            // prime on the first sample and warm up over the whole `skip` tail.
-            float x1, y1; std::size_t fStart;
-            if (c < (int)o.hpIdx.size() && o.hpIdx[c] != UINT64_MAX &&
-                o.hpIdx[c] >= start && o.hpIdx[c] <= visIdx) {
-                x1 = o.hpX1[c]; y1 = o.hpY1[c]; fStart = (std::size_t)(o.hpIdx[c] - start);
-            } else {
-                x1 = p[c]; y1 = 0.0f; fStart = 0;
-            }
-            for (std::size_t i = fStart; i < skip; ++i) {     // advance to the visible start
-                const float xc = p[i * (std::size_t)C + c];
-                const float yy = xc - x1 + R * y1; x1 = xc; y1 = yy;
-            }
-            if (c < (int)o.hpIdx.size()) { o.hpX1[c] = x1; o.hpY1[c] = y1; o.hpIdx[c] = visIdx; }
-            for (std::size_t i = skip; i < count; ++i) {      // filter + emit the visible window
-                const float xc = p[i * (std::size_t)C + c];
-                const float yy = xc - x1 + R * y1; x1 = xc; y1 = yy;
-                ys[i - skip] = yy;
-            }
-        } else {
-            for (int j = 0; j < vis; ++j)
-                ys[j] = p[(skip + (std::size_t)j) * (std::size_t)C + c];
-        }
-        for (int j = 0; j < vis; ++j)
-            xs[j] = (float)(t0 + (double)(start + skip + (std::size_t)j) * dt);
+        for (int j = 0; j < vis; ++j) ys[j] = p[(std::size_t)j * (std::size_t)C + c];
+        for (int j = 0; j < vis; ++j) xs[j] = (float)(t0 + (double)(start + (std::size_t)j) * dt);
         s.applyGaps(xs.data(), vis);
         return vis;
     };
@@ -826,6 +866,7 @@ struct Spectro {
     bool               smoothInit    = false;
     ImGuiTextFilter    chanFilter;              // searchable channel dropdown
     ImGuiTextFilter    streamFilter;            // searchable stream dropdown
+    bool               filtered = false;        // read the display-filtered ring vs raw
     int                id    = 0;               // unique window id (stable ImGui title)
     bool               open  = true;            // window open flag (closed -> removed)
     bool               focus = true;            // one-shot raise request
@@ -901,7 +942,7 @@ static void spectroUpdate(Spectro& sp, HfStreamSource& s) {
 
         const std::uint64_t startAbs = sp.nextEnd - (std::uint64_t)sp.nfft;
         if (head > cap && startAbs < head - cap) { sp.nextEnd = head; break; }
-        const float* p = s.ring().windowAt(startAbs);
+        const float* p = (sp.filtered ? s.ringHp() : s.ring()).windowAt(startAbs);
         sp.psd.compute(p + sp.channel, ch, sp.psdOut);
         for (auto& v : sp.psdOut) v = sp.db ? 10.0f * std::log10(v + 1e-12f) : v;
         writeColumn(false, s.realTime(t0 + (double)sp.nextEnd * dt));
@@ -937,11 +978,14 @@ struct Erp {
     std::vector<float>             avg;         // scratch: sum/count, nchan x nbins row-major
 
     std::vector<double>  pending;               // event display-times awaiting post-data
+    std::vector<double>  stillScratch;          // erpUpdate: events not yet ready (reused, not per-frame allocated)
     std::uint64_t        lastSeq = 0;
     bool                 seqInit = false;
     std::string          sUid, mUid;            // identity (auto-reset on change)
     float                yHalf = 50.0f;         // robust Y half-range (excludes spike outliers)
     std::vector<float>   yscratch;              // |sample| buffer for the percentile
+    std::vector<double>      tvals;             // raster Y-tick positions (reused each frame)
+    std::vector<const char*> tlabs;             // raster Y-tick labels (-> into labels(), per-frame valid)
     int    id    = 0;                           // unique window id (stable ImGui title)
     bool   open  = true;                        // window open flag (closed -> removed)
     bool   focus = true;                        // one-shot raise request
@@ -978,6 +1022,21 @@ static void erpReset(Erp& e, HfStreamSource& s, const std::string& mUid) {
 
 static constexpr int kErpMaxSpaghetti = 60;
 
+// Diverging colormap for signed amplitude (ERP raster): RdBu reversed to blue-white-red
+// so POSITIVE = red/warm and NEGATIVE = blue, the neuroimaging convention (MNE, nilearn),
+// with white at 0. Built once from the built-in RdBu; used with a plain ascending
+// [-half, +half] scale so the heatmap and its colorbar agree (no scale inversion).
+static ImPlotColormap divergingPosRed() {
+    static ImPlotColormap cm = -1;
+    if (cm < 0) {
+        const int n = ImPlot::GetColormapSize(ImPlotColormap_RdBu);
+        std::vector<ImVec4> cols((std::size_t)n);
+        for (int i = 0; i < n; ++i) cols[i] = ImPlot::GetColormapColor(n - 1 - i, ImPlotColormap_RdBu);
+        cm = ImPlot::AddColormap("RdBu_r", cols.data(), n, /*qual=*/false);
+    }
+    return cm;
+}
+
 static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
     // 1) ingest new trigger events (by stable seq) into the pending queue. The first
     // pass after a reset only SYNCS lastSeq (no backfill) so we accumulate from now on.
@@ -995,7 +1054,8 @@ static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
     const std::uint64_t head = s.head(), cap = s.ring().capacity();
     const int C = s.channels();
     const double postSec = e.postMs / 1000.0;
-    std::vector<double> still;
+    std::vector<double>& still = e.stillScratch;   // reused buffer (no per-frame heap alloc)
+    still.clear();
     bool added = false;
     for (double T : e.pending) {
         if (newest < T + postSec) { still.push_back(T); continue; }      // post data not in yet
@@ -1038,12 +1098,12 @@ static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
     //  - imgHalf (raster color): always the average spread (the raster shows averages).
     if (added && e.count > 0) {
         for (std::size_t k = 0; k < e.avg.size(); ++k) e.avg[k] = (float)(e.sumv[k] / e.count);
-        auto pct95 = [&](const std::vector<float>& absv) {
+        // nth_element in place on the (rebuilt-each-call) scratch — no per-fold copy.
+        auto pct95 = [](std::vector<float>& absv) {
             if (absv.empty()) return 1.0f;
-            std::vector<float> w = absv;
-            const std::size_t k = (std::size_t)(0.95 * (w.size() - 1));
-            std::nth_element(w.begin(), w.begin() + k, w.end());
-            return std::max(1e-3f, w[k] * 1.2f);
+            const std::size_t k = (std::size_t)(0.95 * (absv.size() - 1));
+            std::nth_element(absv.begin(), absv.begin() + k, absv.end());
+            return std::max(1e-3f, absv[k] * 1.2f);
         };
         e.yscratch.clear();
         for (float v : e.avg) e.yscratch.push_back(std::fabs(v));
@@ -1242,6 +1302,7 @@ int main(int argc, char** argv) {
     int                        fftStream = 0;
     int                        fftN = 2048;
     bool                       fftDb = true;
+    bool                       fftFiltered = false;  // apply the stream's display filter chain
     bool                       fftRefit = true;   // force-fit axes after a mode change
     std::string                fftUid;
     std::vector<unsigned char> fftSel;
@@ -1822,6 +1883,9 @@ int main(int argc, char** argv) {
                 int szi = (fftN == 512) ? 0 : (fftN == 1024) ? 1 : (fftN == 2048) ? 2 : 3;
                 if (ImGui::Combo("N", &szi, szs, 4)) { fftN = 1 << (9 + szi); fftRefit = true; }
                 ImGui::SameLine(); if (ImGui::Checkbox("dB", &fftDb)) fftRefit = true;
+                ImGui::SameLine(); if (ImGui::Checkbox("Filtered", &fftFiltered)) fftRefit = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("analyze the stream's display-filtered signal (high-pass + notch + low-pass)\ninstead of the raw signal — set the cutoffs in the time-series window");
 
                 if (src->uid() != fftUid) {            // reset selection on stream change
                     fftUid = src->uid();
@@ -1868,7 +1932,8 @@ int main(int argc, char** argv) {
                         if (fftDb)
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -110.0, 30.0, cond);
                         std::size_t count = 0; std::uint64_t start = 0;
-                        const float* p = src->ring().recent((std::size_t)fftN, count, start);
+                        const float* p = (fftFiltered ? src->ringHp() : src->ring())
+                                             .recent((std::size_t)fftN, count, start);
                         const int ch   = src->channels();
                         const int bins = psd.bins();
                         if ((int)count >= fftN) {
@@ -1959,6 +2024,10 @@ int main(int argc, char** argv) {
                     ImGui::SameLine(); ImGui::SetNextItemWidth(150);
                     ImGui::DragFloatRange2("dB", &spectro.dbMin, &spectro.dbMax, 1.0f,
                                            -160.0f, 80.0f, "%.0f");
+                    ImGui::SameLine();
+                    if (ImGui::Checkbox("Filtered", &spectro.filtered)) reset = true;  // recompute columns
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("analyze the display-filtered signal (high-pass + notch + low-pass)\ninstead of raw — set the cutoffs in the time-series window");
 
                     if (src->srate() <= 0.0) {
                         ImGui::TextUnformatted("irregular stream — no spectrogram");
@@ -2171,18 +2240,18 @@ int main(int argc, char** argv) {
                                 ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, ImPlotCond_Always);
                                 ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)erp.nchan, ImPlotCond_Always);
                                 // channel-name ticks at row centers (row 0 = top = first channel)
-                                std::vector<double> tvals(erp.nchan);
-                                std::vector<const char*> tlabs(erp.nchan);
+                                erp.tvals.resize(erp.nchan); erp.tlabs.resize(erp.nchan);
                                 for (int j = 0; j < erp.nchan; ++j) {
-                                    tvals[j] = (double)erp.nchan - 0.5 - j;
+                                    erp.tvals[j] = (double)erp.nchan - 0.5 - j;
                                     const int ch = erp.chans[j];
-                                    tlabs[j] = (ch < (int)labels.size()) ? labels[ch].c_str() : "";
+                                    erp.tlabs[j] = (ch < (int)labels.size()) ? labels[ch].c_str() : "";
                                 }
-                                ImPlot::SetupAxisTicks(ImAxis_Y1, tvals.data(), erp.nchan, tlabs.data());
-                                // Diverging map, symmetric about 0; scale inverted so +µV = red (warm).
-                                ImPlot::PushColormap(ImPlotColormap_RdBu);
+                                ImPlot::SetupAxisTicks(ImAxis_Y1, erp.tvals.data(), erp.nchan, erp.tlabs.data());
+                                // Diverging map, symmetric about 0, + = red (see divergingPosRed).
+                                // Plain ascending scale so the heatmap and colorbar agree on sign.
+                                ImPlot::PushColormap(divergingPosRed());
                                 ImPlot::PlotHeatmap("##i", erp.avg.data(), erp.nchan, erp.nbins,
-                                                    erp.imgHalf, -erp.imgHalf, nullptr,
+                                                    -erp.imgHalf, erp.imgHalf, nullptr,
                                                     ImPlotPoint(-erp.preMs, 0.0),
                                                     ImPlotPoint(erp.postMs, (double)erp.nchan));
                                 onsetLine(0.0, (double)erp.nchan);
