@@ -26,12 +26,18 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+// Per-channel sensor position from the stream's XDF/LSL metadata
+// (channels/channel/location X,Y,Z). `valid` is false when the source publishes no
+// location for that channel — the modality-agnostic basis for any spatial view.
+struct ChanLoc { float x = 0.0f, y = 0.0f, z = 0.0f; bool valid = false; };
 
 class HfStreamSource {
 public:
@@ -84,8 +90,12 @@ public:
         for (int c = 0; c < channels_; ++c)
             labels_[c] = "ch " + std::to_string(c);
         units_.assign(channels_, "");
-        labelsDefault_ = labels_;   // immutable snapshot used until metadata is parsed
+        types_.assign(channels_, "");
+        locs_.assign(channels_, ChanLoc{});
+        labelsDefault_ = labels_;   // immutable snapshots used until metadata is parsed
         unitsDefault_  = units_;
+        typesDefault_  = types_;
+        locsDefault_   = locs_;
 
         chanGain_.assign(channels_, 1.0f);   // per-channel display gain (render-only)
         chanAmp_.assign(channels_, 0.0f);    // measured µV amplitude (render-only)
@@ -205,6 +215,14 @@ public:
     }
     const std::vector<std::string>& units() const {
         return metaReady_.load(std::memory_order_acquire) ? units_ : unitsDefault_;
+    }
+    // Per-channel modality type ("EEG", "EOG", "fNIRS", ...) and sensor position, parsed
+    // from the stream metadata (write-once; lock-free after metaReady_, like labels()).
+    const std::vector<std::string>& types() const {
+        return metaReady_.load(std::memory_order_acquire) ? types_ : typesDefault_;
+    }
+    const std::vector<ChanLoc>& locs() const {
+        return metaReady_.load(std::memory_order_acquire) ? locs_ : locsDefault_;
     }
     std::string error() {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -452,18 +470,37 @@ private:
     void parseLabels(lsl::stream_info full) {  // desc() is non-const in liblsl
         if (metaReady_.load(std::memory_order_acquire)) return;  // finalize once (reconnect re-calls)
         lsl::xml_element ch = full.desc().child("channels").child("channel");
-        std::vector<std::string> plabels, punits;
+        std::vector<std::string> plabels, punits, ptypes;
+        std::vector<ChanLoc>     plocs;
         for (; !ch.empty(); ch = ch.next_sibling("channel")) {
             const char* label = ch.child_value("label");
             const char* unit  = ch.child_value("unit");
+            const char* type  = ch.child_value("type");
             plabels.emplace_back(label ? label : "");
             punits.emplace_back(unit ? unit : "");
+            ptypes.emplace_back(type ? type : "");
+            // Sensor position (channels/channel/location X,Y,Z) — present for spatially
+            // located modalities (EEG/MEG/fNIRS); absent for the rest.
+            ChanLoc loc;
+            lsl::xml_element le = ch.child("location");
+            if (!le.empty()) {
+                const char* X = le.child_value("X");
+                const char* Y = le.child_value("Y");
+                const char* Z = le.child_value("Z");
+                if (X[0] || Y[0] || Z[0]) {
+                    loc.x = (float)std::atof(X); loc.y = (float)std::atof(Y); loc.z = (float)std::atof(Z);
+                    loc.valid = true;
+                }
+            }
+            plocs.push_back(loc);
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
             for (int c = 0; c < channels_ && c < (int)plabels.size(); ++c) {
                 if (!plabels[c].empty()) labels_[c] = plabels[c];
                 if (c < (int)punits.size() && !punits[c].empty()) units_[c] = punits[c];
+                if (c < (int)ptypes.size()) types_[c] = ptypes[c];
+                if (c < (int)plocs.size())  locs_[c]  = plocs[c];
             }
         }
         metaReady_.store(true, std::memory_order_release);  // labels_/units_ now immutable
@@ -523,8 +560,10 @@ private:
     std::atomic<bool>   finished_{false};   // worker has exited -> safe to reap (instant join)
 
     std::mutex               mtx_;     // guards labels_/units_ until metaReady_, and error_
-    std::vector<std::string> labels_, units_;
-    std::vector<std::string> labelsDefault_, unitsDefault_;  // immutable pre-parse snapshot
+    std::vector<std::string> labels_, units_, types_;
+    std::vector<ChanLoc>     locs_;                          // per-channel sensor positions (valid when published)
+    std::vector<std::string> labelsDefault_, unitsDefault_, typesDefault_;  // immutable pre-parse snapshots
+    std::vector<ChanLoc>     locsDefault_;
     std::atomic<bool>        metaReady_{false};   // labels_/units_ finalized -> lock-free ref
     std::string              error_;
 };

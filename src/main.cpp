@@ -534,6 +534,32 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::TextWrapped("source id: %s", s.sourceId().empty() ? "(none)" : s.sourceId().c_str());
         ImGui::Text("channels: %d", C);
         ImGui::Text("unit: %s", streamUnit);
+        // Per-channel modality types (distinct, with counts) from the metadata.
+        {
+            const auto& types = s.types();
+            std::string ts;
+            for (int c = 0; c < C; ++c) {
+                const std::string key = (c < (int)types.size() && !types[c].empty()) ? types[c] : "(none)";
+                std::size_t at = ts.find(key + " x");   // already counted?
+                if (at == std::string::npos) {
+                    int n = 0; for (int k = 0; k < C; ++k)
+                        if (((k < (int)types.size() && !types[k].empty()) ? types[k] : "(none)") == key) ++n;
+                    if (!ts.empty()) ts += ", ";
+                    ts += key + " x" + std::to_string(n);
+                }
+            }
+            ImGui::TextWrapped("ch types: %s", ts.c_str());
+        }
+        // Sensor positions (the basis for any spatial/topographic view). Surfaced so we
+        // can tell at a glance whether a stream actually carries a layout.
+        {
+            const auto& locs = s.locs();
+            int withPos = 0; for (const auto& l : locs) if (l.valid) ++withPos;
+            if (withPos > 0)
+                ImGui::Text("positions: %d/%d channels", withPos, C);
+            else
+                ImGui::TextDisabled("positions: none in metadata");
+        }
         ImGui::Separator();
         const double nom = s.srate(), meas = s.measuredRate();
         if (s.irregular()) {
@@ -847,6 +873,8 @@ struct Spectro {
     int                nfft      = 256;
     bool               db        = true;
     float              dbMin = -40.0f, dbMax = 20.0f;
+    float              fMin = 0.0f, fMax = 0.0f; // displayed frequency range (Y axis); fMax reset to Nyquist
+    bool               yDirty = false;          // freq-range control edited -> reapply axis limits this frame
     float              spanSec   = 2.0f;        // displayed time width (X axis)
     int                cols      = 240;
     std::string        uid;                     // stream-change detection
@@ -877,6 +905,8 @@ static void spectroReset(Spectro& sp, HfStreamSource& s) {
     constexpr double kTargetHop = 0.03;   // s/column target — small hop = fast columns = smooth scroll
     sp.psd.init(sp.nfft, (float)s.srate());
     sp.freqBins = sp.psd.bins();
+    sp.fMin = 0.0f; sp.fMax = (float)(s.srate() * 0.5);   // default Y range = full 0..Nyquist
+    sp.yDirty = true;                                      // apply it on the next frame
     // Stride toward ~0.06 s columns regardless of sample rate, but never coarser
     // than 50% overlap (low-rate streams overlap more, so the edge stays fed).
     sp.hopSamples = (int)std::min((double)(sp.nfft / 2),
@@ -2024,6 +2054,16 @@ int main(int argc, char** argv) {
                     ImGui::SameLine(); ImGui::SetNextItemWidth(150);
                     ImGui::DragFloatRange2("dB", &spectro.dbMin, &spectro.dbMax, 1.0f,
                                            -160.0f, 80.0f, "%.0f");
+                    // Frequency range shown (Y-axis zoom). Vital when the sample rate is
+                    // high but the signal is low-freq (e.g. 48 kHz audio -> tones < 1 kHz);
+                    // also editable by mouse-zooming the plot (the two stay in sync).
+                    const float ny = (float)(src->srate() * 0.5);
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(150);
+                    if (ImGui::DragFloatRange2("Hz", &spectro.fMin, &spectro.fMax,
+                                               std::max(0.5f, ny / 400.0f), 0.0f, ny, "%.0f"))
+                        spectro.yDirty = true;
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("frequency range shown — zoom the Y axis to the band of interest");
                     ImGui::SameLine();
                     if (ImGui::Checkbox("Filtered", &spectro.filtered)) reset = true;  // recompute columns
                     if (ImGui::IsItemHovered())
@@ -2101,13 +2141,18 @@ int main(int argc, char** argv) {
                         if (ImPlot::BeginPlot("##spectro", ImVec2(-70, -1))) {
                             ImPlot::SetupAxes("time (s)", "Hz");
                             ImPlot::SetupAxisLimits(ImAxis_X1, viewX0, viewNewest, ImPlotCond_Always);
-                            // Re-fit Y on a stream/NFFT change (new Nyquist); else leave it.
-                            ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, y1,
-                                                    reset ? ImPlotCond_Always : ImPlotCond_Once);
+                            // Y range is the user's freq window (control or mouse-zoom). Force it
+                            // only when the control changed or on reset; otherwise leave it free so
+                            // the mouse can zoom — then read the live limits back into the control.
+                            ImPlot::SetupAxisLimits(ImAxis_Y1, spectro.fMin, spectro.fMax,
+                                                    (reset || spectro.yDirty) ? ImPlotCond_Always : ImPlotCond_Once);
+                            spectro.yDirty = false;
                             if (Ndraw > 0)
                                 ImPlot::PlotHeatmap("##h", spectro.drawBuf.data(), spectro.freqBins,
                                                     Ndraw, spectro.dbMin, spectro.dbMax, nullptr,
                                                     ImPlotPoint(bMinDraw, 0.0), ImPlotPoint(bMaxDraw, y1));
+                            const ImPlotRect lim = ImPlot::GetPlotLimits();   // sync mouse-zoom -> control
+                            spectro.fMin = (float)lim.Y.Min; spectro.fMax = (float)lim.Y.Max;
                             // Recorded gaps (extended by the STFT recovery latency, less
                             // half a column so the red ends at the last blank column) plus
                             // the live edge gap scrolling in — same opaque red as the time

@@ -28,6 +28,11 @@ something concrete to lock onto:
                                  pauses -> exercises the irregular-numeric path.
   markers     1 ch   string IRREGULAR  infrequent (~1/s) event labels.
   fastmarkers 1 ch   string IRREGULAR  frequent (~30/s) trigger codes.
+  drift       5 ch   @ 250 Hz   float  per-channel sub-Hz drift (0.05-1 Hz) over a
+                                 big DC offset + a shared 10 Hz tone -> empirically
+                                 test the high-pass across its 0.5 Hz cutoff.
+  audio       2 ch   @ 48000 Hz float  440/660 Hz stereo tone -> high-rate (48 kHz)
+                                 stress for ring/FFT/spectrogram.
 
 Usage:
     python lsl_test_streams.py                 # all streams
@@ -62,6 +67,22 @@ _MONTAGE = [
     "Pz", "P4", "P8", "PO3", "PO4", "O1", "Oz", "O2", "TP9", "TP10",
 ]
 
+# Approximate normalized 10-20 scalp positions (top view: nose = +Y, right ear = +X,
+# unit disc). Published as channels/channel/location so the viewer's metadata parse —
+# and any future spatial/topographic view — has a real layout to read. A data source is
+# the correct place for electrode positions; the viewer just reads them.
+_POS = {
+    "Fp1": (-0.31, 0.95), "Fp2": (0.31, 0.95),
+    "F7": (-0.81, 0.59), "F3": (-0.42, 0.62), "Fz": (0.0, 0.64), "F4": (0.42, 0.62), "F8": (0.81, 0.59),
+    "FC5": (-0.64, 0.31), "FC1": (-0.22, 0.34), "FC2": (0.22, 0.34), "FC6": (0.64, 0.31),
+    "T7": (-1.0, 0.0), "C3": (-0.5, 0.0), "Cz": (0.0, 0.0), "C4": (0.5, 0.0), "T8": (1.0, 0.0),
+    "CP5": (-0.64, -0.31), "CP1": (-0.22, -0.34), "CP2": (0.22, -0.34), "CP6": (0.64, -0.31),
+    "P7": (-0.81, -0.59), "P3": (-0.42, -0.62), "Pz": (0.0, -0.64), "P4": (0.42, -0.62), "P8": (0.81, -0.59),
+    "PO3": (-0.33, -0.84), "PO4": (0.33, -0.84),
+    "O1": (-0.31, -0.95), "Oz": (0.0, -1.0), "O2": (0.31, -0.95),
+    "TP9": (-0.95, -0.32), "TP10": (0.95, -0.32),
+}
+
 
 def eeg_labels(n):
     return [_MONTAGE[i] if i < len(_MONTAGE) else f"EEG{i}" for i in range(n)]
@@ -75,6 +96,12 @@ def add_channels(info, labels, unit, ctype):
         ch.append_child_value("label", lab)
         ch.append_child_value("unit", unit)
         ch.append_child_value("type", ctype)
+        if lab in _POS:                       # publish a sensor position when we know one
+            x, y = _POS[lab]
+            loc = ch.append_child("location")
+            loc.append_child_value("X", f"{x:.3f}")
+            loc.append_child_value("Y", f"{y:.3f}")
+            loc.append_child_value("Z", "0.000")
 
 
 def push_chunk(outlet, chunk, ts):
@@ -180,6 +207,36 @@ def make_chirp_gen(srate, f0, f1, sweep_s):
         state["phase"] = float(phase[-1] % (2 * np.pi))
         return (100.0 * np.sin(phase)).astype(np.float32)[:, None]
 
+    return gen
+
+
+def make_drift_gen(srate, freqs):
+    # Each channel = a large sub-Hz drift at its own frequency + a small shared 10 Hz
+    # tone + a big DC offset. Lets you watch the high-pass empirically: off = wandering
+    # baseline that the per-channel drift freq sweeps through the 0.5 Hz cutoff; on =
+    # flat baseline with the 10 Hz tone surviving (channels < 0.5 Hz fully flattened,
+    # the 1 Hz channel only partly attenuated).
+    f = np.array(freqs)[None, :]
+
+    def gen(i0, n):
+        t = (np.arange(i0, i0 + n) / srate)[:, None]
+        drift = 150.0 * np.sin(2 * np.pi * f * t)              # per-channel sub-Hz wander
+        ac    = 12.0 * np.sin(2 * np.pi * 10.0 * t)            # shared 10 Hz tone (passes HP)
+        return (200.0 + drift + ac).astype(np.float32)         # + DC offset
+    return gen
+
+
+def make_audio_gen(srate):
+    # 2-channel "audio": 440 Hz (L) / 660 Hz (R) — a high-rate (48 kHz) stress test for
+    # the ring sizing / FFT / spectrogram, and a clean stereo tone to eyeball. Amplitude
+    # is scaled up (not the usual [-1,1]) so the tone clears the spectrogram's absolute,
+    # EEG-tuned dB floor without retuning the dB range; zoom the spectrogram Y axis to
+    # the low band to see the lines (the tones sit in the bottom ~1.4% of 0..24 kHz).
+    def gen(i0, n):
+        t = (np.arange(i0, i0 + n) / srate)[:, None]
+        L = 30.0 * np.sin(2 * np.pi * 440.0 * t)
+        R = 30.0 * np.sin(2 * np.pi * 660.0 * t)
+        return np.hstack([L, R]).astype(np.float32)
     return gen
 
 
@@ -377,6 +434,23 @@ def build_streams(selected, args, stop, host_suffix):
         spawn(run_markers, out, stop, rng, labels, 30.0)
         started.append("fastmarkers  1ch @ irregular  string (~30/s)")
 
+    if "drift" in selected:
+        sr = 250
+        freqs = [0.05, 0.1, 0.2, 0.4, 1.0]
+        info = StreamInfo(f"MockDrift{host_suffix}", "EEG", len(freqs), sr, cf_float32, "mock-drift")
+        add_channels(info, [f"{fr:g}Hz" for fr in freqs], "microvolts", "EEG")
+        out = StreamOutlet(info, chunk_size=int(sr * 0.02), max_buffered=360)
+        spawn(run_regular, "drift", out, sr, make_drift_gen(sr, freqs), stop, 0.02, sk("drift"))
+        started.append("drift        5ch @ 250 Hz  float  (sub-Hz drift 0.05-1Hz + 10Hz tone; high-pass test)")
+
+    if "audio" in selected:
+        sr = 48000
+        info = StreamInfo(f"MockAudio{host_suffix}", "Audio", 2, sr, cf_float32, "mock-audio")
+        add_channels(info, ["L", "R"], "arbitrary", "Audio")
+        out = StreamOutlet(info, chunk_size=int(sr * 0.02), max_buffered=360)
+        spawn(run_regular, "audio", out, sr, make_audio_gen(sr), stop)
+        started.append("audio        2ch @ 48000 Hz  float  (440/660 Hz stereo tone)")
+
     if "evoked" in selected:
         sr = 250
         dinfo = StreamInfo(f"MockEvoked{host_suffix}", "EEG", 1, sr, cf_float32, "mock-evoked")
@@ -392,7 +466,7 @@ def build_streams(selected, args, stop, host_suffix):
 
 
 ALL = ["eeg", "highdensity", "chirp", "sine", "accel", "flaky", "mouse",
-       "markers", "fastmarkers", "evoked"]
+       "markers", "fastmarkers", "evoked", "drift", "audio"]
 
 
 def main():
