@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["pylsl", "numpy"]
+# ///
 """Synthetic LSL sources for exercising the LSL Stream Viewer.
 
 Launches several concurrent outlets, each targeting a different situation the
@@ -182,13 +186,27 @@ def make_eeg_gen(C, srate, line_freq, rng, n_eog=2):
 
 
 def make_highdensity_gen(C, srate, rng):
+    # A few spatial regions burst intermittently (think alpha spindles confined to occipital
+    # channels), each at its own rate. The raster colors every channel by peak-to-peak
+    # amplitude, so this reads as blinking horizontal bands -- spatial structure you could
+    # never pick out of 128 stacked line traces, and distinct from the spectrogram's sweep.
+    #            (lo_frac, hi_frac, period_s, phase, carrier_hz)
+    regions = [(0.12, 0.28, 1.7, 0.00, 10.0),
+               (0.55, 0.78, 2.6, 0.45, 12.0),
+               (0.86, 0.98, 1.1, 0.20, 18.0)]
+    bands = [(int(lo * C), int(hi * C), p, ph, f) for (lo, hi, p, ph, f) in regions]
+
     def gen(i0, n):
         k = np.arange(i0, i0 + n)
-        t = (k / srate)[:, None]
-        c = np.arange(C)[None, :]
-        # Traveling plane wave: 6 Hz temporal, phase ramp across channels.
-        wave = np.sin(2 * np.pi * 6.0 * t - 0.20 * c)
-        out = 50.0 * wave + rng.standard_normal((n, C)) * 4.0
+        t = (k / srate)[:, None]            # (n,1)
+        c = np.arange(C)[None, :]           # (1,C)
+        out = (rng.standard_normal((n, C)) * 3.0).astype(np.float32)
+        for lo, hi, period, ph, fhz in bands:
+            frac = (t / period + ph) % 1.0                       # 0..1 within each cycle
+            pulse = np.exp(-0.5 * ((frac - 0.5) / 0.12) ** 2)    # brief burst once per period
+            mask = ((c >= lo) & (c < hi)).astype(np.float32)     # spatial extent of the region
+            carrier = np.sin(2 * np.pi * fhz * t)
+            out += (70.0 * pulse * carrier) * mask
         return out.astype(np.float32)
 
     return gen

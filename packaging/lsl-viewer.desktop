@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LSL Viewer
+GenericName=Lab Streaming Layer Viewer
+Comment=Fast real-time viewer for Lab Streaming Layer streams
+Exec=lsl_viewer
+Icon=lsl-viewer
+Terminal=false
+Categories=Science;Education;Utility;
+Keywords=LSL;EEG;MEG;fNIRS;streaming;neuroscience;BCI;

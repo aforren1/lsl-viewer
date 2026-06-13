@@ -354,7 +354,10 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->MenuClick("//##MainMenuBar/View/New ERP (marker average)");
         ctx->Yield(2);
         if (ctx->GetWindowByRef("//ERP 1") == nullptr) { ctx->LogInfo("no ERP window; skip"); return; }
-        ctx->SetRef("//ERP 1");
+        ctx->WindowFocus("//ERP 1"); ctx->Yield(2);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo("//ERP 1/cfg");   // controls live in a left child
+        if (cfg.Window == nullptr) { ctx->LogInfo("no cfg child; skip"); return; }
+        ctx->SetRef(cfg.Window);
         ctx->SleepNoSkip(25.0f, 1.0f / 30.0f);   // accumulate ~30 epochs (single channel + spaghetti)
         ctx->CaptureScreenshotWindow("//ERP 1", ImGuiCaptureFlags_HideMouseCursor);  // 1) single-ch lines + spaghetti
         ctx->ItemCheck("all channels");

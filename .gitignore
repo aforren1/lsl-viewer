@@ -24,3 +24,6 @@ imgui.ini
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Saved view workspaces (user data)
+workspaces/

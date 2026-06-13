@@ -44,6 +44,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,6 +56,7 @@
 #include "imgui_test_engine/imgui_te_engine.h"
 #include "imgui_test_engine/imgui_te_context.h"
 #include "imgui_test_engine/imgui_te_ui.h"
+#include "imgui_test_engine/imgui_capture_tool.h"   // default ffmpeg video/gif params
 extern void RegisterAppTests(ImGuiTestEngine* engine);
 
 // State the screen-capture callback needs. We render the UI into an offscreen
@@ -237,6 +241,62 @@ struct DisplayOpts {
     bool  overlayYFit = true;              // overlay mode: auto-fit Y once (on entry / scale change), then free
     bool  synced      = false;             // pushed our filter/reference state to the source yet?
 };
+
+// ---- Workspace (de)serialization: DisplayOpts <-> a compact "k=v ..." payload --
+// Used by the named-workspace save/load (see main). Values never contain spaces, so the
+// whole thing is one space-separated token list; channel visibility is an index list plus
+// the channel count it was saved at (so it only re-applies to a matching stream).
+static double wsField(const std::string& p, const char* key, double def) {
+    const std::string hay = " " + p, k = std::string(" ") + key + "=";
+    const size_t pos = hay.find(k);
+    return (pos == std::string::npos) ? def : std::atof(hay.c_str() + pos + k.size());
+}
+static std::string serializeOpts(const DisplayOpts& o) {
+    char b[320];
+    std::snprintf(b, sizeof b,
+        "hist=%.3f stk=%d ras=%d gain=%.3f spc=%.3f hp=%d hphz=%.4f no=%d nohz=%.1f "
+        "lp=%d lphz=%.1f ref=%d refc=%d lw=%.2f ovm=%d cfg=%d nch=%zu",
+        o.history, o.stacked ? 1 : 0, o.raster ? 1 : 0, o.gainUv, o.spacing, o.highpass ? 1 : 0,
+        o.hpHz, o.notch ? 1 : 0, o.notchHz, o.lowpass ? 1 : 0, o.lpHz, o.refMode, o.refChan,
+        o.lineWidth, o.overlayMarkers ? 1 : 0, o.cfgShown ? 1 : 0, o.visible.size());
+    std::string s = b;
+    s += " vis=";
+    for (std::size_t i = 0; i < o.visible.size(); ++i) if (o.visible[i]) { s += std::to_string(i); s += ','; }
+    return s;
+}
+static DisplayOpts parseOpts(const std::string& p) {
+    DisplayOpts o;
+    o.history   = (float)wsField(p, "hist", o.history);
+    o.stacked   = wsField(p, "stk",  1) != 0;
+    o.raster    = wsField(p, "ras",  0) != 0;
+    o.gainUv    = (float)wsField(p, "gain", o.gainUv);
+    o.spacing   = (float)wsField(p, "spc",  o.spacing);
+    o.highpass  = wsField(p, "hp",   1) != 0;
+    o.hpHz      = (float)wsField(p, "hphz", o.hpHz);
+    o.notch     = wsField(p, "no",   0) != 0;
+    o.notchHz   = (float)wsField(p, "nohz", o.notchHz);
+    o.lowpass   = wsField(p, "lp",   0) != 0;
+    o.lpHz      = (float)wsField(p, "lphz", o.lpHz);
+    o.refMode   = (int)wsField(p, "ref",  0);
+    o.refChan   = (int)wsField(p, "refc", 0);
+    o.lineWidth = (float)wsField(p, "lw",   o.lineWidth);
+    o.overlayMarkers = wsField(p, "ovm", 0) != 0;
+    o.cfgShown  = wsField(p, "cfg", 1) != 0;
+    const int nch = (int)wsField(p, "nch", 0);
+    if (nch > 0 && nch < 100000) {
+        o.visible.assign(nch, 0);
+        const size_t vp = p.find("vis=");
+        if (vp != std::string::npos)
+            for (const char* c = p.c_str() + vp + 4; *c && *c != ' '; ) {
+                int idx = std::atoi(c);
+                if (idx >= 0 && idx < nch) o.visible[idx] = 1;
+                while (*c && *c != ',' && *c != ' ') ++c;   // skip to next index
+                if (*c == ',') ++c;
+            }
+    }
+    o.synced = false;   // force the filter/reference state to be re-pushed to the worker
+    return o;
+}
 
 // Stable per-channel color (by absolute channel index, so a channel keeps its
 // color across stacked/overlay and regardless of which others are selected).
@@ -752,7 +812,9 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                     float* dst = sc.raster.data() + (std::size_t)j * px;
                     for (int k = 0; k < px; ++k) dst[k] = (sc.mx[sc.pmap[k]] - sc.mn[sc.pmap[k]]) * inv;
                 }
-                ImPlot::PushColormap(ImPlotColormap_Viridis);
+                // Plasma here (vs the spectrogram's Viridis) so the two heatmaps read as
+                // different views at a glance — both perceptually uniform, distinct hues.
+                ImPlot::PushColormap(ImPlotColormap_Plasma);
                 ImPlot::PlotHeatmap("##r", sc.raster.data(), show, px, 0.0, 1.0, nullptr,
                                     ImPlotPoint(bMin, 0.0), ImPlotPoint(bMax, (double)show));
                 drawDropoutRed(s, 0.0, 0.0);
@@ -906,6 +968,7 @@ static void applyPresentMode(SDL_GPUDevice* gpu, SDL_Window* window, bool vsync)
 // ---- Spectrogram: rolling STFT heatmap for one channel ----------------------
 struct Spectro {
     Psd                psd;
+    std::string        wantSid;   // workspace restore: bind to this stream source_id once it appears
     int                streamIdx = 0;
     int                channel   = 0;
     int                nfft      = 256;
@@ -1032,6 +1095,7 @@ static void spectroUpdate(Spectro& sp, HfStreamSource& s) {
 // recent individual epochs (faint "spaghetti").
 // ===========================================================================
 struct Erp {
+    std::string wantSid, wantMsid;   // workspace restore: bind to these source_ids once present
     int    streamIdx = 0, channel = 0, markerIdx = 0;
     float  preMs = 100.0f, postMs = 500.0f;
     bool   baseline = true;
@@ -1240,8 +1304,15 @@ int main(int argc, char** argv) {
     bool       vsync       = std::getenv("LSL_NOVSYNC")     == nullptr;
     LSL_PROFILE_ENABLE(profile);   // built-in text zone profiler (no-op under Tracy)
 
+    // Initial window size; override with LSL_WINDOW=WxH (used for higher-res capture).
+    int winW = 1280, winH = 800;
+    if (const char* ws = std::getenv("LSL_WINDOW")) {
+        int w = 0, h = 0;
+        if (std::sscanf(ws, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) { winW = w; winH = h; }
+    }
     SDL_WindowFlags wflags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    SDL_Window* window = SDL_CreateWindow("LSL Stream Viewer", 1280, 800, wflags);
+    if (std::getenv("LSL_FULLSCREEN")) wflags |= SDL_WINDOW_FULLSCREEN;
+    SDL_Window* window = SDL_CreateWindow("LSL Stream Viewer", winW, winH, wflags);
     if (!window) { spdlog::critical("SDL_CreateWindow: {}", SDL_GetError()); return 1; }
 
     SDL_GPUDevice* gpu = SDL_CreateGPUDevice(
@@ -1298,6 +1369,10 @@ int main(int argc, char** argv) {
     tio.ConfigLogToTTY            = true;
     tio.ConfigRunSpeed            = runTests ? ImGuiTestRunSpeed_Fast : ImGuiTestRunSpeed_Normal;
     tio.ConfigNoThrottle          = runTests;
+    tio.ConfigWatchdogKillTest    = 180.0f;   // capture tests sleep to fill plots / accumulate ERPs
+    // Video/GIF capture (CaptureBeginVideo/EndVideo) via ffmpeg: the encoder path + params are
+    // applied from LSL_FFMPEG once after the first frame (the settings load clobbers pre-Start
+    // values), so they live in the render loop below rather than here.
     ImGuiTestEngine_Start(engine, ImGui::GetCurrentContext());
     ImGuiTestEngine_InstallDefaultCrashHandler();
     RegisterAppTests(engine);
@@ -1352,6 +1427,10 @@ int main(int argc, char** argv) {
     PlotScratch scratch;
 
     std::unordered_map<const HfStreamSource*, DisplayOpts> dispOpts;  // per-stream settings
+    // Per-stream settings restored from a workspace, keyed by source_id; consumed (applied
+    // + erased) the first time that stream's dispOpts is touched, so it works whether the
+    // stream is already connected at load time or reconnects later.
+    std::unordered_map<std::string, DisplayOpts>          savedOpts;
     std::unordered_map<const HfStreamSource*, double>      edgeMap;   // smoothed X right-edge
     std::unordered_map<const HfStreamSource*, std::uint64_t> pauseHead; // frozen head at pause
     bool showPerf     = false;   // Performance overlay (View menu; hidden by default)
@@ -1374,10 +1453,13 @@ int main(int argc, char** argv) {
     // FFT / PSD view state.
     Psd                        psd;
     int                        fftStream = 0;
+    std::string                fftWantSid;   // workspace restore: bind to this source_id once present
+    std::vector<int>           fftWantSel;   // workspace restore: selected-channel indices, applied on bind
     int                        fftN = 512;   // small default = fast fill / immediate feedback (bump for finer Hz resolution)
     bool                       fftDb = true;
     bool                       fftFiltered = false;  // apply the stream's display filter chain
     bool                       fftRefit = true;   // force-fit axes after a mode change
+    bool                       fftFitHz = false;  // pending request: zoom X to significant energy
     std::string                fftUid;
     std::vector<unsigned char> fftSel;
     ImGuiTextFilter            fftFilter;
@@ -1394,6 +1476,120 @@ int main(int argc, char** argv) {
     double benchAccum = 0.0;
     double profAccum  = 0.0;     // text-profiler dump cadence
     Uint64 tPrev = SDL_GetPerformanceCounter();
+
+    // ---- Workspaces: named snapshots of the whole view (per-stream settings, analysis
+    // windows, and the dock layout). Streams are referenced by source_id so a workspace
+    // re-applies itself when the same streams reconnect. Stored as ./workspaces/<name>.lslws.
+    const std::filesystem::path wsDir = "workspaces";
+    char        wsNameBuf[128] = "";
+    std::string pendingWs;            // a load deferred to end-of-frame (safe ImGui ini point)
+
+    auto wsSerialize = [&]() -> std::string {
+        std::string s = "# lsl-sdl workspace v1\n";
+        for (auto& src : sources) {
+            auto it = dispOpts.find(src.get());
+            if (it != dispOpts.end())
+                s += "S\t" + streamKeyOf(*src) + "\t" + serializeOpts(it->second) + "\n";
+        }
+        if (showSpectrum && fftStream < (int)sources.size()) {
+            std::string sel;
+            for (std::size_t c = 0; c < fftSel.size(); ++c) if (fftSel[c]) sel += std::to_string(c) + ",";
+            char b[96]; std::snprintf(b, sizeof b, "n=%d db=%d filt=%d vis=", fftN, fftDb ? 1 : 0, fftFiltered ? 1 : 0);
+            s += "F\t" + streamKeyOf(*sources[fftStream]) + "\t" + b + sel + "\n";
+        }
+        for (auto& sp : spectros) {
+            if (sp->streamIdx >= (int)sources.size()) continue;
+            char b[176]; std::snprintf(b, sizeof b, "ch=%d nfft=%d span=%.1f fmin=%.2f fmax=%.2f db=%d filt=%d",
+                sp->channel, sp->nfft, sp->spanSec, sp->fMin, sp->fMax, sp->db ? 1 : 0, sp->filtered ? 1 : 0);
+            s += "G\t" + streamKeyOf(*sources[sp->streamIdx]) + "\t" + b + "\n";
+        }
+        for (auto& ep : erps) {
+            if (ep->streamIdx >= (int)sources.size() || ep->markerIdx >= (int)markerSources.size()) continue;
+            char b[176]; std::snprintf(b, sizeof b, "ch=%d all=%d maxc=%d pre=%.0f post=%.0f base=%d ras=%d",
+                ep->channel, ep->allCh ? 1 : 0, ep->maxCh, ep->preMs, ep->postMs, ep->baseline ? 1 : 0, ep->raster ? 1 : 0);
+            s += "E\t" + streamKeyOf(*sources[ep->streamIdx]) + "\t" + streamKeyOf(*markerSources[ep->markerIdx])
+               + "\t" + b + "\t" + ep->labelFilter.InputBuf + "\n";
+        }
+        s += "---IMGUI---\n";
+        s += ImGui::SaveIniSettingsToMemory();
+        return s;
+    };
+
+    auto wsApply = [&](const std::string& blob) {
+        const std::string mark = "\n---IMGUI---\n";
+        const std::size_t sep = blob.find(mark);
+        const std::string app = blob.substr(0, sep);
+        const std::string ini = (sep == std::string::npos) ? std::string() : blob.substr(sep + mark.size());
+        // Rebuild analysis windows + pending per-stream settings from the workspace.
+        spectros.clear(); erps.clear(); savedOpts.clear();
+        nextSpectroId = nextErpId = 1;
+        auto split = [](const std::string& l) {              // tab-delimited fields
+            std::vector<std::string> f; std::string cur; std::istringstream is(l);
+            while (std::getline(is, cur, '\t')) f.push_back(cur);
+            return f;
+        };
+        std::istringstream is(app); std::string line;
+        while (std::getline(is, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            const auto f = split(line);
+            if (f[0] == "S" && f.size() >= 3) {
+                savedOpts[f[1]] = parseOpts(f[2]);
+            } else if (f[0] == "F" && f.size() >= 3) {
+                showSpectrum = true;
+                fftWantSid = f[1];
+                fftN = (int)wsField(f[2], "n", fftN);
+                fftDb = wsField(f[2], "db", 1) != 0;
+                fftFiltered = wsField(f[2], "filt", 0) != 0;
+                fftWantSel.clear();
+                if (std::size_t vp = f[2].find("vis="); vp != std::string::npos)
+                    for (const char* c = f[2].c_str() + vp + 4; *c && *c != ' '; ) {
+                        fftWantSel.push_back(std::atoi(c));
+                        while (*c && *c != ',' && *c != ' ') ++c; if (*c == ',') ++c;
+                    }
+            } else if (f[0] == "G" && f.size() >= 3) {
+                auto sp = std::make_unique<Spectro>();
+                sp->id = nextSpectroId++; sp->wantSid = f[1];
+                sp->channel = (int)wsField(f[2], "ch", 0);
+                sp->nfft    = (int)wsField(f[2], "nfft", sp->nfft);
+                sp->spanSec = (float)wsField(f[2], "span", sp->spanSec);
+                sp->fMin    = (float)wsField(f[2], "fmin", 0);
+                sp->fMax    = (float)wsField(f[2], "fmax", 0);
+                sp->db      = wsField(f[2], "db", 1) != 0;
+                sp->filtered = wsField(f[2], "filt", 0) != 0;
+                spectros.push_back(std::move(sp));
+            } else if (f[0] == "E" && f.size() >= 4) {
+                auto ep = std::make_unique<Erp>();
+                ep->id = nextErpId++; ep->wantSid = f[1]; ep->wantMsid = f[2];
+                ep->channel  = (int)wsField(f[3], "ch", 0);
+                ep->allCh    = wsField(f[3], "all", 0) != 0;
+                ep->maxCh    = (int)wsField(f[3], "maxc", ep->maxCh);
+                ep->preMs    = (float)wsField(f[3], "pre", ep->preMs);
+                ep->postMs   = (float)wsField(f[3], "post", ep->postMs);
+                ep->baseline = wsField(f[3], "base", 1) != 0;
+                ep->raster   = wsField(f[3], "ras", 0) != 0;
+                if (f.size() >= 5) { std::snprintf(ep->labelFilter.InputBuf, sizeof ep->labelFilter.InputBuf, "%s", f[4].c_str()); ep->labelFilter.Build(); }
+                erps.push_back(std::move(ep));
+            }
+        }
+        if (!ini.empty()) ImGui::LoadIniSettingsFromMemory(ini.c_str(), ini.size());
+    };
+
+    auto wsList = [&]() -> std::vector<std::string> {
+        std::vector<std::string> names; std::error_code ec;
+        if (std::filesystem::exists(wsDir, ec))
+            for (auto& de : std::filesystem::directory_iterator(wsDir, ec))
+                if (de.path().extension() == ".lslws") names.push_back(de.path().stem().string());
+        std::sort(names.begin(), names.end());
+        return names;
+    };
+    auto wsSave = [&](const std::string& name) {
+        std::error_code ec; std::filesystem::create_directories(wsDir, ec);
+        std::ofstream(wsDir / (name + ".lslws")) << wsSerialize();
+    };
+    auto wsLoad = [&](const std::string& name) {
+        std::ifstream f(wsDir / (name + ".lslws"));
+        if (f) { std::ostringstream ss; ss << f.rdbuf(); pendingWs = ss.str(); }   // applied end-of-frame
+    };
 
     bool done = false;
     unsigned long frameCounter = 0;
@@ -1447,6 +1643,29 @@ int main(int argc, char** argv) {
                     if (ImGui::MenuItem("New ERP (marker average)")) {
                         auto e = std::make_unique<Erp>(); e->id = nextErpId++; erps.push_back(std::move(e));
                         wantBottom = true;
+                    }
+                    ImGui::EndMenu();
+                }
+                if (ImGui::BeginMenu("Workspaces")) {
+                    ImGui::TextDisabled("save the current view (per-stream settings,");
+                    ImGui::TextDisabled("analysis windows, layout) under a name");
+                    ImGui::SetNextItemWidth(160);
+                    ImGui::InputTextWithHint("##wsname", "name", wsNameBuf, sizeof wsNameBuf);
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(wsNameBuf[0] == '\0');
+                    if (ImGui::Button("Save")) { wsSave(wsNameBuf); wsNameBuf[0] = '\0'; ImGui::CloseCurrentPopup(); }
+                    ImGui::EndDisabled();
+                    ImGui::Separator();
+                    const auto names = wsList();
+                    if (names.empty()) ImGui::TextDisabled("(no saved workspaces)");
+                    for (const auto& n : names)
+                        if (ImGui::MenuItem(n.c_str())) wsLoad(n);   // load on click (applied next frame)
+                    if (!names.empty() && ImGui::BeginMenu("Delete")) {
+                        for (const auto& n : names) {
+                            std::error_code ec;
+                            if (ImGui::MenuItem(n.c_str())) std::filesystem::remove(wsDir / (n + ".lslws"), ec);
+                        }
+                        ImGui::EndMenu();
                     }
                     ImGui::EndMenu();
                 }
@@ -1867,6 +2086,13 @@ int main(int argc, char** argv) {
             std::unordered_map<std::string, int> nameSeen;  // disambiguate same-named streams
             for (auto& s : sources) {
                 DisplayOpts& o = dispOpts[s.get()];   // per-stream settings (default on first use)
+                // Consume a pending workspace restore for this stream (by source_id), once.
+                if (!savedOpts.empty()) {
+                    if (auto it = savedOpts.find(streamKeyOf(*s)); it != savedOpts.end()) {
+                        o = std::move(it->second);
+                        savedOpts.erase(it);
+                    }
+                }
                 // Smooth right-edge: glide at wall-clock rate and ease toward the
                 // (chunky) newest data time, so the scroll doesn't snap per chunk.
                 double        edge       = 0.0;
@@ -1946,6 +2172,15 @@ int main(int argc, char** argv) {
             if (sources.empty()) {
                 ImGui::TextUnformatted("Connect a stream to view its spectrum.");
             } else {
+                if (!fftWantSid.empty())   // workspace restore: bind once the stream appears
+                    for (int i = 0; i < (int)sources.size(); ++i)
+                        if (streamKeyOf(*sources[i]) == fftWantSid) {
+                            fftStream = i; fftWantSid.clear(); fftRefit = true;
+                            fftSel.assign(sources[i]->channels(), 0);   // apply saved channel selection
+                            for (int c : fftWantSel) if (c >= 0 && c < (int)fftSel.size()) fftSel[c] = 1;
+                            fftWantSel.clear();
+                            break;
+                        }
                 if (fftStream >= (int)sources.size()) fftStream = 0;
                 HfStreamSource* src = sources[fftStream].get();
 
@@ -1981,6 +2216,11 @@ int main(int argc, char** argv) {
                 if (ImGui::SmallButton("All"))  for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 1;
                 ImGui::SameLine();
                 if (ImGui::SmallButton("None")) for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 0;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Fit Hz")) fftFitHz = true;   // zoom X to where the energy is
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("zoom the frequency axis to the band that actually carries\n"
+                                      "signal energy (handy at high sample rates, e.g. 48 kHz audio)");
                 fftFilter.Draw("##f", -1.0f);                                           // channel name filter
                 ImGui::BeginChild("chans", ImVec2(0, 0), ImGuiChildFlags_Borders);      // fills the rest of the strip
                 for (int c = 0; c < src->channels(); ++c) {
@@ -2008,7 +2248,35 @@ int main(int argc, char** argv) {
                         ImPlot::SetupAxes("Hz", fftDb ? "dB" : "power",
                                           ImPlotAxisFlags_None,
                                           fftDb ? ImPlotAxisFlags_None : ImPlotAxisFlags_AutoFit);
-                        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, src->srate() * 0.5, cond);
+                        // X axis: full 0..Nyquist by default. "Fit Hz" instead snaps it (once) to
+                        // the band carrying energy — ImPlot's own AutoFit can't, since every PSD
+                        // bin has a value and would just span the whole range. Uses last frame's
+                        // cached spectra (recomputed below); the highest bin within ~45 dB of the
+                        // peak sets the upper edge, with a little headroom.
+                        double xmax = src->srate() * 0.5;
+                        ImPlotCond xcond = cond;
+                        if (fftFitHz) {
+                            fftFitHz = false;
+                            const int b = psd.bins();
+                            const int nc = src->channels();
+                            if ((int)fftCache.size() == nc * b && (int)psdFreq.size() >= b && b > 1) {
+                                float peak = -1e30f;
+                                for (int c = 0; c < nc; ++c) if (fftSel[c])
+                                    for (int k = 1; k < b; ++k) peak = std::max(peak, fftCache[(std::size_t)c * b + k]);
+                                const bool haveSignal = fftDb ? (peak > -90.0f) : (peak > 0.0f);
+                                if (haveSignal) {
+                                    const float thresh = fftDb ? peak - 45.0f : peak * 3.2e-5f;  // ~ -45 dB
+                                    int hi = 0;
+                                    for (int c = 0; c < nc; ++c) if (fftSel[c])
+                                        for (int k = 1; k < b; ++k)
+                                            if (fftCache[(std::size_t)c * b + k] > thresh && k > hi) hi = k;
+                                    if (hi > 0)
+                                        xmax = std::min((double)psdFreq[hi] * 1.3, src->srate() * 0.5);
+                                    xcond = ImPlotCond_Always;
+                                }
+                            }
+                        }
+                        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, xmax, xcond);
                         if (fftDb)
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -110.0, 30.0, cond);
                         std::size_t count = 0; std::uint64_t start = 0;
@@ -2075,6 +2343,10 @@ int main(int argc, char** argv) {
                 if (sources.empty()) {
                     ImGui::TextUnformatted("Connect a stream to view its spectrogram.");
                 } else {
+                    // Workspace restore: bind to the saved stream once it (re)appears.
+                    if (!spectro.wantSid.empty())
+                        for (int i = 0; i < (int)sources.size(); ++i)
+                            if (streamKeyOf(*sources[i]) == spectro.wantSid) { spectro.streamIdx = i; spectro.wantSid.clear(); break; }
                     if (spectro.streamIdx >= (int)sources.size()) spectro.streamIdx = 0;
                     HfStreamSource* src = sources[spectro.streamIdx].get();
                     bool reset = (spectro.uid != src->uid());
@@ -2127,6 +2399,31 @@ int main(int argc, char** argv) {
                         spectro.yDirty = true;
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("frequency range shown — zoom the Y axis to the band of interest");
+                    ImGui::SameLine();
+                    // Fit Hz: snap the Y range to the highest frequency carrying energy across the
+                    // stored columns (same idea as the spectrum's Fit Hz; rows are Nyquist..DC).
+                    if (ImGui::SmallButton("Fit Hz") && spectro.freqBins > 1 && spectro.filled > 0) {
+                        const int fb = spectro.freqBins;
+                        const int cols = std::min(spectro.filled, spectro.cols);
+                        float peak = -1e30f;
+                        for (int cc = 0; cc < cols; ++cc)
+                            for (int r = 0; r < fb; ++r)
+                                peak = std::max(peak, spectro.data[(std::size_t)cc * fb + r]);
+                        const bool haveSignal = spectro.db ? (peak > -120.0f) : (peak > 0.0f);
+                        if (haveSignal) {
+                            const float thresh = spectro.db ? peak - 45.0f : peak * 3.2e-5f;
+                            int rHi = fb - 1;                          // row of the highest energetic freq
+                            for (int cc = 0; cc < cols; ++cc)
+                                for (int r = 0; r < fb; ++r)
+                                    if (spectro.data[(std::size_t)cc * fb + r] > thresh) { rHi = std::min(rHi, r); break; }
+                            const float fhi = ny * (float)(fb - 1 - rHi) / (float)(fb - 1);
+                            spectro.fMin = 0.0f;
+                            spectro.fMax = std::min(ny, fhi * 1.3f);
+                            spectro.yDirty = true;
+                        }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("zoom the frequency axis to the band that actually carries energy");
                     if (ImGui::Checkbox("Filtered", &spectro.filtered)) reset = true;  // recompute columns
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("analyze the conditioned signal (whichever filter stages are enabled\n"
@@ -2250,12 +2547,22 @@ int main(int argc, char** argv) {
                 if (sources.empty() || markerSources.empty()) {
                     ImGui::TextUnformatted("connect a data stream AND a marker stream");
                 } else {
+                    // Workspace restore: bind to the saved data + marker streams once present.
+                    if (!erp.wantSid.empty())
+                        for (int i = 0; i < (int)sources.size(); ++i)
+                            if (streamKeyOf(*sources[i]) == erp.wantSid) { erp.streamIdx = i; erp.wantSid.clear(); break; }
+                    if (!erp.wantMsid.empty())
+                        for (int i = 0; i < (int)markerSources.size(); ++i)
+                            if (streamKeyOf(*markerSources[i]) == erp.wantMsid) { erp.markerIdx = i; erp.wantMsid.clear(); break; }
                     if (erp.streamIdx >= (int)sources.size()) erp.streamIdx = 0;
                     if (erp.markerIdx >= (int)markerSources.size()) erp.markerIdx = 0;
                     HfStreamSource* src = sources[erp.streamIdx].get();
                     MarkerSource*   mk  = markerSources[erp.markerIdx].get();
                     bool reset = (erp.sUid != src->uid()) || (erp.mUid != mk->uid());
 
+                    // ---- left config strip; the plot fills the right (matches the time
+                    // series / spectrum / spectrogram windows) ----
+                    ImGui::BeginChild("cfg", ImVec2(230, 0), ImGuiChildFlags_Borders);
                     // data stream
                     ImGui::SetNextItemWidth(140);
                     if (ImGui::BeginCombo("stream", src->name().c_str())) {
@@ -2272,9 +2579,8 @@ int main(int argc, char** argv) {
                     if (erp.channel >= src->channels()) { erp.channel = 0; reset = true; }
                     const auto& labels = src->labels();
                     // single-channel picker (disabled when averaging all channels)
-                    ImGui::SameLine();
                     ImGui::BeginDisabled(erp.allCh);
-                    ImGui::SetNextItemWidth(110);
+                    ImGui::SetNextItemWidth(140);
                     const char* chn = (erp.channel < (int)labels.size()) ? labels[erp.channel].c_str() : "ch";
                     if (ImGui::BeginCombo("channel", chn)) {
                         erp.chanFilter.Draw("##chf", -1.0f);
@@ -2287,10 +2593,9 @@ int main(int argc, char** argv) {
                         ImGui::EndCombo();
                     }
                     ImGui::EndDisabled();
-                    ImGui::SameLine();
                     if (ImGui::Checkbox("all channels", &erp.allCh)) reset = true;  // average every channel
                     if (erp.allCh) {
-                        ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+                        ImGui::SetNextItemWidth(140);
                         if (ImGui::SliderInt("max ch", &erp.maxCh, 1, std::max(1, src->channels()))) reset = true;
                     }
                     // trigger marker stream
@@ -2306,24 +2611,24 @@ int main(int argc, char** argv) {
                         ImGui::EndCombo();
                     }
                     mk = markerSources[erp.markerIdx].get();
-                    ImGui::SameLine(); ImGui::SetNextItemWidth(140);
                     if (erp.labelFilter.Draw("match", 140.0f)) reset = true;  // only events matching fire
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("only trigger on events whose text matches (blank = every event)");
 
-                    ImGui::SetNextItemWidth(120);
+                    ImGui::SetNextItemWidth(140);
                     if (ImGui::SliderFloat("pre (ms)", &erp.preMs, 10.0f, 1000.0f, "%.0f")) reset = true;
-                    ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+                    ImGui::SetNextItemWidth(140);
                     if (ImGui::SliderFloat("post (ms)", &erp.postMs, 50.0f, 2000.0f, "%.0f")) reset = true;
-                    if (ImGui::Checkbox("baseline", &erp.baseline)) reset = true;   // new line so nothing clips
+                    if (ImGui::Checkbox("baseline", &erp.baseline)) reset = true;
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Clear")) erpClear(erp);
-                    ImGui::SameLine();
                     ImGui::Checkbox("raster", &erp.raster);   // channels x time heatmap, one row per channel
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("render the averaged ERP as a channels x time heatmap (color = µV),\none row per channel — the trigger-aligned twin of the time-series raster");
                     ImGui::SameLine();
                     ImGui::TextDisabled("%d epoch%s", erp.count, erp.count == 1 ? "" : "s");
+                    ImGui::EndChild();   // cfg
+                    ImGui::SameLine();
 
                     if (src->srate() <= 0.0) {
                         ImGui::TextUnformatted("data stream has no regular rate");
@@ -2498,9 +2803,24 @@ int main(int argc, char** argv) {
             SDL_SubmitGPUCommandBuffer(cmd);   // presents the acquired swapchain
 #ifdef LSL_TESTS
             ImGuiTestEngine_PostSwap(engine);  // processes capture / queue timing
+            // The engine loads settings (incl. empty VideoCapture*ToEncoder entries) on the
+            // first frame, clobbering any pre-Start values; (re)apply the ffmpeg path + params
+            // once after, so CaptureBeginVideo() can encode a .gif/.mp4.
+            if (frameCounter == 2 && std::getenv("LSL_FFMPEG")) {
+                std::strncpy(tio.VideoCaptureEncoderPath, std::getenv("LSL_FFMPEG"),
+                             sizeof(tio.VideoCaptureEncoderPath) - 1);
+                std::strncpy(tio.VideoCaptureEncoderParams, IMGUI_CAPTURE_DEFAULT_VIDEO_PARAMS_FOR_FFMPEG,
+                             sizeof(tio.VideoCaptureEncoderParams) - 1);
+                std::strncpy(tio.GifCaptureEncoderParams, IMGUI_CAPTURE_DEFAULT_GIF_PARAMS_FOR_FFMPEG,
+                             sizeof(tio.GifCaptureEncoderParams) - 1);
+            }
 #endif
         }
         gpuMs = pcSeconds(tGpu0, SDL_GetPerformanceCounter()) * 1000.0;
+
+        // Apply a deferred workspace load now the frame is fully rendered (a safe point to
+        // mutate ImGui ini state): rebuilds analysis windows + restores the dock layout.
+        if (!pendingWs.empty()) { wsApply(pendingWs); pendingWs.clear(); }
 
         LSL_FRAME_MARK();
         LSL_PLOT("frame ms", frameMs);

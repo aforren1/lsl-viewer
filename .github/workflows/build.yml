@@ -1,0 +1,127 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. force-pushes to a PR).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux,   os: ubuntu-latest,  gen: Ninja,                   bindir: build }
+          - { name: macos,   os: macos-latest,   gen: Ninja,                   bindir: build }
+          - { name: windows, os: windows-latest, gen: "Visual Studio 17 2022", bindir: build/Release }
+    steps:
+      - uses: actions/checkout@v4
+
+      # SDL3 is built from source (FetchContent). Install the X11 + Wayland dev headers so
+      # SDL builds BOTH backends — it then picks one at runtime, so the binary runs under
+      # either display server. SDL bundles its own Vulkan headers (no system Vulkan SDK
+      # needed to build SDL_GPU). SDL hard-errors if SDL_X11=ON but X11 headers are absent.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxrender-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev libgbm-dev
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      # Compile check incl. the UI test suite + Test Engine (LSL_TESTS=ON, no LTO so the
+      # link stays fast). The tests themselves need a GPU to run, so CI only builds them.
+      - name: Build (with tests)
+        run: >
+          cmake -S . -B build-test -G "${{ matrix.gen }}"
+          -DCMAKE_BUILD_TYPE=Release -DLSL_TESTS=ON &&
+          cmake --build build-test --config Release --parallel
+
+      # Shippable artifact: a static Release build (LTO on) — SDL3 + liblsl folded into the
+      # executable, so each binary is self-contained (no SDL3/lsl libs to ship alongside).
+      - name: Build (release, static)
+        run: >
+          cmake -S . -B build -G "${{ matrix.gen }}"
+          -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON &&
+          cmake --build build --config Release --parallel
+
+      - name: Strip binaries (Unix)
+        if: runner.os != 'Windows'
+        run: strip ${{ matrix.bindir }}/lsl_viewer ${{ matrix.bindir }}/xdf_record
+
+      - name: Upload executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsl-viewer-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            ${{ matrix.bindir }}/lsl_viewer
+            ${{ matrix.bindir }}/lsl_viewer.exe
+            ${{ matrix.bindir }}/xdf_record
+            ${{ matrix.bindir }}/xdf_record.exe
+
+  # Portable single-file Linux build. Built on an older Ubuntu (older glibc) so it runs on
+  # a wide range of distros, and packaged as an AppImage with a desktop entry + icon. SDL
+  # dlopens the display-server libs at runtime, so the host provides X11/Wayland + the GPU
+  # driver/Vulkan loader (always system components) — the AppImage carries the rest.
+  appimage:
+    name: linux-appimage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build file \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxrender-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev wayland-protocols libdecor-0-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev libgbm-dev
+
+      - name: Build (release, static, X11 + Wayland)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON
+          cmake --build build --parallel
+
+      - name: Assemble AppDir
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp build/lsl_viewer build/xdf_record AppDir/usr/bin/
+          strip AppDir/usr/bin/lsl_viewer AppDir/usr/bin/xdf_record
+
+      - name: Package AppImage
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          export APPIMAGE_EXTRACT_AND_RUN=1   # runners have no FUSE
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/lsl_viewer \
+            --desktop-file packaging/lsl-viewer.desktop \
+            --icon-file packaging/lsl-viewer.png \
+            --output appimage
+          rm -f linuxdeploy-x86_64.AppImage          # drop the tool, leaving only the output
+          mv ./*.AppImage LSL-Viewer-x86_64.AppImage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: lsl-viewer-appimage
+          if-no-files-found: error
+          path: LSL-Viewer-x86_64.AppImage

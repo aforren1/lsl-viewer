@@ -1,102 +1,126 @@
-# lsl-sdl — live LSL stream viewer
+# lsl-sdl
 
-A real-time, EEG-style viewer for [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer)
-streams. SDL3 + SDL_GPU + Dear ImGui (docking) + ImPlot + liblsl, C++20.
+**A fast, real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer) streams.**
 
-See [DESIGN.md](DESIGN.md) for architecture and rationale.
+Plot live LSL streams (e.g. EEG, MEG, fNIRS, accelerometers, markers) with
+filtering, spectral views, evoked-response averaging, and recording all in one
+GPU-accelerated window.
 
-## Repository layout
+![Live scrolling EEG montage](docs/images/live.gif)
 
+---
+
+## Features
+
+### Live multi-stream time series
+
+![Stacked montage of slow drift channels beside a 128-channel raster](docs/images/montage.png)
+
+- **Stacked montage** (EEG-style, one named lane per channel) or shared-axis **overlay**, with per-channel gains and an Auto-fit.
+- Smooth GPU scrolling that stays fluid at high channel counts and sample rates.
+- A single-quad **raster/heatmap** mode for dense montages (32–256+ channels) where line traces are too short to read — spot regional activity across the whole array at a glance.
+- **Pause** to inspect a frozen window.
+- **Dropouts shown honestly** — a stream that drops out leaves a red gap on the real timeline, not a silent jump.
+
+### Signal conditioning
+
+Independent, stackable filter stages you apply in any combination — and *every*
+view (time series, spectrum, spectrogram, zoom) reflects them:
+
+- **High-pass** (DC/drift removal) · **mains notch** (50 / 60 Hz) · **low-pass** (anti-EMG)
+- **Re-referencing**: common-average (CAR) or a single reference channel. CAR averages the **EEG channels only** — EOG/EMG/trigger channels are excluded automatically from the metadata.
+
+### Frequency domain analysis
+
+| Per-channel FFT spectrum | Rolling spectrogram |
+|---|---|
+| ![FFT spectrum of two audio tones](docs/images/spectrum.png) | ![Spectrogram of a 1→120 Hz chirp](docs/images/spectrogram.png) |
+
+- Overlaid **PSD** for any selected channels (dB or linear).
+- A rolling **STFT spectrogram** with a **zoomable frequency axis**, plus a one-click **Fit Hz** that snaps it to the band actually carrying energy — essential when the sample rate is high but the signal of interest is low (e.g. 48 kHz audio, tones < 1 kHz).
+- Both can analyze the raw or the conditioned signal.
+
+### ERP / marker-aligned averaging
+
+![ERP average with single-trial spaghetti](docs/images/erp.png)
+
+- Trigger on a marker stream (with optional label matching, e.g. `target`), cut epochs around each event, and watch the **evoked response** build up — average in bold over the faint single-trial "spaghetti".
+- Multi-channel and an **erpimage** (trials × time, or channels × time) raster view.
+
+### Recording
+
+- One-click **XDF recording** of every connected stream — LabRecorder-compatible (verified against the real LabRecorder via `pyxdf`), with raw timestamps + clock-offset chunks so importers realign streams to a common clock.
+- BIDS-ish **filename templating** (`sub-{subject}_task-{task}_run-{run}_eeg.xdf`).
+- A headless **`xdf_record`** CLI for unattended capture (no GUI).
+
+### And more
+
+- **IDE-like docking** layout: a Streams rail on the left, plots and analysis as tabs you arrange to taste.
+- **Saved workspaces** — name and save the whole view (per-stream filters/channels/gains, the open analysis windows, and the dock layout); loading one re-applies it, re-binding to each stream by `source_id` as it reconnects. Set your rig up once.
+- **Stream Info & health** — type, source id, channels, sensor positions, plus live measured-rate / clock-offset / dropout counters per stream.
+- **Remote control** over TCP — drive recording from your experiment script (see below).
+- Light / dark theme, persisted layout.
+
+---
+
+## Remote control
+
+Start the viewer with a control port (`LSL_RC_PORT=22345`, or enable it from the
+Recording panel) and any client can drive recording over TCP with newline-terminated
+commands — `status`, `start [path]`, `stop`, `help`. Handy for starting/stopping a
+recording from the same script that runs your experiment:
+
+```python
+import socket
+
+with socket.create_connection(("localhost", 22345)) as rc:
+    def cmd(c):
+        rc.sendall((c + "\n").encode())
+        return rc.recv(4096).decode().strip()
+
+    cmd("start sub-01_task-oddball_run-1_eeg.xdf")
+    # ... present stimuli, push markers via LSL ...
+    cmd("stop")
+    print(cmd("status"))
 ```
-src/                     the viewer — one translation unit + header-only modules
-  main.cpp                 app entry: UI, dock layout, render loop, recording UI
-  hf_stream_source.hpp     LSL inlet -> ring buffer on a worker thread
-  magic_ring_buffer.hpp    mirrored (contiguous-wraparound) lock-free ring buffer
-  minmax_summary.hpp       decimated min/max envelope for zoomed-out plots
-  filter.hpp               DC-blocker / running high-pass
-  fft.hpp                  FFT + PSD (spectrum and spectrogram views)
-  recorder.hpp             XDF recording driver (records connected streams)
-  xdf_writer.hpp           XDF container writer
-  remote_control.hpp       TCP remote-control server (start/stop/status)
-  profiler.hpp             zone-profiling macros (no-ops unless -DLSL_TRACY)
 
-tools/                   standalone helpers (not linked into the viewer)
-  lsl_test_streams.py      synthetic LSL sources for testing (EEG, sine, chirp, markers)
-  xdf_record.cpp           headless XDF recorder CLI (no GUI deps)
+The port is also advertised over LSL (in the control stream's `source_id`), so a
+client can discover it instead of hard-coding `22345`. Or just `nc localhost 22345`.
 
-tests/                   Dear ImGui Test Engine UI tests + screenshot captures
-  ui_tests.cpp             enabled with -DLSL_TESTS=ON; run via `lsl_viewer --tests`
+---
 
-CMakeLists.txt           all dependencies are fetched at configure time (FetchContent)
-run.sh                   WSLg launcher (points SDL at the Wayland runtime dir)
-```
+## Quick start
 
-Build trees (`build/`, `build-tracy/`), the Python venv (`.venv/`), captured
-screenshots (`output/`), recordings (`*.xdf`), and the persisted ImGui layout
-(`imgui.ini`) are generated and git-ignored.
-
-## Build & run
-
-All third-party libraries (SDL3, liblsl, Dear ImGui, ImPlot, spdlog, and
-optionally Tracy / the ImGui Test Engine) are pulled in by CMake — no system
-packages to install beyond a C++20 compiler and CMake ≥ 3.23.
+All dependencies are fetched by CMake — you just need a **C++20 compiler** and
+**CMake ≥ 3.23**.
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/lsl_viewer          # on WSL: use ./run.sh (sets the WSLg Wayland socket)
+./build/lsl_viewer          # on WSL: ./run.sh
+
+# in another terminal, feed it synthetic streams to play with:
+uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers,evoked
 ```
 
-Feed it test data — the script carries inline metadata (PEP 723), so
-[uv](https://docs.astral.sh/uv/) resolves `pylsl`/`numpy` automatically
-(or run it with plain `python` in a venv that has them):
+Then connect streams from the **Streams** rail (or set `LSL_AUTOCONNECT=1`).
 
-```bash
-uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers
-```
+➡️ **[docs/building.md](docs/building.md)** — build options, single-file/static builds, Windows, test data, repo layout.
 
-### Optional CMake flags
+---
 
-| Flag | Effect |
-|------|--------|
-| `-DLSL_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]` |
-| `-DLSL_TRACY=ON`  | enable the Tracy frame profiler (connect the Tracy server to view) |
-| `-DLSL_STATIC=ON` | static-link SDL3 + liblsl into one self-contained binary (see below) |
+## Roadmap
 
-### Windows
+- **Scalp topography (topomap)** — interpolated head map of amplitude / band power. Groundwork is in place: per-channel sensor positions are already parsed from stream metadata (so it's modality-agnostic — EEG/MEG/fNIRS), and the Info panel reports how many channels carry a layout.
+- **Bipolar montages** — named electrode chains (e.g. the longitudinal "double banana").
+- **Markers drag-onto-plot** and richer marker/event handling.
+- Per-channel **bad-channel rejection** (manual exclude from CAR / display).
 
-The sources are portable (SDL_GPU uses the native D3D12 backend); only the build
-artifacts are platform-specific. Copy the **source** (not `build*/` or `.venv/`)
-to a native Windows path, install Visual Studio 2022 + CMake ≥ 3.23, then run the
-same `cmake` configure/build (drop the Linux-only `-DSDL_X11=OFF`). `run.sh` and
-the Wayland environment are not needed — just launch `lsl_viewer.exe`.
+---
 
-The remote-control TCP server uses Winsock on Windows; to verify that path at
-runtime see [docs/windows-remote-control-testing.md](docs/windows-remote-control-testing.md).
+## Documentation
 
-### Static build (single-file distribution)
+- **[docs/building.md](docs/building.md)** — building, CMake flags, static / single-file builds, Windows, repo layout
+- **[DESIGN.md](DESIGN.md)** — architecture & rationale (ring buffers, threading, the rendering path)
 
-`-DLSL_STATIC=ON` folds SDL3 and liblsl into the executable so there's nothing to
-ship alongside it:
-
-```bash
-cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON
-cmake --build build-static
-```
-
-This is primarily a **Windows** convenience: the default (dynamic) build drops
-`SDL3.dll`/`lsl.dll` next to the exe, whereas the static build needs none — and it
-also switches the MSVC C runtime to static (`/MT`), so the target machine doesn't
-need the Visual C++ redistributable. The UI font is embedded either way, so a
-static Windows build is a genuinely standalone `lsl_viewer.exe`.
-
-On Linux the GPU driver and glibc stay dynamic regardless (SDL loads the Vulkan
-loader at runtime), so static linking buys less there — prefer an AppImage for
-distribution. The graphics driver is always a system component on both platforms.
-
-**Link-time optimization** is enabled automatically for `Release` builds (but not
-the test build or the default `RelWithDebInfo` dev build, so iterative links stay
-fast). It mostly drops unreferenced ImGui/ImPlot code — measured **~45% smaller**
-on the static binary (~10 MB → ~5.6 MB stripped). Runtime is unchanged (the app is
-GPU-bound). No flag needed; it's on whenever `-DCMAKE_BUILD_TYPE=Release` and the
-compiler supports IPO.
+Built with [SDL3](https://github.com/libsdl-org/SDL) + SDL_GPU, [Dear ImGui](https://github.com/ocornut/imgui) (docking) + [ImPlot](https://github.com/epezent/implot), [liblsl](https://github.com/sccn/liblsl), and [KissFFT](https://github.com/mborgerding/kissfft). C++20.
