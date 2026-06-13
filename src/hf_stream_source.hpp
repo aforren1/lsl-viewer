@@ -136,6 +136,9 @@ public:
     void setHighpassHz(double fc) {
         hpR_.store(DcBlocker::cutoffToR(fc, srate_), std::memory_order_relaxed);
     }
+    // High-pass is one STAGE of the conditioned chain (re-reference -> high-pass -> notch
+    // -> low-pass) and can be bypassed independently, so you can run e.g. a notch alone.
+    void setHighpass(bool on) { hpOn_.store(on, std::memory_order_relaxed); }
     // Optional notch (mains 50/60 Hz) and low-pass stages of the display filter chain
     // (high-pass -> notch -> low-pass), feeding the filtered envelope. The producer
     // reads these atomics per chunk and reconfigures the biquads when they change.
@@ -266,6 +269,7 @@ private:
         const bool  non = notchOn_.load(std::memory_order_relaxed);
         const float nf  = notchHz_.load(std::memory_order_relaxed);
         if (non != notchApplied_ || nf != notchHzApplied_) {
+            if (non && !notchApplied_) notch_.reset();    // re-enabled: clear stale z-state
             notch_.enabled = non;
             if (non) notch_.setNotch(nf, srate_, 30.0);   // narrow (Q=30): only the mains line
             notchApplied_ = non; notchHzApplied_ = nf;
@@ -273,6 +277,7 @@ private:
         const bool  lon = lpOn_.load(std::memory_order_relaxed);
         const float lf  = lpHz_.load(std::memory_order_relaxed);
         if (lon != lpApplied_ || lf != lpHzApplied_) {
+            if (lon && !lpApplied_) lp_.reset();          // re-enabled: clear stale z-state
             lp_.enabled = lon;
             if (lon) lp_.setLowpass(lf, srate_, 0.70710678);  // Butterworth
             lpApplied_ = lon; lpHzApplied_ = lf;
@@ -367,16 +372,27 @@ private:
                     lastTsValid_ = true;
                 }
 
-                // Publish: head advances now, with the gap (if any) already recorded.
-                ring_.write(buf.data(), n);        // one memcpy
-                summary_.append(buf.data(), n);    // fold, cache-hot
                 // Conditioned chain: re-reference -> high-pass -> notch -> low-pass.
                 const float* condIn = reference(buf.data(), refBuf.data(), n);
-                hp_.setR(hpR_.load(std::memory_order_relaxed));   // running high-pass
-                hp_.process(condIn, hpBuf.data(), n);
+                const bool hpOn = hpOn_.load(std::memory_order_relaxed);
+                if (hpOn && !hpApplied_) hp_.reset();                 // re-enabled: re-prime clean
+                hpApplied_ = hpOn;
+                if (hpOn) {
+                    hp_.setR(hpR_.load(std::memory_order_relaxed));   // running high-pass
+                    hp_.process(condIn, hpBuf.data(), n);
+                } else {
+                    std::copy(condIn, condIn + n * (std::size_t)channels_, hpBuf.data());  // bypass HP
+                }
                 applyPostFilters(hpBuf.data(), n);                // optional notch + low-pass
+                // Write ALL derived structures FIRST, then publish the raw ring's head LAST.
+                // ring_.head() is the canonical head every reader bounds by (incl. filtered
+                // reads of ringHp_), so it must never advance ahead of the filtered ring /
+                // summaries for the same chunk — otherwise a filtered read indexes ringHp_
+                // past its written data (one-chunk stale/wrap tail at the live edge).
                 ringHp_.write(hpBuf.data(), n);                   // full-rate filtered (FFT/spectro/zoom)
                 summaryHp_.append(hpBuf.data(), n);
+                summary_.append(buf.data(), n);                  // raw envelope, fold cache-hot
+                ring_.write(buf.data(), n);        // publish: head advances now (gap already recorded)
 
                 const double now = lsl::local_clock();
                 if (now - lastCorr > 5.0) {        // refresh for cross-stream align
@@ -447,16 +463,24 @@ private:
                     for (std::size_t i = 0; i < batch; ++i)
                         for (int c = 0; c < channels_; ++c)
                             out[i * (std::size_t)channels_ + c] = cur[c];
-                    ring_.write(out.data(), batch);
-                    summary_.append(out.data(), batch);
                     refOut.resize(batch * (std::size_t)channels_);
                     const float* condIn = reference(out.data(), refOut.data(), batch);
-                    hp_.setR(hpR_.load(std::memory_order_relaxed));
                     hpOut.resize(batch * (std::size_t)channels_);
-                    hp_.process(condIn, hpOut.data(), batch);
+                    const bool hpOn = hpOn_.load(std::memory_order_relaxed);
+                    if (hpOn && !hpApplied_) hp_.reset();
+                    hpApplied_ = hpOn;
+                    if (hpOn) {
+                        hp_.setR(hpR_.load(std::memory_order_relaxed));
+                        hp_.process(condIn, hpOut.data(), batch);
+                    } else {
+                        std::copy(condIn, condIn + batch * (std::size_t)channels_, hpOut.data());
+                    }
                     applyPostFilters(hpOut.data(), batch);        // optional notch + low-pass
+                    // Derived structures first, then publish the raw head LAST (see run()).
                     ringHp_.write(hpOut.data(), batch);           // full-rate filtered
                     summaryHp_.append(hpOut.data(), batch);
+                    summary_.append(out.data(), batch);
+                    ring_.write(out.data(), batch);               // publish canonical head last
                     written += batch;
                 }
             }
@@ -527,12 +551,13 @@ private:
     // Cutoffs/enables are read atomically (UI may change); biquad state is producer-only.
     DcBlocker           hp_;
     std::atomic<float>  hpR_{0.999f};
+    std::atomic<bool>   hpOn_{true};   // high-pass stage enabled (else bypassed)
     Biquad              notch_, lp_;
     std::atomic<bool>   notchOn_{false}, lpOn_{false};
     std::atomic<float>  notchHz_{60.0f}, lpHz_{40.0f};
     std::atomic<int>    refMode_{0}, refChan_{0};   // 0 none / 1 CAR / 2 single-channel
     // last-applied params, so the producer only recomputes coeffs on change
-    bool                notchApplied_ = false, lpApplied_ = false;
+    bool                notchApplied_ = false, lpApplied_ = false, hpApplied_ = true;
     float               notchHzApplied_ = -1.0f, lpHzApplied_ = -1.0f;
 
     // Render-thread-only display state (one plot per source).

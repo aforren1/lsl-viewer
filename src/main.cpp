@@ -217,9 +217,9 @@ struct DisplayOpts {
     float history     = 10.0f;
     bool  stacked     = true;   // EEG-style montage (vs shared-axis overlay)
     bool  raster      = false;  // many-channel mode: one heatmap (color=p2p) vs N line series
-    bool  filter      = true;   // show high-pass filtered signal
     float gainUv      = 150.0f; // µV mapped to one lane height (stacked)
     float spacing     = 0.0f;   // vertical offset between channels (overlay)
+    bool  highpass    = true;   // high-pass STAGE on/off (independent of notch/low-pass/reference)
     float hpHz        = 0.5f;   // running high-pass cutoff (Hz)
     bool  notch       = false;  // mains line-noise notch (display filter stage)
     float notchHz     = 60.0f;  // notch center (50 or 60 Hz)
@@ -421,16 +421,20 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::EndDisabled();
         ImGui::SetNextItemWidth(110);
         ImGui::SliderFloat("Line width", &o.lineWidth, 0.5f, 4.0f, "%.1f");
-        if (ImGui::Checkbox("High-pass", &o.filter)) o.overlayYFit = true;  // raw<->filtered = big scale change; refit overlay Y
+        // Conditioning stages (re-reference -> high-pass -> notch -> low-pass) are each
+        // INDEPENDENT — press any combination. The plot shows the conditioned signal
+        // whenever ANY stage is on, and the raw signal when all are off (no master toggle).
+        // High-pass stage (own toggle + cutoff)
+        if (ImGui::Checkbox("High-pass", &o.highpass)) { s.setHighpass(o.highpass); o.overlayYFit = true; }
         ImGui::SameLine();
-        ImGui::BeginDisabled(!o.filter);
+        ImGui::BeginDisabled(!o.highpass);
         ImGui::SetNextItemWidth(90);
         if (ImGui::SliderFloat("##hpcut", &o.hpHz, 0.1f, 5.0f, "%.2f Hz",
                                ImGuiSliderFlags_Logarithmic))
             s.setHighpassHz(o.hpHz);
-        // Notch + low-pass are further stages of the same filtered view (they feed the
-        // high-pass envelope), so they only apply when High-pass is on.
-        if (ImGui::Checkbox("Notch", &o.notch)) s.setNotch(o.notch);
+        ImGui::EndDisabled();
+        // Notch stage
+        if (ImGui::Checkbox("Notch", &o.notch)) { s.setNotch(o.notch); o.overlayYFit = true; }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("band-reject the mains line frequency (50/60 Hz) and its hum");
         ImGui::SameLine();
@@ -444,7 +448,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("jump to %s Hz mains", is50 ? "60" : "50");
         ImGui::EndDisabled();
-        if (ImGui::Checkbox("Low-pass", &o.lowpass)) s.setLowpass(o.lowpass);
+        // Low-pass stage
+        if (ImGui::Checkbox("Low-pass", &o.lowpass)) { s.setLowpass(o.lowpass); o.overlayYFit = true; }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("smooth / anti-EMG: attenuate everything above the cutoff");
         ImGui::SameLine();
@@ -457,7 +462,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         // high-pass -> notch -> low-pass), so it lives with the filter controls.
         const char* refModes[] = { "None", "Avg (CAR)", "Channel" };
         ImGui::SetNextItemWidth(110);
-        if (ImGui::Combo("Reference", &o.refMode, refModes, 3)) s.setReference(o.refMode);
+        if (ImGui::Combo("Reference", &o.refMode, refModes, 3)) { s.setReference(o.refMode); o.overlayYFit = true; }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("re-reference the montage: subtract the common average (CAR)\n"
                               "or a chosen channel from every channel");
@@ -473,7 +478,6 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImGui::EndCombo();
             }
         }
-        ImGui::EndDisabled();
     }
     if (ImGui::CollapsingHeader("Channels", ImGuiTreeNodeFlags_DefaultOpen)) {
         // All/None act on the visible (filtered) set, so "Cz" + All selects all
@@ -535,20 +539,20 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::TextWrapped("source id: %s", s.sourceId().empty() ? "(none)" : s.sourceId().c_str());
         ImGui::Text("channels: %d", C);
         ImGui::Text("unit: %s", streamUnit);
-        // Per-channel modality types (distinct, with counts) from the metadata.
+        // Per-channel modality types (distinct, with counts) from the metadata — one
+        // pass over channels accumulating into an ordered (key,count) list.
         {
             const auto& types = s.types();
-            std::string ts;
+            static const std::string kNone("(none)");
+            std::vector<std::pair<std::string, int>> tc;
             for (int c = 0; c < C; ++c) {
-                const std::string key = (c < (int)types.size() && !types[c].empty()) ? types[c] : "(none)";
-                std::size_t at = ts.find(key + " x");   // already counted?
-                if (at == std::string::npos) {
-                    int n = 0; for (int k = 0; k < C; ++k)
-                        if (((k < (int)types.size() && !types[k].empty()) ? types[k] : "(none)") == key) ++n;
-                    if (!ts.empty()) ts += ", ";
-                    ts += key + " x" + std::to_string(n);
-                }
+                const std::string& key = (c < (int)types.size() && !types[c].empty()) ? types[c] : kNone;
+                bool found = false;
+                for (auto& p : tc) if (p.first == key) { ++p.second; found = true; break; }
+                if (!found) tc.push_back({key, 1});
             }
+            std::string ts;
+            for (auto& p : tc) { if (!ts.empty()) ts += ", "; ts += p.first + " x" + std::to_string(p.second); }
             ImGui::TextWrapped("ch types: %s", ts.c_str());
         }
         // Sensor positions (the basis for any spatial/topographic view). Surfaced so we
@@ -622,7 +626,9 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     const std::uint64_t endBin = headFreeze ? headFreeze / (std::uint64_t)B : 0;
     const double windowSamples = o.history * rate;
     const double viewSamples   = (o.history + 0.5) * rate;  // read past both edges
-    MinMaxSummary& summ = o.filter ? s.summaryHp() : s.summary();
+    // Show the conditioned (filtered) signal when ANY stage is enabled, else raw.
+    const bool   filtered = o.highpass || o.notch || o.lowpass || (o.refMode != 0);
+    MinMaxSummary& summ = filtered ? s.summaryHp() : s.summary();
     auto envelopeBins = [&]() {
         return std::max<std::size_t>(1, (std::size_t)(viewSamples / B) + 4);
     };
@@ -635,7 +641,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         // Read the pre-filtered ring when the display filter is on (full chain:
         // high-pass -> notch -> low-pass), else the raw ring. Both rings share indices
         // (written in lockstep), so no per-frame filtering or warm-up is needed.
-        InterleavedRing& rg = o.filter ? s.ringHp() : s.ring();
+        InterleavedRing& rg = filtered ? s.ringHp() : s.ring();
         const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples, rg.capacity());
         std::size_t count = 0; std::uint64_t start = 0;
         const float* p;
@@ -913,7 +919,12 @@ static void spectroReset(Spectro& sp, HfStreamSource& s) {
     constexpr double kTargetHop = 0.03;   // s/column target — small hop = fast columns = smooth scroll
     sp.psd.init(sp.nfft, (float)s.srate());
     sp.freqBins = sp.psd.bins();
-    sp.fMin = 0.0f; sp.fMax = (float)(s.srate() * 0.5);   // default Y range = full 0..Nyquist
+    // Y (frequency) range: seed to full 0..Nyquist on first init, else PRESERVE the user's
+    // zoom across resets (channel/NFFT change, Filtered toggle) — only clamp it to the new
+    // Nyquist (which can shrink on a stream switch). Avoids losing the Hz zoom on a toggle.
+    const float ny = (float)(s.srate() * 0.5);
+    if (sp.fMax <= 0.0f) { sp.fMin = 0.0f; sp.fMax = ny; }
+    else { sp.fMin = std::clamp(sp.fMin, 0.0f, ny); sp.fMax = std::clamp(sp.fMax, sp.fMin, ny); }
     sp.yDirty = true;                                      // apply it on the next frame
     // Stride toward ~0.06 s columns regardless of sample rate, but never coarser
     // than 50% overlap (low-rate streams overlap more, so the edge stays fed).
@@ -1339,7 +1350,7 @@ int main(int argc, char** argv) {
     // FFT / PSD view state.
     Psd                        psd;
     int                        fftStream = 0;
-    int                        fftN = 2048;
+    int                        fftN = 512;   // small default = fast fill / immediate feedback (bump for finer Hz resolution)
     bool                       fftDb = true;
     bool                       fftFiltered = false;  // apply the stream's display filter chain
     bool                       fftRefit = true;   // force-fit axes after a mode change
@@ -1351,6 +1362,7 @@ int main(int argc, char** argv) {
     std::vector<float>         psdFreq, psdOut;
     std::vector<float>         fftCache;          // [channel*bins] last computed spectra
     double                     fftLastCompute = -1e18;  // wall-clock of last recompute (throttle)
+    bool                       fftPausedPrev  = false;  // detect pause entry (recompute once on the frozen window)
 
     FrameStats fps;
     bool   curVsync = vsync;
@@ -1636,13 +1648,20 @@ int main(int argc, char** argv) {
                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking);
             ImGuiWindow* streamsWin = ImGui::GetCurrentWindow();  // kept on top below
+            // Slightly larger section headers for the sidebar so the Recording/Streams/
+            // Performance groups stand out (SetWindowFontScale is per-window, reset after).
+            auto sectionHeader = [](const char* label) {
+                ImGui::SetWindowFontScale(1.2f);
+                ImGui::SeparatorText(label);
+                ImGui::SetWindowFontScale(1.0f);
+            };
             ImGui::TextDisabled("live \xc2\xb7 %d stream%s on the network",
                                 (int)found.size(), found.size() == 1 ? "" : "s");
 
             // ---- Recording: pinned at the top so it has a stable location (always
             // visible, never shifts with the stream count). Records every connected
             // stream — no per-stream selection.
-            ImGui::SeparatorText("Recording");
+            sectionHeader("Recording");
             {
                 int nConn = 0; for (auto& info : found) if (connected(info)) ++nConn;
                 if (!recorder.active()) {
@@ -1713,7 +1732,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            ImGui::SeparatorText("Streams");
+            sectionHeader("Streams");
 
             for (auto& info : found) {
                 ImGui::PushID(info.uid().c_str());
@@ -1798,8 +1817,7 @@ int main(int argc, char** argv) {
 
             // ---- Performance (Debug menu) — lives at the bottom of the rail ----
             if (showPerf) {
-                ImGui::Separator();
-                ImGui::SeparatorText("Performance");
+                sectionHeader("Performance");
                 const float avg = fps.avg();
                 ImGui::Text("%.1f FPS  \xc2\xb7  %.2f ms avg / %.2f ms max",
                             avg > 0 ? 1000.0f / avg : 0.0f, avg, fps.maxv());
@@ -1907,8 +1925,10 @@ int main(int argc, char** argv) {
                 if (fftStream >= (int)sources.size()) fftStream = 0;
                 HfStreamSource* src = sources[fftStream].get();
 
-                ImGui::SetNextItemWidth(180);
-                if (ImGui::BeginCombo("stream", src->name().c_str())) {
+                // ---- left config strip; the plot fills the right (like the time series) ----
+                ImGui::BeginChild("cfg", ImVec2(200, 0), ImGuiChildFlags_Borders);
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                     for (int i = 0; i < (int)sources.size(); ++i)
                         if (ImGui::Selectable(sources[i]->name().c_str(), i == fftStream)) {
                             fftStream = i; fftRefit = true;
@@ -1916,16 +1936,6 @@ int main(int argc, char** argv) {
                     ImGui::EndCombo();
                 }
                 src = sources[fftStream].get();
-
-                ImGui::SameLine(); ImGui::SetNextItemWidth(90);
-                const char* szs[] = { "512", "1024", "2048", "4096" };
-                int szi = (fftN == 512) ? 0 : (fftN == 1024) ? 1 : (fftN == 2048) ? 2 : 3;
-                if (ImGui::Combo("N", &szi, szs, 4)) { fftN = 1 << (9 + szi); fftRefit = true; }
-                ImGui::SameLine(); if (ImGui::Checkbox("dB", &fftDb)) fftRefit = true;
-                ImGui::SameLine(); if (ImGui::Checkbox("Filtered", &fftFiltered)) fftRefit = true;
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("analyze the stream's display-filtered signal (high-pass + notch + low-pass)\ninstead of the raw signal — set the cutoffs in the time-series window");
-
                 if (src->uid() != fftUid) {            // reset selection on stream change
                     fftUid = src->uid();
                     fftSel.assign(src->channels(), 0);
@@ -1933,23 +1943,30 @@ int main(int argc, char** argv) {
                     fftRefit = true;
                 }
                 const auto& labels = src->labels();
-
-                // Select all/none act on the filtered set (like the montage list).
                 auto fpass = [&](int c) { return fftFilter.PassFilter(labels[c].c_str()); };
-                if (ImGui::SmallButton("All"))
-                    for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 1;
+
+                ImGui::SetNextItemWidth(80);
+                const char* szs[] = { "512", "1024", "2048", "4096" };
+                int szi = (fftN == 512) ? 0 : (fftN == 1024) ? 1 : (fftN == 2048) ? 2 : 3;
+                if (ImGui::Combo("N", &szi, szs, 4)) { fftN = 1 << (9 + szi); fftRefit = true; }
+                ImGui::SameLine(); if (ImGui::Checkbox("dB", &fftDb)) fftRefit = true;
+                if (ImGui::Checkbox("Filtered", &fftFiltered)) fftRefit = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("analyze the display-filtered signal (high-pass + notch + low-pass)\n"
+                                      "instead of raw — set the cutoffs in the time-series window");
+                if (ImGui::SmallButton("All"))  for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 1;
                 ImGui::SameLine();
-                if (ImGui::SmallButton("None"))
-                    for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 0;
-                ImGui::SameLine();
-                fftFilter.Draw("filter", 140.0f);
-                ImGui::BeginChild("chans", ImVec2(0, 110), ImGuiChildFlags_Borders);
+                if (ImGui::SmallButton("None")) for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 0;
+                fftFilter.Draw("##f", -1.0f);                                           // channel name filter
+                ImGui::BeginChild("chans", ImVec2(0, 0), ImGuiChildFlags_Borders);      // fills the rest of the strip
                 for (int c = 0; c < src->channels(); ++c) {
                     if (!fpass(c)) continue;
                     bool on = fftSel[c] != 0;
-                    if (ImGui::Checkbox(labels[c].c_str(), &on)) { fftSel[c] = on ? 1 : 0; fftRefit = true; }  // recompute now (no stale/zero flash)
+                    if (ImGui::Checkbox(labels[c].c_str(), &on)) { fftSel[c] = on ? 1 : 0; fftRefit = true; }
                 }
-                ImGui::EndChild();
+                ImGui::EndChild();   // chans
+                ImGui::EndChild();   // cfg
+                ImGui::SameLine();
 
                 if (src->srate() <= 0.0) {
                     ImGui::TextUnformatted("irregular stream — no spectrum");
@@ -1995,7 +2012,13 @@ int main(int argc, char** argv) {
                             // every frame on a 128-ch "All" selection was N×60 scalar FFTs/s
                             // for no visible gain) — cache the result and plot from it.
                             const double now = ImGui::GetTime();
-                            const bool recompute = fftRefit || (now - fftLastCompute) > (1.0 / 15.0);
+                            // While paused the frozen window never changes, so recompute only
+                            // ONCE on pause entry (to align the cache to the frozen window) and
+                            // on a settings change — not at 15 Hz forever.
+                            const bool pauseEntered = paused && !fftPausedPrev;
+                            fftPausedPrev = paused;
+                            const bool recompute = fftRefit || pauseEntered ||
+                                                   (!paused && (now - fftLastCompute) > (1.0 / 15.0));
                             if ((int)fftCache.size() != ch * bins) fftCache.assign((std::size_t)ch * bins, 0.0f);
                             if (recompute) {
                                 fftLastCompute = now;
@@ -2039,8 +2062,10 @@ int main(int argc, char** argv) {
                     HfStreamSource* src = sources[spectro.streamIdx].get();
                     bool reset = (spectro.uid != src->uid());
 
-                    ImGui::SetNextItemWidth(150);
-                    if (ImGui::BeginCombo("stream", src->name().c_str())) {
+                    // ---- left config strip; the plot + colorbar fill the right ----
+                    ImGui::BeginChild("cfg", ImVec2(200, 0), ImGuiChildFlags_Borders);
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                         spectro.streamFilter.Draw("##sf", -1.0f);   // searchable
                         for (int i = 0; i < (int)sources.size(); ++i) {
                             if (!spectro.streamFilter.PassFilter(sources[i]->name().c_str())) continue;
@@ -2053,11 +2078,10 @@ int main(int argc, char** argv) {
                     src = sources[spectro.streamIdx].get();
                     if (spectro.channel >= src->channels()) { spectro.channel = 0; reset = true; }
                     const auto& labels = src->labels();
-
-                    ImGui::SameLine(); ImGui::SetNextItemWidth(110);
                     const char* chn = (spectro.channel < (int)labels.size())
                                           ? labels[spectro.channel].c_str() : "ch";
-                    if (ImGui::BeginCombo("channel", chn)) {
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::BeginCombo("##channel", chn)) {
                         spectro.chanFilter.Draw("##chf", -1.0f);    // searchable (e.g. "Cz")
                         for (int c = 0; c < src->channels(); ++c) {
                             if (!spectro.chanFilter.PassFilter(labels[c].c_str())) continue;
@@ -2067,31 +2091,31 @@ int main(int argc, char** argv) {
                         }
                         ImGui::EndCombo();
                     }
-
                     ImGui::SetNextItemWidth(90);
                     const char* nf[] = { "128", "256", "512", "1024" };
                     int ni = (spectro.nfft == 128) ? 0 : (spectro.nfft == 256) ? 1
                            : (spectro.nfft == 512) ? 2 : 3;
                     if (ImGui::Combo("NFFT", &ni, nf, 4)) { spectro.nfft = 1 << (7 + ni); reset = true; }
-                    ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+                    ImGui::SetNextItemWidth(110);
                     ImGui::SliderFloat("span (s)", &spectro.spanSec, 2.0f, 120.0f, "%.0f");
-                    ImGui::SameLine(); ImGui::SetNextItemWidth(150);
+                    ImGui::SetNextItemWidth(140);
                     ImGui::DragFloatRange2("dB", &spectro.dbMin, &spectro.dbMax, 1.0f,
                                            -160.0f, 80.0f, "%.0f");
-                    // Frequency range shown (Y-axis zoom). Vital when the sample rate is
-                    // high but the signal is low-freq (e.g. 48 kHz audio -> tones < 1 kHz);
-                    // also editable by mouse-zooming the plot (the two stay in sync).
+                    // Frequency range shown (Y-axis zoom). Vital when the sample rate is high but
+                    // the signal is low-freq (48 kHz audio -> tones < 1 kHz); synced with mouse zoom.
                     const float ny = (float)(src->srate() * 0.5);
-                    ImGui::SameLine(); ImGui::SetNextItemWidth(150);
+                    ImGui::SetNextItemWidth(140);
                     if (ImGui::DragFloatRange2("Hz", &spectro.fMin, &spectro.fMax,
                                                std::max(0.5f, ny / 400.0f), 0.0f, ny, "%.0f"))
                         spectro.yDirty = true;
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("frequency range shown — zoom the Y axis to the band of interest");
-                    ImGui::SameLine();
                     if (ImGui::Checkbox("Filtered", &spectro.filtered)) reset = true;  // recompute columns
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("analyze the display-filtered signal (high-pass + notch + low-pass)\ninstead of raw — set the cutoffs in the time-series window");
+                        ImGui::SetTooltip("analyze the display-filtered signal (high-pass + notch + low-pass)\n"
+                                          "instead of raw — set the cutoffs in the time-series window");
+                    ImGui::EndChild();   // cfg
+                    ImGui::SameLine();
 
                     if (src->srate() <= 0.0) {
                         ImGui::TextUnformatted("irregular stream — no spectrogram");
@@ -2177,7 +2201,8 @@ int main(int argc, char** argv) {
                                                     Ndraw, spectro.dbMin, spectro.dbMax, nullptr,
                                                     ImPlotPoint(bMinDraw, 0.0), ImPlotPoint(bMaxDraw, y1));
                             const ImPlotRect lim = ImPlot::GetPlotLimits();   // sync mouse-zoom -> control
-                            spectro.fMin = (float)lim.Y.Min; spectro.fMax = (float)lim.Y.Max;
+                            spectro.fMin = std::clamp((float)lim.Y.Min, 0.0f, (float)y1);   // keep the Hz control sane
+                            spectro.fMax = std::clamp((float)lim.Y.Max, spectro.fMin, (float)y1);
                             // Recorded gaps (extended by the STFT recovery latency, less
                             // half a column so the red ends at the last blank column) plus
                             // the live edge gap scrolling in — same opaque red as the time

@@ -17,6 +17,9 @@ struct DcBlocker {
         y1_.assign(channels, 0.0f);
     }
     void setR(float R) { R_ = R; }
+    // Re-prime on the next chunk (used when the stage is re-enabled after a bypass, so it
+    // starts clean from the current signal instead of ringing on stale x1_/y1_).
+    void reset() { primed_ = false; }
 
     // Cutoff (Hz) -> pole radius. fc<=0 or fs<=0 disables (R=1, pure integrator-free passthrough of AC).
     static float cutoffToR(double fc, double fs) {
