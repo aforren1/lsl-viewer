@@ -30,10 +30,10 @@
 #include <cstdlib>
 #include <mutex>
 #include <numeric>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
+#include "thread_compat.hpp"   // jthread / stop_token (with an Apple-libc++ polyfill)
 #include <vector>
 
 // Per-channel sensor position from the stream's XDF/LSL metadata
@@ -110,7 +110,7 @@ public:
 
     void start() {
         if (worker_.joinable()) return;
-        worker_ = std::jthread([this](std::stop_token st) { run(st); });
+        worker_ = jthread([this](stop_token st) { run(st); });
     }
     void stop() {
         worker_.request_stop();
@@ -307,7 +307,7 @@ private:
         summary_.append(raw, n);      ring_.write(raw, n);     // publish canonical head LAST
     }
 
-    void run(std::stop_token st) {
+    void run(stop_token st) {
         // Set on ANY exit (return/exception) so the owner can reap us off the UI
         // thread: it stops + drops the window now, then joins once finished() is true
         // (instant), instead of blocking ~0.5 s in join() while the worker winds down.
@@ -416,7 +416,7 @@ private:
     // by sample-and-hold. We pull one sample at a time and, every grid step, write the
     // most recent value — so an event-driven stream (mouse) becomes a regular trace
     // that holds its last value between updates. All downstream code is unchanged.
-    void runIrregular(std::stop_token st) {
+    void runIrregular(stop_token st) {
         try {
             lsl::stream_inlet inlet(info_, /*max_buflen*/ 360, /*max_chunklen*/ 0,
                                     /*recover*/ true);
@@ -594,7 +594,7 @@ private:
     double                                      lastTs_ = 0.0;
     bool                                        lastTsValid_ = false;
 
-    std::jthread        worker_;
+    jthread        worker_;
     std::atomic<bool>   finished_{false};   // worker has exited -> safe to reap (instant join)
 
     std::mutex               mtx_;     // guards labels_/units_ until metaReady_, and error_
@@ -622,7 +622,7 @@ public:
           channels_(info.channel_count()) {}
     ~MarkerSource() { requestStop(); }
 
-    void start() { worker_ = std::jthread([this](std::stop_token st) { run(st); }); }
+    void start() { worker_ = jthread([this](stop_token st) { run(st); }); }
     void requestStop() { if (worker_.joinable()) worker_.request_stop(); }
     bool finished() const { return finished_.load(std::memory_order_acquire); }
 
@@ -675,7 +675,7 @@ public:
     }
 
 private:
-    void run(std::stop_token st) {
+    void run(stop_token st) {
         struct Done { std::atomic<bool>& f; ~Done() { f.store(true, std::memory_order_release); } }
             _done{finished_};   // reaped off the UI thread once set (see HfStreamSource::run)
         try {
@@ -727,7 +727,7 @@ private:
     std::size_t         total_ = 0;     // lifetime count (events_ is pruned)
     std::string         error_;
     std::atomic<double> lastData_{0.0};
-    std::jthread        worker_;
+    jthread        worker_;
     std::atomic<bool>   finished_{false};   // worker exited -> safe to reap (instant join)
 };
 

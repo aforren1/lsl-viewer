@@ -33,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "thread_compat.hpp"   // jthread / stop_token (with an Apple-libc++ polyfill)
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -110,7 +111,7 @@ public:
             setError("listen() failed"); rc_close(listenfd_); listenfd_ = RC_INVALID; return false;
         }
         up_.store(true, std::memory_order_release);
-        th_ = std::jthread([this](std::stop_token s) { serve(s); });
+        th_ = jthread([this](stop_token s) { serve(s); });
         // LSL announcement so clients DISCOVER the control endpoint without knowing
         // host:port — they resolve type "ViewerControl"; LSL supplies the hostname, and
         // the TCP port is encoded in source_id ("lsl-viewer-rc:<port>") so it's readable
@@ -138,7 +139,7 @@ public:
 private:
     void setError(const std::string& e) { std::lock_guard<std::mutex> lk(emtx_); error_ = e; }
 
-    void serve(std::stop_token stoke) {
+    void serve(stop_token stoke) {
         while (!stoke.stop_requested() && up_) {
             rc_socket_t fd = ::accept(listenfd_, nullptr, nullptr);
             if (fd == RC_INVALID) break;                    // listenfd closed on stop()
@@ -252,7 +253,7 @@ private:
 
     static constexpr char kHello[] = "lsl-viewer remote control. type `help`.\n";
     rc_socket_t       listenfd_ = RC_INVALID;
-    std::jthread      th_;
+    jthread      th_;
     RemoteState*      st_ = nullptr;
     int               port_ = 0;
     std::atomic<bool> up_{false};

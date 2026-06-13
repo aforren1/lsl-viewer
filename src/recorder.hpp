@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "thread_compat.hpp"   // jthread / stop_token (with an Apple-libc++ polyfill)
 
 class Recorder {
 public:
@@ -49,7 +50,7 @@ public:
         xdf::streamid_t id = 1;
         for (const auto& info : infos) {
             auto wr = writer_;   // shared ref: keeps the file alive for a deferred close
-            workers_.emplace_back([this, info, id, wr](std::stop_token st) { record(st, info, id, wr); });
+            workers_.emplace_back([this, info, id, wr](stop_token st) { record(st, info, id, wr); });
             ++id;
         }
         return true;
@@ -76,7 +77,7 @@ public:
 
 private:
     template <class T>
-    void pumpLoop(std::stop_token st, lsl::stream_inlet& inlet, xdf::Writer& w, xdf::streamid_t id,
+    void pumpLoop(stop_token st, lsl::stream_inlet& inlet, xdf::Writer& w, xdf::streamid_t id,
                   int nchan, double& first, double& last, std::uint64_t& count) {
         std::vector<T>      buf;
         std::vector<double> ts;
@@ -98,7 +99,7 @@ private:
         }
     }
 
-    void record(std::stop_token st, lsl::stream_info info, xdf::streamid_t id,
+    void record(stop_token st, lsl::stream_info info, xdf::streamid_t id,
                 std::shared_ptr<xdf::Writer> wr) {
         xdf::Writer& w = *wr;            // own ref; outlives a deferred close
         try {
@@ -132,7 +133,7 @@ private:
     }
 
     std::shared_ptr<xdf::Writer> writer_;   // shared with workers so a deferred close is safe
-    std::vector<std::jthread>    workers_;
+    std::vector<jthread>    workers_;
     std::thread                  closer_;   // deferred join + flush (keeps stop() off the UI thread)
     std::atomic<bool>            active_{false};
     double                       t0_ = 0.0, elapsed_ = 0.0;

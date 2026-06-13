@@ -51,6 +51,10 @@ set(SDL_HAPTIC   OFF CACHE BOOL "" FORCE)
 set(SDL_HIDAPI   OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR   OFF CACHE BOOL "" FORCE)
 set(SDL_POWER    OFF CACHE BOOL "" FORCE)
+# The viewer never synthesizes input or warps the mouse globally, so it doesn't need the
+# X11 XTest extension — turning it off drops the libXtst build dependency on Linux. (The
+# other X11 extensions SDL checks are kept; they cover normal windowing.)
+set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
 
 # --- liblsl -----------------------------------------------------------------
 # Provides the `lsl` target. Pin to a current release tag.
