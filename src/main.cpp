@@ -357,6 +357,29 @@ static void drawMarkers(const std::vector<MarkerEvent>& evs) {
 // is false while paused (so the X axis stops auto-following and can be panned).
 // `headFreeze` (0 = live) anchors the data read to a frozen absolute sample index
 // while paused, so the plotted window doesn't slide off as new data keeps arriving.
+// Read up to `want` most-recent samples from a ring. When `endHead` is 0 the live edge
+// is read (ring's own head); otherwise the window ENDS at `endHead` (a frozen/paused
+// head). Either way the start is clamped to what's still resident — using `liveHead`
+// (the ring's CURRENT head) as the lower bound, since the producer keeps writing while
+// paused. Returns a contiguous pointer (the magic ring guarantees no wrap split) and
+// sets count/start. Shared by the time-series zoom (fillRaw) and the FFT.
+static const float* readWindow(InterleavedRing& rg, std::uint64_t endHead, std::uint64_t liveHead,
+                               std::size_t want, std::size_t& count, std::uint64_t& start) {
+    if (endHead == 0) return rg.recent(want, count, start);                 // live edge
+    const std::size_t   cap    = rg.capacity();
+    const std::uint64_t oldest = (liveHead > cap) ? liveHead - cap : 0;     // resident lower bound
+    start = (endHead > want) ? endHead - want : 0;
+    if (start < oldest) start = oldest;
+    count = (endHead >= start) ? (std::size_t)(endHead - start) : 0;
+    return rg.windowAt(start);
+}
+
+// "Fit once, then free": snap an axis to its limits the frame something CHANGED (mode /
+// stream / range edit), then leave it Once so the mouse can zoom/pan freely afterward.
+// The per-site change detection differs (a flag, a value compare); this just names the
+// shared cond. (Overlay-mode Y is a separate AutoFit mechanism — see overlayYFit.)
+static ImPlotCond fitCond(bool changed) { return changed ? ImPlotCond_Always : ImPlotCond_Once; }
+
 static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool followX,
                        std::uint64_t headFreeze,
                        const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
@@ -464,8 +487,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::SetNextItemWidth(110);
         if (ImGui::Combo("Reference", &o.refMode, refModes, 3)) { s.setReference(o.refMode); o.overlayYFit = true; }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("re-reference the montage: subtract the common average (CAR)\n"
-                              "or a chosen channel from every channel");
+            ImGui::SetTooltip("re-reference the montage: subtract the common average (CAR,\n"
+                              "over the EEG channels only) or a chosen channel from every channel");
         if (o.refMode == 2) {
             ImGui::SameLine(); ImGui::SetNextItemWidth(90);
             if (o.refChan >= C) o.refChan = 0;
@@ -644,18 +667,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         InterleavedRing& rg = filtered ? s.ringHp() : s.ring();
         const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples, rg.capacity());
         std::size_t count = 0; std::uint64_t start = 0;
-        const float* p;
-        if (headFreeze) {            // paused: read the window ending at the frozen head
-            const std::size_t   cap    = rg.capacity();
-            const std::uint64_t live   = s.head();
-            const std::uint64_t oldest = (live > cap) ? live - cap : 0;  // still resident
-            start = (headFreeze > want) ? headFreeze - want : 0;
-            if (start < oldest) start = oldest;                          // clamp to buffer
-            count = (std::size_t)(headFreeze - start);
-            p = rg.windowAt(start);
-        } else {
-            p = rg.recent(want, count, start);
-        }
+        const float* p = readWindow(rg, headFreeze, s.head(), want, count, start);
         if (count == 0) return 0;
         const int vis = (int)count;
         xs.resize(vis); ys.resize(vis);
@@ -1980,7 +1992,7 @@ int main(int argc, char** argv) {
                     if (ImPlot::BeginPlot("##psd", ImVec2(-1, -1))) {
                         // Fixed axes (re-fit only after a mode change, not every
                         // frame) so the spectrum doesn't jump; user can still zoom.
-                        const ImPlotCond cond = fftRefit ? ImPlotCond_Always : ImPlotCond_Once;
+                        const ImPlotCond cond = fitCond(fftRefit);
                         ImPlot::SetupAxes("Hz", fftDb ? "dB" : "power",
                                           ImPlotAxisFlags_None,
                                           fftDb ? ImPlotAxisFlags_None : ImPlotAxisFlags_AutoFit);
@@ -1989,22 +2001,14 @@ int main(int argc, char** argv) {
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -110.0, 30.0, cond);
                         std::size_t count = 0; std::uint64_t start = 0;
                         InterleavedRing& frg = fftFiltered ? src->ringHp() : src->ring();
-                        const float* p;
+                        // When paused, freeze on the same window the rest of the UI is frozen at
+                        // (the producer keeps filling the ring, so the live edge would keep moving).
+                        std::uint64_t endHead = 0;
                         if (paused) {
-                            // Freeze on the same window the rest of the UI is frozen at (the
-                            // producer keeps filling the ring, so recent() would keep updating
-                            // the spectrum while everything else is paused).
                             auto ph = pauseHead.find(src);
-                            const std::uint64_t fh = (ph != pauseHead.end()) ? ph->second : src->head();
-                            const std::uint64_t cap = frg.capacity();
-                            const std::uint64_t oldest = (fh > cap) ? fh - cap : 0;
-                            start = (fh > (std::uint64_t)fftN) ? fh - (std::uint64_t)fftN : 0;
-                            if (start < oldest) start = oldest;
-                            count = (std::size_t)(fh - start);
-                            p = frg.windowAt(start);
-                        } else {
-                            p = frg.recent((std::size_t)fftN, count, start);
+                            endHead = (ph != pauseHead.end()) ? ph->second : src->head();
                         }
+                        const float* p = readWindow(frg, endHead, src->head(), (std::size_t)fftN, count, start);
                         const int ch   = src->channels();
                         const int bins = psd.bins();
                         if ((int)count >= fftN) {
@@ -2194,7 +2198,7 @@ int main(int argc, char** argv) {
                             // only when the control changed or on reset; otherwise leave it free so
                             // the mouse can zoom — then read the live limits back into the control.
                             ImPlot::SetupAxisLimits(ImAxis_Y1, spectro.fMin, spectro.fMax,
-                                                    (reset || spectro.yDirty) ? ImPlotCond_Always : ImPlotCond_Once);
+                                                    fitCond(reset || spectro.yDirty));
                             spectro.yDirty = false;
                             if (Ndraw > 0)
                                 ImPlot::PlotHeatmap("##h", spectro.drawBuf.data(), spectro.freqBins,
@@ -2325,7 +2329,7 @@ int main(int argc, char** argv) {
                         // ERP is a static analysis view: fit the axes on a reset (stream / channel
                         // / pre-post change), then leave them FREE so the mouse can zoom/pan/
                         // double-click-fit into a latency window or amplitude range.
-                        const ImPlotCond erpCond = reset ? ImPlotCond_Always : ImPlotCond_Once;
+                        const ImPlotCond erpCond = fitCond(reset);
 
                         if (erp.raster) {
                             // channels x time heatmap (one row per channel) of the averaged ERP —
@@ -2367,8 +2371,7 @@ int main(int argc, char** argv) {
                             ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, erpCond);
                             // Y auto-fits while the robust range (yHalf) is still evolving with
                             // accumulation, then is free to zoom once it settles (or after a reset).
-                            const ImPlotCond yCond =
-                                (reset || erp.yHalf != erp.yHalfApplied) ? ImPlotCond_Always : ImPlotCond_Once;
+                            const ImPlotCond yCond = fitCond(reset || erp.yHalf != erp.yHalfApplied);
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -erp.yHalf, erp.yHalf, yCond);
                             erp.yHalfApplied = erp.yHalf;
                             if (erp.nbins > 0 && erp.count > 0) {

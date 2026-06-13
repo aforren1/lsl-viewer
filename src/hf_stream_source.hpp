@@ -84,6 +84,7 @@ public:
         setHighpassHz(0.5);            // default 0.5 Hz display high-pass
         notch_.init(channels_);        // optional mains notch + low-pass (off by default)
         lp_.init(channels_);
+        carMask_.assign(channels_, 1); carCount_ = channels_;   // CAR over all until types known
 
         // Default channel labels; refined from desc() XML once connected.
         labels_.resize(channels_);
@@ -251,13 +252,15 @@ private:
                 const float r = x[rc];
                 for (int c = 0; c < C; ++c) o[c] = x[c] - r;
             }
-        } else {                                           // common-average reference
+        } else {                                           // common-average reference (over EEG channels)
+            const float inv = 1.0f / (float)std::max(1, carCount_);
             for (std::size_t i = 0; i < n; ++i) {
                 const float* x = in + i * (std::size_t)C;
                 float* o = scratch + i * (std::size_t)C;
-                float sum = 0.0f; for (int c = 0; c < C; ++c) sum += x[c];
-                const float m = sum / (float)C;
-                for (int c = 0; c < C; ++c) o[c] = x[c] - m;
+                float sum = 0.0f;
+                for (int c = 0; c < C; ++c) if (carMask_[c]) sum += x[c];   // average the good channels
+                const float m = sum * inv;
+                for (int c = 0; c < C; ++c) o[c] = x[c] - m;                // subtract from every channel
             }
         }
         return scratch;
@@ -528,6 +531,19 @@ private:
             }
         }
         metaReady_.store(true, std::memory_order_release);  // labels_/units_ now immutable
+
+        // CAR include-mask (producer-only): average only EEG channels, so EOG/EMG/etc.
+        // don't pollute the common average. Unknown/blank type counts as EEG (so a stream
+        // with no per-channel types behaves as before = CAR over all). If somehow nothing
+        // qualifies, fall back to all channels.
+        int inc = 0;
+        for (int c = 0; c < channels_; ++c) {
+            const bool eeg = types_[c].empty() || types_[c] == "EEG" || types_[c] == "eeg";
+            carMask_[c] = eeg ? 1 : 0;
+            inc += eeg;
+        }
+        if (inc == 0) { std::fill(carMask_.begin(), carMask_.end(), (char)1); inc = channels_; }
+        carCount_ = inc;
     }
 
     static constexpr double kMaxHistory   = 60.0;   // seconds buffers are sized for
@@ -556,6 +572,11 @@ private:
     std::atomic<bool>   notchOn_{false}, lpOn_{false};
     std::atomic<float>  notchHz_{60.0f}, lpHz_{40.0f};
     std::atomic<int>    refMode_{0}, refChan_{0};   // 0 none / 1 CAR / 2 single-channel
+    // CAR include-mask: which channels join the common average. Producer-only (built in
+    // parseLabels, read in reference() — both on the worker thread). Excludes non-EEG
+    // channels (EOG/EMG/ECG/triggers) so they don't pollute the average.
+    std::vector<char>   carMask_;
+    int                 carCount_ = 0;
     // last-applied params, so the producer only recomputes coeffs on change
     bool                notchApplied_ = false, lpApplied_ = false, hpApplied_ = true;
     float               notchHzApplied_ = -1.0f, lpHzApplied_ = -1.0f;

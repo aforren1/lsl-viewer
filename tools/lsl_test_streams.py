@@ -95,7 +95,8 @@ def add_channels(info, labels, unit, ctype):
         ch = chns.append_child("channel")
         ch.append_child_value("label", lab)
         ch.append_child_value("unit", unit)
-        ch.append_child_value("type", ctype)
+        # EOG channels carry their own type so the viewer excludes them from CAR etc.
+        ch.append_child_value("type", "EOG" if lab.upper().startswith("EOG") else ctype)
         if lab in _POS:                       # publish a sensor position when we know one
             x, y = _POS[lab]
             loc = ch.append_child("location")
