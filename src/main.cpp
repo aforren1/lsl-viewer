@@ -2277,6 +2277,9 @@ int main(int argc, char** argv) {
                             }
                         }
                         ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, xmax, xcond);
+                        // Keep pan/zoom within the real frequency band (no negative Hz, no
+                        // empty space past Nyquist).
+                        ImPlot::SetupAxisLimitsConstraints(ImAxis_X1, 0.0, src->srate() * 0.5);
                         if (fftDb)
                             ImPlot::SetupAxisLimits(ImAxis_Y1, -110.0, 30.0, cond);
                         std::size_t count = 0; std::uint64_t start = 0;
@@ -2403,22 +2406,37 @@ int main(int argc, char** argv) {
                     // Fit Hz: snap the Y range to the highest frequency carrying energy across the
                     // stored columns (same idea as the spectrum's Fit Hz; rows are Nyquist..DC).
                     if (ImGui::SmallButton("Fit Hz") && spectro.freqBins > 1 && spectro.filled > 0) {
-                        const int fb = spectro.freqBins;
+                        const int fb   = spectro.freqBins;
                         const int cols = std::min(spectro.filled, spectro.cols);
+                        const auto at  = [&](int cc, int r) { return spectro.data[(std::size_t)cc * fb + r]; };
                         float peak = -1e30f;
                         for (int cc = 0; cc < cols; ++cc)
-                            for (int r = 0; r < fb; ++r)
-                                peak = std::max(peak, spectro.data[(std::size_t)cc * fb + r]);
+                            for (int r = 0; r < fb; ++r) peak = std::max(peak, at(cc, r));
                         const bool haveSignal = spectro.db ? (peak > -120.0f) : (peak > 0.0f);
                         if (haveSignal) {
                             const float thresh = spectro.db ? peak - 45.0f : peak * 3.2e-5f;
-                            int rHi = fb - 1;                          // row of the highest energetic freq
-                            for (int cc = 0; cc < cols; ++cc)
+                            const int   bbBins = std::max(8, fb / 4);   // lit across >~25% of bins = "broadband"
+                            // A brief broadband column is a transient (e.g. a chirp's sawtooth reset
+                            // splattering the whole spectrum); exclude those so they don't inflate the
+                            // fit. But if most columns are broadband the SIGNAL is broadband (EEG 1/f),
+                            // so keep them.
+                            int bbCols = 0;
+                            for (int cc = 0; cc < cols; ++cc) {
+                                int cnt = 0;
+                                for (int r = 0; r < fb; ++r) if (at(cc, r) > thresh) ++cnt;
+                                if (cnt > bbBins) ++bbCols;
+                            }
+                            const bool dropBroadband = bbCols * 5 < cols;   // broadband is the exception
+                            int rHi = fb - 1;                               // row of the highest energetic freq
+                            for (int cc = 0; cc < cols; ++cc) {
+                                int cnt = 0, firstR = fb;
                                 for (int r = 0; r < fb; ++r)
-                                    if (spectro.data[(std::size_t)cc * fb + r] > thresh) { rHi = std::min(rHi, r); break; }
+                                    if (at(cc, r) > thresh) { if (firstR == fb) firstR = r; ++cnt; }
+                                if (firstR < fb && !(dropBroadband && cnt > bbBins)) rHi = std::min(rHi, firstR);
+                            }
                             const float fhi = ny * (float)(fb - 1 - rHi) / (float)(fb - 1);
                             spectro.fMin = 0.0f;
-                            spectro.fMax = std::min(ny, fhi * 1.3f);
+                            spectro.fMax = std::min(ny, fhi * 1.2f);
                             spectro.yDirty = true;
                         }
                     }
@@ -2509,6 +2527,8 @@ int main(int argc, char** argv) {
                             // the mouse can zoom — then read the live limits back into the control.
                             ImPlot::SetupAxisLimits(ImAxis_Y1, spectro.fMin, spectro.fMax,
                                                     fitCond(reset || spectro.yDirty));
+                            // Keep the Y (frequency) pan/zoom inside 0..Nyquist.
+                            ImPlot::SetupAxisLimitsConstraints(ImAxis_Y1, 0.0, src->srate() * 0.5);
                             spectro.yDirty = false;
                             if (Ndraw > 0)
                                 ImPlot::PlotHeatmap("##h", spectro.drawBuf.data(), spectro.freqBins,
@@ -2660,6 +2680,9 @@ int main(int argc, char** argv) {
                                                   ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
                                 ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, erpCond);
                                 ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)erp.nchan, erpCond);
+                                // keep pan/zoom inside the epoch window / channel range
+                                ImPlot::SetupAxisLimitsConstraints(ImAxis_X1, -erp.preMs, erp.postMs);
+                                ImPlot::SetupAxisLimitsConstraints(ImAxis_Y1, 0.0, (double)erp.nchan);
                                 // channel-name ticks at row centers (row 0 = top = first channel)
                                 erp.tvals.resize(erp.nchan); erp.tlabs.resize(erp.nchan);
                                 for (int j = 0; j < erp.nchan; ++j) {
@@ -2687,6 +2710,7 @@ int main(int argc, char** argv) {
                                 single ? ((erp.chans[0] < (int)labels.size()) ? labels[erp.chans[0]].c_str() : "uV")
                                        : "uV");
                             ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, erpCond);
+                            ImPlot::SetupAxisLimitsConstraints(ImAxis_X1, -erp.preMs, erp.postMs);  // stay in the epoch window
                             // Y auto-fits while the robust range (yHalf) is still evolving with
                             // accumulation, then is free to zoom once it settles (or after a reset).
                             const ImPlotCond yCond = fitCond(reset || erp.yHalf != erp.yHalfApplied);
