@@ -235,6 +235,7 @@ struct DisplayOpts {
     bool cfgShown = true;                  // show the left config strip (else plot is full-width)
     float lastPlotPx = 0.0f;               // last frame's plot width (px) — for edge pixel-snapping
     bool  overlayYFit = true;              // overlay mode: auto-fit Y once (on entry / scale change), then free
+    bool  synced      = false;             // pushed our filter/reference state to the source yet?
 };
 
 // Stable per-channel color (by absolute channel index, so a channel keeps its
@@ -359,15 +360,16 @@ static void drawMarkers(const std::vector<MarkerEvent>& evs) {
 // while paused, so the plotted window doesn't slide off as new data keeps arriving.
 // Read up to `want` most-recent samples from a ring. When `endHead` is 0 the live edge
 // is read (ring's own head); otherwise the window ENDS at `endHead` (a frozen/paused
-// head). Either way the start is clamped to what's still resident — using `liveHead`
-// (the ring's CURRENT head) as the lower bound, since the producer keeps writing while
-// paused. Returns a contiguous pointer (the magic ring guarantees no wrap split) and
-// sets count/start. Shared by the time-series zoom (fillRaw) and the FFT.
-static const float* readWindow(InterleavedRing& rg, std::uint64_t endHead, std::uint64_t liveHead,
+// head). Either way the start is clamped to what's still resident, using THIS ring's own
+// head as the lower bound — so it's correct for any ring (the raw ring and the filtered
+// ring publish their heads at slightly different times). Returns a contiguous pointer
+// (the magic ring guarantees no wrap split) and sets count/start. Shared by fillRaw + FFT.
+static const float* readWindow(InterleavedRing& rg, std::uint64_t endHead,
                                std::size_t want, std::size_t& count, std::uint64_t& start) {
     if (endHead == 0) return rg.recent(want, count, start);                 // live edge
-    const std::size_t   cap    = rg.capacity();
-    const std::uint64_t oldest = (liveHead > cap) ? liveHead - cap : 0;     // resident lower bound
+    const std::size_t   cap  = rg.capacity();
+    const std::uint64_t head = rg.head();
+    const std::uint64_t oldest = (head > cap) ? head - cap : 0;             // this ring's resident floor
     start = (endHead > want) ? endHead - want : 0;
     if (start < oldest) start = oldest;
     count = (endHead >= start) ? (std::size_t)(endHead - start) : 0;
@@ -396,6 +398,16 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     }
 
     const int C = s.channels();
+    // Push our filter/reference state to the source ONCE, so the producer's conditioning
+    // matches the UI regardless of whether the defaults happen to line up (the UI setters
+    // otherwise only fire on a toggle).
+    if (!o.synced) {
+        s.setHighpass(o.highpass); s.setHighpassHz(o.hpHz);
+        s.setNotch(o.notch);       s.setNotchHz(o.notchHz);
+        s.setLowpass(o.lowpass);   s.setLowpassHz(o.lpHz);
+        s.setReference(o.refMode); s.setRefChannel(o.refChan);
+        o.synced = true;
+    }
     const auto& labels = s.labels();   // lock-free ref (see HfStreamSource::labels)
     const auto& units  = s.units();
     const char* streamUnit = "a.u.";           // representative unit for labels
@@ -667,7 +679,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         InterleavedRing& rg = filtered ? s.ringHp() : s.ring();
         const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples, rg.capacity());
         std::size_t count = 0; std::uint64_t start = 0;
-        const float* p = readWindow(rg, headFreeze, s.head(), want, count, start);
+        const float* p = readWindow(rg, headFreeze, want, count, start);
         if (count == 0) return 0;
         const int vis = (int)count;
         xs.resize(vis); ys.resize(vis);
@@ -1964,8 +1976,8 @@ int main(int argc, char** argv) {
                 ImGui::SameLine(); if (ImGui::Checkbox("dB", &fftDb)) fftRefit = true;
                 if (ImGui::Checkbox("Filtered", &fftFiltered)) fftRefit = true;
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("analyze the display-filtered signal (high-pass + notch + low-pass)\n"
-                                      "instead of raw — set the cutoffs in the time-series window");
+                    ImGui::SetTooltip("analyze the conditioned signal (whichever filter stages are enabled\n"
+                                      "in the time-series window) instead of raw");
                 if (ImGui::SmallButton("All"))  for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 1;
                 ImGui::SameLine();
                 if (ImGui::SmallButton("None")) for (int c = 0; c < src->channels(); ++c) if (fpass(c)) fftSel[c] = 0;
@@ -2008,19 +2020,20 @@ int main(int argc, char** argv) {
                             auto ph = pauseHead.find(src);
                             endHead = (ph != pauseHead.end()) ? ph->second : src->head();
                         }
-                        const float* p = readWindow(frg, endHead, src->head(), (std::size_t)fftN, count, start);
+                        const float* p = readWindow(frg, endHead, (std::size_t)fftN, count, start);
                         const int ch   = src->channels();
                         const int bins = psd.bins();
+                        // Pause-entry latch — updated every frame (NOT inside the data guard
+                        // below) so it can't desync when the plot isn't producing a frame.
+                        const bool pauseEntered = paused && !fftPausedPrev;
+                        fftPausedPrev = paused;
                         if ((int)count >= fftN) {
                             // Recompute the selected channels at most ~15 Hz (a fresh FFT
                             // every frame on a 128-ch "All" selection was N×60 scalar FFTs/s
-                            // for no visible gain) — cache the result and plot from it.
+                            // for no visible gain) — cache the result and plot from it. While
+                            // paused the frozen window never changes, so recompute only ONCE on
+                            // pause entry (to align the cache) and on a settings change.
                             const double now = ImGui::GetTime();
-                            // While paused the frozen window never changes, so recompute only
-                            // ONCE on pause entry (to align the cache to the frozen window) and
-                            // on a settings change — not at 15 Hz forever.
-                            const bool pauseEntered = paused && !fftPausedPrev;
-                            fftPausedPrev = paused;
                             const bool recompute = fftRefit || pauseEntered ||
                                                    (!paused && (now - fftLastCompute) > (1.0 / 15.0));
                             if ((int)fftCache.size() != ch * bins) fftCache.assign((std::size_t)ch * bins, 0.0f);
@@ -2116,8 +2129,8 @@ int main(int argc, char** argv) {
                         ImGui::SetTooltip("frequency range shown — zoom the Y axis to the band of interest");
                     if (ImGui::Checkbox("Filtered", &spectro.filtered)) reset = true;  // recompute columns
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("analyze the display-filtered signal (high-pass + notch + low-pass)\n"
-                                          "instead of raw — set the cutoffs in the time-series window");
+                        ImGui::SetTooltip("analyze the conditioned signal (whichever filter stages are enabled\n"
+                                          "in the time-series window) instead of raw");
                     ImGui::EndChild();   // cfg
                     ImGui::SameLine();
 

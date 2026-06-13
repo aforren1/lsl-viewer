@@ -95,6 +95,9 @@ struct Biquad {
     }
 
     bool enabled = false;   // owner gates process() on this
+    // Enable/disable; clears stale z-state on a disabled->enabled transition so the stage
+    // starts clean instead of ringing on state from when it was last running.
+    void setEnabled(bool on) { if (on && !enabled) reset(); enabled = on; }
 
 private:
     void setIdentity() { b0_ = 1.0f; b1_ = b2_ = a1_ = a2_ = 0.0f; reset(); }

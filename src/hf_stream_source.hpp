@@ -23,11 +23,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <numeric>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -84,7 +86,7 @@ public:
         setHighpassHz(0.5);            // default 0.5 Hz display high-pass
         notch_.init(channels_);        // optional mains notch + low-pass (off by default)
         lp_.init(channels_);
-        carMask_.assign(channels_, 1); carCount_ = channels_;   // CAR over all until types known
+        carIncludeAll();                                        // CAR over all channels until types known
 
         // Default channel labels; refined from desc() XML once connected.
         labels_.resize(channels_);
@@ -253,12 +255,12 @@ private:
                 for (int c = 0; c < C; ++c) o[c] = x[c] - r;
             }
         } else {                                           // common-average reference (over EEG channels)
-            const float inv = 1.0f / (float)std::max(1, carCount_);
+            const float inv = 1.0f / (float)std::max<std::size_t>(1, carIdx_.size());
             for (std::size_t i = 0; i < n; ++i) {
                 const float* x = in + i * (std::size_t)C;
                 float* o = scratch + i * (std::size_t)C;
                 float sum = 0.0f;
-                for (int c = 0; c < C; ++c) if (carMask_[c]) sum += x[c];   // average the good channels
+                for (int k : carIdx_) sum += x[k];                          // average the good channels
                 const float m = sum * inv;
                 for (int c = 0; c < C; ++c) o[c] = x[c] - m;                // subtract from every channel
             }
@@ -272,21 +274,37 @@ private:
         const bool  non = notchOn_.load(std::memory_order_relaxed);
         const float nf  = notchHz_.load(std::memory_order_relaxed);
         if (non != notchApplied_ || nf != notchHzApplied_) {
-            if (non && !notchApplied_) notch_.reset();    // re-enabled: clear stale z-state
-            notch_.enabled = non;
+            notch_.setEnabled(non);                       // self-resets z-state on re-enable
             if (non) notch_.setNotch(nf, srate_, 30.0);   // narrow (Q=30): only the mains line
             notchApplied_ = non; notchHzApplied_ = nf;
         }
         const bool  lon = lpOn_.load(std::memory_order_relaxed);
         const float lf  = lpHz_.load(std::memory_order_relaxed);
         if (lon != lpApplied_ || lf != lpHzApplied_) {
-            if (lon && !lpApplied_) lp_.reset();          // re-enabled: clear stale z-state
-            lp_.enabled = lon;
+            lp_.setEnabled(lon);                          // self-resets z-state on re-enable
             if (lon) lp_.setLowpass(lf, srate_, 0.70710678);  // Butterworth
             lpApplied_ = lon; lpHzApplied_ = lf;
         }
         if (notch_.enabled) notch_.process(x, n);
         if (lp_.enabled)    lp_.process(x, n);
+    }
+
+    // Run the conditioned chain (re-reference -> high-pass-or-bypass -> notch -> low-pass)
+    // on one raw chunk and publish it. `refScratch`/`hpScratch` are caller-owned buffers
+    // of at least n*channels_ floats. Writes the derived structures (ringHp_/summaryHp_/
+    // summary_) FIRST, then publishes the raw ring's head LAST so ring_.head() — the
+    // canonical head every reader bounds by, including filtered reads of ringHp_ — never
+    // runs ahead of the filtered ring/summaries for the same chunk. Producer-only.
+    void publishChunk(const float* raw, std::size_t n, float* refScratch, float* hpScratch) {
+        const float* condIn = reference(raw, refScratch, n);   // re-reference (first stage)
+        const bool hpOn = hpOn_.load(std::memory_order_relaxed);
+        if (hpOn && !hpApplied_) hp_.reset();                  // re-enabled: re-prime clean
+        hpApplied_ = hpOn;
+        if (hpOn) { hp_.setR(hpR_.load(std::memory_order_relaxed)); hp_.process(condIn, hpScratch, n); }
+        else      { std::copy(condIn, condIn + n * (std::size_t)channels_, hpScratch); }  // bypass HP
+        applyPostFilters(hpScratch, n);                        // optional notch + low-pass
+        ringHp_.write(hpScratch, n);  summaryHp_.append(hpScratch, n);
+        summary_.append(raw, n);      ring_.write(raw, n);     // publish canonical head LAST
     }
 
     void run(std::stop_token st) {
@@ -375,27 +393,8 @@ private:
                     lastTsValid_ = true;
                 }
 
-                // Conditioned chain: re-reference -> high-pass -> notch -> low-pass.
-                const float* condIn = reference(buf.data(), refBuf.data(), n);
-                const bool hpOn = hpOn_.load(std::memory_order_relaxed);
-                if (hpOn && !hpApplied_) hp_.reset();                 // re-enabled: re-prime clean
-                hpApplied_ = hpOn;
-                if (hpOn) {
-                    hp_.setR(hpR_.load(std::memory_order_relaxed));   // running high-pass
-                    hp_.process(condIn, hpBuf.data(), n);
-                } else {
-                    std::copy(condIn, condIn + n * (std::size_t)channels_, hpBuf.data());  // bypass HP
-                }
-                applyPostFilters(hpBuf.data(), n);                // optional notch + low-pass
-                // Write ALL derived structures FIRST, then publish the raw ring's head LAST.
-                // ring_.head() is the canonical head every reader bounds by (incl. filtered
-                // reads of ringHp_), so it must never advance ahead of the filtered ring /
-                // summaries for the same chunk — otherwise a filtered read indexes ringHp_
-                // past its written data (one-chunk stale/wrap tail at the live edge).
-                ringHp_.write(hpBuf.data(), n);                   // full-rate filtered (FFT/spectro/zoom)
-                summaryHp_.append(hpBuf.data(), n);
-                summary_.append(buf.data(), n);                  // raw envelope, fold cache-hot
-                ring_.write(buf.data(), n);        // publish: head advances now (gap already recorded)
+                // Conditioned chain + publish (derived structures first, raw head last).
+                publishChunk(buf.data(), n, refBuf.data(), hpBuf.data());
 
                 const double now = lsl::local_clock();
                 if (now - lastCorr > 5.0) {        // refresh for cross-stream align
@@ -467,23 +466,8 @@ private:
                         for (int c = 0; c < channels_; ++c)
                             out[i * (std::size_t)channels_ + c] = cur[c];
                     refOut.resize(batch * (std::size_t)channels_);
-                    const float* condIn = reference(out.data(), refOut.data(), batch);
                     hpOut.resize(batch * (std::size_t)channels_);
-                    const bool hpOn = hpOn_.load(std::memory_order_relaxed);
-                    if (hpOn && !hpApplied_) hp_.reset();
-                    hpApplied_ = hpOn;
-                    if (hpOn) {
-                        hp_.setR(hpR_.load(std::memory_order_relaxed));
-                        hp_.process(condIn, hpOut.data(), batch);
-                    } else {
-                        std::copy(condIn, condIn + batch * (std::size_t)channels_, hpOut.data());
-                    }
-                    applyPostFilters(hpOut.data(), batch);        // optional notch + low-pass
-                    // Derived structures first, then publish the raw head LAST (see run()).
-                    ringHp_.write(hpOut.data(), batch);           // full-rate filtered
-                    summaryHp_.append(hpOut.data(), batch);
-                    summary_.append(out.data(), batch);
-                    ring_.write(out.data(), batch);               // publish canonical head last
+                    publishChunk(out.data(), batch, refOut.data(), hpOut.data());
                     written += batch;
                 }
             }
@@ -532,19 +516,27 @@ private:
         }
         metaReady_.store(true, std::memory_order_release);  // labels_/units_ now immutable
 
-        // CAR include-mask (producer-only): average only EEG channels, so EOG/EMG/etc.
-        // don't pollute the common average. Unknown/blank type counts as EEG (so a stream
-        // with no per-channel types behaves as before = CAR over all). If somehow nothing
+        // CAR good-channel list (producer-only): average only EEG channels, so EOG/EMG/etc.
+        // don't pollute the common average. Type match is trimmed + case-insensitive (LSL
+        // sources vary: "EEG", "eeg", " EEG "...). Unknown/blank type counts as EEG (so a
+        // stream with no per-channel types behaves as before = CAR over all). If nothing
         // qualifies, fall back to all channels.
-        int inc = 0;
-        for (int c = 0; c < channels_; ++c) {
-            const bool eeg = types_[c].empty() || types_[c] == "EEG" || types_[c] == "eeg";
-            carMask_[c] = eeg ? 1 : 0;
-            inc += eeg;
-        }
-        if (inc == 0) { std::fill(carMask_.begin(), carMask_.end(), (char)1); inc = channels_; }
-        carCount_ = inc;
+        auto isEeg = [](std::string t) {
+            const std::size_t a = t.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) return true;            // blank = unknown = include
+            const std::size_t b = t.find_last_not_of(" \t\r\n");
+            t = t.substr(a, b - a + 1);
+            for (char& ch : t) ch = (char)std::toupper((unsigned char)ch);
+            return t == "EEG";
+        };
+        carIdx_.clear();
+        for (int c = 0; c < channels_; ++c) if (isEeg(types_[c])) carIdx_.push_back(c);
+        if (carIdx_.empty()) carIncludeAll();
     }
+
+    // CAR over every channel (the default before types are known, and the fallback when
+    // no channel qualifies as EEG).
+    void carIncludeAll() { carIdx_.resize(channels_); std::iota(carIdx_.begin(), carIdx_.end(), 0); }
 
     static constexpr double kMaxHistory   = 60.0;   // seconds buffers are sized for
     static constexpr double kTargetBins   = 2000.0; // ~bins across the max window
@@ -572,11 +564,11 @@ private:
     std::atomic<bool>   notchOn_{false}, lpOn_{false};
     std::atomic<float>  notchHz_{60.0f}, lpHz_{40.0f};
     std::atomic<int>    refMode_{0}, refChan_{0};   // 0 none / 1 CAR / 2 single-channel
-    // CAR include-mask: which channels join the common average. Producer-only (built in
-    // parseLabels, read in reference() — both on the worker thread). Excludes non-EEG
-    // channels (EOG/EMG/ECG/triggers) so they don't pollute the average.
-    std::vector<char>   carMask_;
-    int                 carCount_ = 0;
+    // CAR good-channel index list: which channels join the common average. Producer-only
+    // (built in parseLabels, read in reference() — both on the worker thread). Excludes
+    // non-EEG channels (EOG/EMG/ECG/triggers) so they don't pollute the average. Stored as
+    // an index list so the inner sum has no per-sample branch.
+    std::vector<int>    carIdx_;
     // last-applied params, so the producer only recomputes coeffs on change
     bool                notchApplied_ = false, lpApplied_ = false, hpApplied_ = true;
     float               notchHzApplied_ = -1.0f, lpHzApplied_ = -1.0f;
