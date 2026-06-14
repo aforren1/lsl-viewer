@@ -20,7 +20,7 @@ jobs:
         include:
           - { name: linux,   os: ubuntu-latest,  gen: Ninja,                   bindir: build }
           - { name: macos,   os: macos-latest,   gen: Ninja,                   bindir: build }
-          - { name: windows, os: windows-latest, gen: "Visual Studio 17 2022", bindir: build/Release }
+          - { name: windows, os: windows-2022,   gen: "Visual Studio 17 2022", bindir: build/Release }
     steps:
       - uses: actions/checkout@v4
 
@@ -143,10 +143,10 @@ jobs:
             ninja-build \
             libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev \
             libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev libgbm-dev
-          # liblsl (for LabRecorderCLI + pylsl) and LabRecorder, from the LSL project releases.
-          curl -fsSL -o /tmp/liblsl.deb https://github.com/sccn/liblsl/releases/download/v1.17.7/liblsl-1.17.7-noble_amd64.deb
+          # The LabRecorder .deb bundles its own liblsl.so (used by both LabRecorderCLI and
+          # pylsl), so install just it — a separate liblsl .deb would clash on /usr/lib/liblsl.so.
           curl -fsSL -o /tmp/labrec.deb https://github.com/labstreaminglayer/App-LabRecorder/releases/download/v1.17.1/LabRecorder-1.17.0-noble_amd64.deb
-          sudo apt-get install -y /tmp/liblsl.deb /tmp/labrec.deb
+          sudo apt-get install -y /tmp/labrec.deb
 
       # Only the headless recorder is needed; --target skips building SDL/the viewer.
       - name: Build xdf_record
