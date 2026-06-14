@@ -22,7 +22,7 @@ jobs:
           - { name: macos,   os: macos-latest,   gen: Ninja,                   bindir: build }
           - { name: windows, os: windows-2022,   gen: "Visual Studio 17 2022", bindir: build/Release }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # SDL3 is built from source (FetchContent). Install the X11 + Wayland dev headers so
       # SDL builds BOTH backends — it then picks one at runtime, so the binary runs under
@@ -64,7 +64,7 @@ jobs:
         run: strip ${{ matrix.bindir }}/lsl_viewer ${{ matrix.bindir }}/xdf_record
 
       - name: Upload executables
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lsl-viewer-${{ matrix.name }}
           if-no-files-found: error
@@ -82,7 +82,7 @@ jobs:
     name: linux-appimage
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build deps
         run: |
@@ -120,7 +120,7 @@ jobs:
           mv ./*.AppImage LSL-Viewer-x86_64.AppImage
 
       - name: Upload AppImage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lsl-viewer-appimage
           if-no-files-found: error
@@ -134,7 +134,7 @@ jobs:
     name: recording-vs-labrecorder
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install build deps + LabRecorder + liblsl
         run: |
