@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -40,6 +41,11 @@ public:
         // are still flushing. Practically instant unless a stop happened <0.5 s ago.
         if (closer_.joinable()) closer_.join();
         { std::lock_guard<std::mutex> lk(emtx_); error_.clear(); }
+        // The template can nest directories (sub-…/ses-…/<modality>/…); create them so the
+        // Writer's ofstream can open the file.
+        if (const auto parent = std::filesystem::path(path).parent_path(); !parent.empty()) {
+            std::error_code ec; std::filesystem::create_directories(parent, ec);
+        }
         try { writer_ = std::make_shared<xdf::Writer>(path); }
         catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(emtx_); error_ = e.what(); return false;

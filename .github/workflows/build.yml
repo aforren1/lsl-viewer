@@ -125,3 +125,41 @@ jobs:
           name: lsl-viewer-appimage
           if-no-files-found: error
           path: LSL-Viewer-x86_64.AppImage
+
+  # Recording conformance: record the mock streams with our headless recorder AND the real
+  # LabRecorder (LabRecorderCLI) at once, and check the two XDFs hold identical data. Both
+  # are CLI/headless, so this runs without a display. Pinned to ubuntu-24.04 to match the
+  # 'noble' LabRecorder/liblsl .deb packages installed below.
+  conformance:
+    name: recording-vs-labrecorder
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps + LabRecorder + liblsl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build \
+            libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libdrm-dev libgbm-dev
+          # liblsl (for LabRecorderCLI + pylsl) and LabRecorder, from the LSL project releases.
+          curl -fsSL -o /tmp/liblsl.deb https://github.com/sccn/liblsl/releases/download/v1.17.7/liblsl-1.17.7-noble_amd64.deb
+          curl -fsSL -o /tmp/labrec.deb https://github.com/labstreaminglayer/App-LabRecorder/releases/download/v1.17.1/LabRecorder-1.17.0-noble_amd64.deb
+          sudo apt-get install -y /tmp/liblsl.deb /tmp/labrec.deb
+
+      # Only the headless recorder is needed; --target skips building SDL/the viewer.
+      - name: Build xdf_record
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_X11=OFF
+          cmake --build build --target xdf_record --parallel
+
+      - name: Install Python deps
+        run: python3 -m pip install --break-system-packages --quiet pyxdf pylsl numpy
+
+      - name: Compare our recorder vs LabRecorder
+        run: |
+          # Resolve LSL streams over loopback (CI runners have no usable multicast).
+          printf '[lab]\nKnownPeers = {127.0.0.1}\n[multicast]\nResolveScope = link\n' > lsl_api.cfg
+          export LSLAPICFG="$PWD/lsl_api.cfg" XDF_RECORD="$PWD/build/xdf_record"
+          python3 tests/compare_labrecorder.py

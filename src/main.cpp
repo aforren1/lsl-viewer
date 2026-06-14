@@ -153,10 +153,11 @@ static std::string streamKeyOf(const Src& s) {
     return !s.sourceId().empty() ? s.sourceId() : s.uid();
 }
 
-// BIDS-ish filename templating: substitute {subject}/{session}/{task}/{run} and the
-// built-ins {datetime}/{date}/{time} in `tmpl`. Unknown {keys} are left literal so a
-// forgotten field is visible in the resulting name.
-struct RecVars { std::string subject, session, task, run; };
+// BIDS-ish filename templating: substitute {subject}/{session}/{task}/{run}/{acq}/{modality}
+// and the built-ins {datetime}/{date}/{time} in `tmpl`. Unknown {keys} are left literal so a
+// forgotten field is visible in the resulting name. The template may include subdirectories
+// (created at record time).
+struct RecVars { std::string subject, session, task, run, acq, modality; };
 static std::string resolveTemplate(const std::string& tmpl, const RecVars& v) {
     std::time_t tt = std::time(nullptr); std::tm tm{};
 #if defined(_WIN32)
@@ -173,6 +174,8 @@ static std::string resolveTemplate(const std::string& tmpl, const RecVars& v) {
         if (k == "session")  return v.session;
         if (k == "task")     return v.task;
         if (k == "run")      return v.run;
+        if (k == "acq")      return v.acq;
+        if (k == "modality") return v.modality;
         if (k == "datetime") return dt;
         if (k == "date")     return dd;
         if (k == "time")     return hh;
@@ -1259,7 +1262,10 @@ static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
 // Persisted in imgui.ini (via the settings handler below): theme + recording path.
 static bool g_light    = false;
 static char g_recDir[512]  = "";                          // output directory ("" = cwd)
-static char g_recTmpl[512] = "recording_{datetime}.xdf";  // filename template
+// Default follows LabRecorder's BIDS layout (forward slashes for cross-platform paths;
+// the optional acq entity is left out of the default — add `{acq}` to the template if needed).
+static char g_recTmpl[512] =
+    "sub-{subject}/ses-{session}/{modality}/sub-{subject}_ses-{session}_task-{task}_run-{run}_{modality}.xdf";
 
 static void* SettingsReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char*) { return (void*)1; }
 static void SettingsReadLine(ImGuiContext*, ImGuiSettingsHandler*, void*, const char* line) {
@@ -1410,11 +1416,15 @@ int main(int argc, char** argv) {
         if (remote.start(rcPort, &rcState)) spdlog::info("remote control listening on tcp:{}", rcPort);
     }
     RecVars recVars;                                     // g_recTmpl/g_recDir are file-scope (persisted)
-    char    recSubject[64] = "", recSession[64] = "", recTask[64] = "", recRun[64] = "";
+    // BIDS entity defaults so the default template yields a valid name out of the box; the
+    // user overrides them in the Recording panel.
+    char    recSubject[64] = "P001", recSession[64] = "S001", recTask[64] = "Default",
+            recRun[64] = "001", recAcq[64] = "", recModality[64] = "eeg";
     // Full output path: resolve the template, then prefix the directory (unless the
     // template is already absolute).
     auto recFullPath = [&]() -> std::string {
-        std::string fn = resolveTemplate(g_recTmpl, RecVars{recSubject, recSession, recTask, recRun});
+        std::string fn = resolveTemplate(g_recTmpl,
+            RecVars{recSubject, recSession, recTask, recRun, recAcq, recModality});
         const bool abs = !fn.empty() &&
                          (fn[0] == '/' || fn[0] == '\\' || (fn.size() > 1 && fn[1] == ':'));
         if (!abs && g_recDir[0]) {
@@ -1483,14 +1493,29 @@ int main(int argc, char** argv) {
     const std::filesystem::path wsDir = "workspaces";
     char        wsNameBuf[128] = "";
     std::string pendingWs;            // a load deferred to end-of-frame (safe ImGui ini point)
+    // Streams a loaded workspace needs (source_id, name): auto-connected as they appear and
+    // listed in a "waiting for…" notice until present. Cleared on the next load or dismiss.
+    std::vector<std::pair<std::string, std::string>> wsRequired;
+    std::unordered_set<std::string>                  wsConnectedOnce;   // don't re-fight a manual disconnect
 
     auto wsSerialize = [&]() -> std::string {
         std::string s = "# lsl-sdl workspace v1\n";
+        // "R" lines list the streams this workspace needs (source_id + name) so loading it can
+        // re-connect them and report any that aren't on the network. Deduplicated.
+        std::unordered_set<std::string> reqSeen;
+        auto require = [&](const std::string& sid, const std::string& name) {
+            if (reqSeen.insert(sid).second) s += "R\t" + sid + "\t" + name + "\n";
+        };
         for (auto& src : sources) {
+            require(streamKeyOf(*src), src->name());
             auto it = dispOpts.find(src.get());
             if (it != dispOpts.end())
                 s += "S\t" + streamKeyOf(*src) + "\t" + serializeOpts(it->second) + "\n";
         }
+        // Every connected marker stream is "required" too — recording captures all connected
+        // streams, so restoring the workspace must re-connect them even if no ERP/overlay uses one.
+        for (auto& mk : markerSources)
+            require(streamKeyOf(*mk), mk->name());
         if (showSpectrum && fftStream < (int)sources.size()) {
             std::string sel;
             for (std::size_t c = 0; c < fftSel.size(); ++c) if (fftSel[c]) sel += std::to_string(c) + ",";
@@ -1522,6 +1547,7 @@ int main(int argc, char** argv) {
         const std::string ini = (sep == std::string::npos) ? std::string() : blob.substr(sep + mark.size());
         // Rebuild analysis windows + pending per-stream settings from the workspace.
         spectros.clear(); erps.clear(); savedOpts.clear();
+        wsRequired.clear(); wsConnectedOnce.clear();
         nextSpectroId = nextErpId = 1;
         auto split = [](const std::string& l) {              // tab-delimited fields
             std::vector<std::string> f; std::string cur; std::istringstream is(l);
@@ -1532,7 +1558,9 @@ int main(int argc, char** argv) {
         while (std::getline(is, line)) {
             if (line.empty() || line[0] == '#') continue;
             const auto f = split(line);
-            if (f[0] == "S" && f.size() >= 3) {
+            if (f[0] == "R" && f.size() >= 3) {
+                wsRequired.emplace_back(f[1], f[2]);   // (source_id, name) to re-connect / report
+            } else if (f[0] == "S" && f.size() >= 3) {
                 savedOpts[f[1]] = parseOpts(f[2]);
             } else if (f[0] == "F" && f.size() >= 3) {
                 showSpectrum = true;
@@ -1735,6 +1763,17 @@ int main(int argc, char** argv) {
                     if (!dismissed.count(streamKey(info)) && !connected(info))
                         connectStream(info);
 
+            // Workspace restore: connect each required stream the FIRST time it appears (once,
+            // so a later manual disconnect isn't fought). connectStream() clears `dismissed`.
+            if (!wsRequired.empty())
+                for (auto& info : found) {
+                    const std::string k = streamKey(info);
+                    for (auto& req : wsRequired)
+                        if (req.first == k && !wsConnectedOnce.count(k) && !connected(info)) {
+                            connectStream(info); wsConnectedOnce.insert(k);
+                        }
+                }
+
             // Snapshot each connected marker stream once per frame (only events within
             // the widest plot window, so a long recording stays cheap). Each gets a
             // distinct color; plots pick which streams to overlay.
@@ -1801,8 +1840,9 @@ int main(int argc, char** argv) {
                     rcState.setFilename.reset();
                 }
                 for (auto& [k, val] : rcState.setVars) {
-                    char* dst = (k == "subject") ? recSubject : (k == "session") ? recSession
-                              : (k == "task")    ? recTask    : (k == "run")     ? recRun : nullptr;
+                    char* dst = (k == "subject")  ? recSubject : (k == "session")  ? recSession
+                              : (k == "task")     ? recTask    : (k == "run")      ? recRun
+                              : (k == "acq")      ? recAcq     : (k == "modality") ? recModality : nullptr;
                     if (dst) std::snprintf(dst, 64, "%s", val.c_str());
                 }
                 rcState.setVars.clear();
@@ -1901,6 +1941,31 @@ int main(int argc, char** argv) {
             ImGui::TextDisabled("live \xc2\xb7 %d stream%s on the network",
                                 (int)found.size(), found.size() == 1 ? "" : "s");
 
+            // ---- Workspace restore: a loaded workspace auto-connects its streams; list any
+            // that aren't on the network yet (clears itself once they all arrive). While some
+            // are still missing, recording is held (below) so you don't capture a session that's
+            // silently short a stream — until they connect or you dismiss the notice.
+            int wsMissing = 0;
+            if (!wsRequired.empty()) {
+                auto connKey = [&](const std::string& key) {
+                    for (auto& s : sources)       if (streamKeyOf(*s) == key) return true;
+                    for (auto& m : markerSources) if (streamKeyOf(*m) == key) return true;
+                    return false;
+                };
+                std::string miss;
+                for (auto& req : wsRequired)
+                    if (!connKey(req.first)) { if (wsMissing++) miss += ", "; miss += req.second; }
+                if (wsMissing == 0) {
+                    wsRequired.clear(); wsConnectedOnce.clear();   // all present -> stop tracking
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.20f, 1.0f));
+                    ImGui::TextWrapped("\xe2\x9a\xa0 workspace: waiting for %d stream%s \xe2\x80\x94 %s",
+                                       wsMissing, wsMissing == 1 ? "" : "s", miss.c_str());
+                    ImGui::PopStyleColor();
+                    if (ImGui::SmallButton("Dismiss##wswait")) { wsRequired.clear(); wsConnectedOnce.clear(); }
+                }
+            }
+
             // ---- Recording: pinned at the top so it has a stable location (always
             // visible, never shifts with the stream count). Records every connected
             // stream — no per-stream selection.
@@ -1917,7 +1982,7 @@ int main(int argc, char** argv) {
                         SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
                                                  g_recDir[0] ? g_recDir : nullptr, false);
                     ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::InputTextWithHint("##recpath", "recording_{datetime}.xdf",
+                    if (ImGui::InputTextWithHint("##recpath", "sub-{subject}/…/{modality}.xdf",
                                                  g_recTmpl, sizeof(g_recTmpl)))
                         ImGui::MarkIniSettingsDirty();
                     if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
@@ -1925,10 +1990,13 @@ int main(int argc, char** argv) {
                                           - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
                         ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
                         ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
                         ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
+                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
                         ImGui::SameLine();
                         ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
+                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##mod", "{modality}", recModality, sizeof(recModality));
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##acq", "{acq} (optional)", recAcq, sizeof(recAcq));
                         ImGui::TreePop();
                     }
                     // Preview path: recFullPath() does strftime + template substitution;
@@ -1937,13 +2005,30 @@ int main(int argc, char** argv) {
                     static double recPreviewAt = -1e18;
                     if (dueEvery(recPreviewAt, 0.25)) recPreview = recFullPath();
                     ImGui::TextDisabled("-> %s", recPreview.c_str());
-                    ImGui::BeginDisabled(nConn == 0);
+                    // Hold recording while a restored workspace is still missing streams, so a
+                    // session can't quietly start short a stream (recording = every connected
+                    // stream). Resolved by the streams connecting or dismissing the notice above.
+                    ImGui::BeginDisabled(nConn == 0 || wsMissing > 0);
                     if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
                     ImGui::EndDisabled();
-                    if (nConn == 0)
+                    // Tooltip on the disabled button explaining how to proceed (disabled items
+                    // don't hover by default — AllowWhenDisabled re-enables it).
+                    if ((nConn == 0 || wsMissing > 0) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip(wsMissing > 0
+                            ? "Recording is held until your workspace's streams are present.\n"
+                              "Wait for the missing stream(s) to connect, or click Dismiss in the\n"
+                              "notice above to record without them."
+                            : "Connect at least one stream to record.");
+                    if (nConn == 0) {
                         ImGui::TextDisabled("Connect a stream to record.");
-                    else
+                    } else if (wsMissing > 0) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                        ImGui::TextWrapped("recording held: %d workspace stream%s missing (connect them or dismiss above)",
+                                           wsMissing, wsMissing == 1 ? "" : "s");
+                        ImGui::PopStyleColor();
+                    } else {
                         ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
+                    }
                 } else {
                     if (ImGui::Button("Stop recording", ImVec2(-1, 0))) {
                         recorder.stop(); spdlog::info("recording stopped ({:.1f}s, {:.1f} MB)",

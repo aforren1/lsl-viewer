@@ -1,10 +1,9 @@
 # lsl-sdl
 
-**A fast, real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer) streams.**
-
-Plot live LSL streams (e.g. EEG, MEG, fNIRS, accelerometers, markers) with
-filtering, spectral views, evoked-response averaging, and recording all in one
-GPU-accelerated window.
+A real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer)
+(LSL) streams. It plots live data (EEG, MEG, fNIRS, accelerometers, markers, …),
+applies display filters, computes spectra and marker-averaged responses, and records
+to XDF, in a single GPU-rendered window.
 
 ![Live scrolling EEG montage](docs/images/live.gif)
 
@@ -16,59 +15,57 @@ GPU-accelerated window.
 
 ![Stacked montage of slow drift channels beside a 128-channel raster](docs/images/montage.png)
 
-- **Stacked montage** (EEG-style, one named lane per channel) or shared-axis **overlay**, with per-channel gains and an Auto-fit.
-- Smooth GPU scrolling that stays fluid at high channel counts and sample rates.
-- A single-quad **raster/heatmap** mode for dense montages (32–256+ channels) where line traces are too short to read — spot regional activity across the whole array at a glance.
-- **Pause** to inspect a frozen window.
-- **Dropouts shown honestly** — a stream that drops out leaves a red gap on the real timeline, not a silent jump.
+- Stacked montage (one named lane per channel) or shared-axis overlay, with per-channel gain and an auto-fit.
+- A raster/heatmap mode for high channel counts (32–256+), where individual line traces become too thin to read.
+- Pause to inspect a frozen window.
+- Dropouts are drawn as gaps on the real timeline rather than concatenating across the missing span.
 
 ### Signal conditioning
 
-Independent, stackable filter stages you apply in any combination — and *every*
-view (time series, spectrum, spectrogram, zoom) reflects them:
+Independent filter stages applied in any combination; the spectrum, spectrogram, and
+zoomed views use the conditioned signal.
 
-- **High-pass** (DC/drift removal) · **mains notch** (50 / 60 Hz) · **low-pass** (anti-EMG)
-- **Re-referencing**: common-average (CAR) or a single reference channel. CAR averages the **EEG channels only** — EOG/EMG/trigger channels are excluded automatically from the metadata.
+- High-pass (DC/drift removal), mains notch (50 / 60 Hz), low-pass.
+- Re-referencing: common-average (CAR) or a single reference channel. CAR averages over the EEG channels only; EOG/EMG/trigger channels are excluded based on the channel metadata.
 
-### Frequency domain analysis
+### Frequency-domain analysis
 
 | Per-channel FFT spectrum | Rolling spectrogram |
 |---|---|
 | ![FFT spectrum of two audio tones](docs/images/spectrum.png) | ![Spectrogram of a 1→120 Hz chirp](docs/images/spectrogram.png) |
 
-- Overlaid **PSD** for any selected channels (dB or linear).
-- A rolling **STFT spectrogram** with a **zoomable frequency axis**, plus a one-click **Fit Hz** that snaps it to the band actually carrying energy — essential when the sample rate is high but the signal of interest is low (e.g. 48 kHz audio, tones < 1 kHz).
-- Both can analyze the raw or the conditioned signal.
+- Per-channel PSD (dB or linear) for the selected channels.
+- A rolling STFT spectrogram with an adjustable frequency range. "Fit Hz" sets the range to the band that carries signal energy, which helps when the sample rate is high relative to the signal of interest (e.g. audio, where the tones sit well below the Nyquist frequency).
+- Both can read the raw or the conditioned signal.
 
 ### ERP / marker-aligned averaging
 
-![ERP average with single-trial spaghetti](docs/images/erp.png)
+![ERP average with single-trial traces](docs/images/erp.png)
 
-- Trigger on a marker stream (with optional label matching, e.g. `target`), cut epochs around each event, and watch the **evoked response** build up — average in bold over the faint single-trial "spaghetti".
-- Multi-channel and an **erpimage** (trials × time, or channels × time) raster view.
+- Epoch around events from a marker stream (with optional label matching, e.g. `target`) and average over trials, with the single-trial traces drawn under the average.
+- Single- or multi-channel, plus an erpimage (trials x time, or channels x time) view.
 
 ### Recording
 
-- One-click **XDF recording** of every connected stream — LabRecorder-compatible (verified against the real LabRecorder via `pyxdf`), with raw timestamps + clock-offset chunks so importers realign streams to a common clock.
-- BIDS-ish **filename templating** (`sub-{subject}_task-{task}_run-{run}_eeg.xdf`).
-- A headless **`xdf_record`** CLI for unattended capture (no GUI).
+- XDF recording of every connected stream, LabRecorder-compatible (checked against LabRecorder via `pyxdf`). Raw timestamps and clock-offset chunks are stored so importers can realign streams to a common clock.
+- Filename templating (`sub-{subject}_task-{task}_run-{run}_eeg.xdf`).
+- A headless `xdf_record` CLI (no GUI).
 
-### And more
+### Other
 
-- **IDE-like docking** layout: a Streams rail on the left, plots and analysis as tabs you arrange to taste.
-- **Saved workspaces** — name and save the whole view (per-stream filters/channels/gains, the open analysis windows, and the dock layout); loading one re-applies it, re-binding to each stream by `source_id` as it reconnects. Set your rig up once.
-- **Stream Info & health** — type, source id, channels, sensor positions, plus live measured-rate / clock-offset / dropout counters per stream.
-- **Remote control** over TCP — drive recording from your experiment script (see below).
-- Light / dark theme, persisted layout.
+- Docking layout: a Streams rail on the left; plots and analysis windows are tabs you arrange.
+- Saved workspaces: store the current view (per-stream filters/channels/gains, the open analysis windows, the dock layout) and reload it later. On load it reconnects the streams the workspace referenced (matched by `source_id`) and lists any that aren't on the network; recording is held until they connect or the notice is dismissed.
+- Per-stream info: type, source id, channels, sensor positions, and live measured-rate / clock-offset / dropout counters.
+- TCP remote control for recording (see below).
+- Light / dark theme; layout persisted between sessions.
 
----
 
 ## Remote control
 
-Start the viewer with a control port (`LSL_RC_PORT=22345`, or enable it from the
-Recording panel) and any client can drive recording over TCP with newline-terminated
-commands — `status`, `start [path]`, `stop`, `help`. Handy for starting/stopping a
-recording from the same script that runs your experiment:
+With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client
+can drive recording over TCP with newline-terminated commands: `status`, `start [path]`,
+`stop`, `help`. For example, starting and stopping a recording from the same script that
+runs an experiment:
 
 ```python
 import socket
@@ -84,43 +81,35 @@ with socket.create_connection(("localhost", 22345)) as rc:
     print(cmd("status"))
 ```
 
-The port is also advertised over LSL (in the control stream's `source_id`), so a
-client can discover it instead of hard-coding `22345`. Or just `nc localhost 22345`.
-
----
+The port is also advertised over LSL (in the control stream's `source_id`), so a client
+can discover it rather than hard-coding `22345`. `nc localhost 22345` works too.
 
 ## Quick start
 
-All dependencies are fetched by CMake — you just need a **C++20 compiler** and
-**CMake ≥ 3.23**.
+Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.23 (on Linux,
+also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/lsl_viewer          # on WSL: ./run.sh
 
-# in another terminal, feed it synthetic streams to play with:
+# in another terminal, generate some synthetic streams to view:
 uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers,evoked
 ```
 
-Then connect streams from the **Streams** rail (or set `LSL_AUTOCONNECT=1`).
-
-➡️ **[docs/building.md](docs/building.md)** — build options, single-file/static builds, Windows, test data, repo layout.
-
----
+Connect streams from the Streams rail (or set `LSL_AUTOCONNECT=1`).
 
 ## Roadmap
 
-- **Scalp topography (topomap)** — interpolated head map of amplitude / band power. Groundwork is in place: per-channel sensor positions are already parsed from stream metadata (so it's modality-agnostic — EEG/MEG/fNIRS), and the Info panel reports how many channels carry a layout.
-- **Bipolar montages** — named electrode chains (e.g. the longitudinal "double banana").
-- **Markers drag-onto-plot** and richer marker/event handling.
-- Per-channel **bad-channel rejection** (manual exclude from CAR / display).
-
----
+- Scalp topography (topomap): interpolated head map of amplitude / band power. Per-channel sensor positions are already parsed from stream metadata (so it is modality-agnostic: EEG/MEG/fNIRS), and the Info panel reports how many channels carry a layout.
+- Bipolar montages: named electrode chains (e.g. the longitudinal "double banana").
+- Markers drag-onto-plot and richer marker/event handling.
+- Per-channel bad-channel rejection (manual exclude from CAR / display).
 
 ## Documentation
 
-- **[docs/building.md](docs/building.md)** — building, CMake flags, static / single-file builds, Windows, repo layout
-- **[DESIGN.md](DESIGN.md)** — architecture & rationale (ring buffers, threading, the rendering path)
+- [docs/building.md](docs/building.md): building, CMake flags, static / single-file builds, Windows, repo layout.
+- [DESIGN.md](DESIGN.md): architecture and rationale (ring buffers, threading, the rendering path).
 
 Built with [SDL3](https://github.com/libsdl-org/SDL) + SDL_GPU, [Dear ImGui](https://github.com/ocornut/imgui) (docking) + [ImPlot](https://github.com/epezent/implot), [liblsl](https://github.com/sccn/liblsl), and [KissFFT](https://github.com/mborgerding/kissfft). C++20.

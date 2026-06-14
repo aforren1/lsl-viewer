@@ -368,5 +368,4 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->Yield(3);
         ctx->CaptureScreenshotWindow("//ERP 1", ImGuiCaptureFlags_HideMouseCursor);  // 3) channels x time raster
     };
-
 }

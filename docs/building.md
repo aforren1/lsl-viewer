@@ -48,6 +48,19 @@ uv run tools/lsl_test_streams.py --help          # all streams + tunables
 By default the viewer waits for you to connect streams from the **Streams** rail;
 set `LSL_AUTOCONNECT=1` to auto-connect everything it discovers.
 
+## Recording conformance test
+
+`tests/compare_labrecorder.py` records the mock streams with both our headless recorder
+(`xdf_record`, the same `Recorder`/`xdf_writer` as the viewer) and **LabRecorder**
+(`LabRecorderCLI`) at the same time, then checks that the two XDFs hold identical sample
+values and timestamps for every stream over a shared window. CI runs it on Linux (the
+`recording-vs-labrecorder` job installs LabRecorderCLI + liblsl from the LSL releases).
+Locally it needs `LabRecorderCLI` on `PATH` and a built `xdf_record`:
+
+```bash
+uv run tests/compare_labrecorder.py        # all mock streams, incl. 48 kHz audio
+```
+
 ## Optional CMake flags
 
 | Flag | Effect |
@@ -123,6 +136,8 @@ tools/                   standalone helpers (not linked into the viewer)
 
 tests/                   Dear ImGui Test Engine UI tests + screenshot captures
   ui_tests.cpp             enabled with -DLSL_TESTS=ON; run via `lsl_viewer --tests`
+  compare_labrecorder.py   records the mock streams with our recorder + LabRecorder and
+                           checks the XDFs are identical (needs LabRecorderCLI; runs locally)
 
 CMakeLists.txt           all dependencies are fetched at configure time (FetchContent)
 run.sh                   WSLg launcher (points SDL at the Wayland runtime dir)
