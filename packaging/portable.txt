@@ -1,0 +1,12 @@
+LSL Viewer — portable marker
+=============================
+
+Because this file sits next to the executable, LSL Viewer runs in PORTABLE mode: its
+configuration and recordings are kept in a "lsl_viewer_data" folder right here, instead of
+your system's app-data and Documents folders. Move this folder anywhere (USB stick, network
+share, …) and your setup travels with it.
+
+Delete this file to use the standard per-user locations instead
+(see docs/building.md, "Data and config locations").
+
+The application only checks that this file exists; its contents are ignored.

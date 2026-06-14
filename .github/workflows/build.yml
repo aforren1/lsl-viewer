@@ -14,13 +14,18 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write        # keyless signing of the build-provenance attestation
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: linux,   os: ubuntu-latest,  gen: Ninja,                   bindir: build }
-          - { name: macos,   os: macos-latest,   gen: Ninja,                   bindir: build }
-          - { name: windows, os: windows-2022,   gen: "Visual Studio 17 2022", bindir: build/Release }
+          - { name: linux,         os: ubuntu-latest,    gen: Ninja,                   bindir: build,         ext: "" }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, gen: Ninja,                   bindir: build,         ext: "" }
+          - { name: macos,         os: macos-latest,     gen: Ninja,                   bindir: build,         ext: "" }
+          - { name: windows,       os: windows-2022,     gen: "Visual Studio 17 2022", bindir: build/Release, ext: ".exe" }
     steps:
       - uses: actions/checkout@v6
 
@@ -63,24 +68,109 @@ jobs:
         if: runner.os != 'Windows'
         run: strip ${{ matrix.bindir }}/lsl_viewer ${{ matrix.bindir }}/xdf_record
 
-      - name: Upload executables
+      # Flat portable package: binaries + licenses + a portable.txt marker, so unzipping and
+      # running keeps config/recordings beside the executable (see docs/building.md).
+      - name: Stage portable package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.bindir }}/lsl_viewer${{ matrix.ext }}" "${{ matrix.bindir }}/xdf_record${{ matrix.ext }}" dist/
+          cp LICENSE THIRD_PARTY_LICENSES packaging/portable.txt dist/
+
+      # Provenance attestation: ties each binary's hash to this repo + workflow run + commit
+      # (keyless, via GitHub OIDC + Sigstore). Verify with `gh attestation verify <file>`.
+      # Only on pushes — fork PRs can't mint an id-token.
+      - name: Attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/lsl_viewer${{ matrix.ext }}
+            dist/xdf_record${{ matrix.ext }}
+
+      - name: Upload portable package
         uses: actions/upload-artifact@v7
         with:
           name: lsl-viewer-${{ matrix.name }}
           if-no-files-found: error
-          path: |
-            ${{ matrix.bindir }}/lsl_viewer
-            ${{ matrix.bindir }}/lsl_viewer.exe
-            ${{ matrix.bindir }}/xdf_record
-            ${{ matrix.bindir }}/xdf_record.exe
+          path: dist/*
+
+      # Windows also gets a conventional installer (Inno Setup is preinstalled on the runner):
+      # Program Files install, Start-menu shortcut, uninstaller — no portable.txt, so it uses
+      # the per-user locations. The portable .zip above is the no-install alternative.
+      - name: Build Windows installer
+        if: matrix.name == 'windows'
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\lsl-viewer.iss'
+
+      - name: Attest installer provenance
+        if: matrix.name == 'windows' && github.event_name == 'push'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: lsl-viewer-setup.exe
+
+      - name: Upload Windows installer
+        if: matrix.name == 'windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lsl-viewer-windows-installer
+          if-no-files-found: error
+          path: lsl-viewer-setup.exe
+
+      # macOS gets a .dmg: a .app bundle (icon from packaging/lsl-viewer.png) in a drag-to-
+      # Applications disk image. Unsigned (FreeCAD-style), so the first launch needs a
+      # right-click > Open, or: xattr -dr com.apple.quarantine "LSL Viewer.app".
+      - name: Build macOS .dmg
+        if: matrix.name == 'macos'
+        run: |
+          set -e
+          mkdir icon.iconset
+          for sz in 16 32 128 256 512; do
+            sips -z $sz $sz             packaging/lsl-viewer.png --out icon.iconset/icon_${sz}x${sz}.png
+            sips -z $((sz*2)) $((sz*2)) packaging/lsl-viewer.png --out icon.iconset/icon_${sz}x${sz}@2x.png
+          done
+          iconutil -c icns icon.iconset -o lsl_viewer.icns
+          APP="LSL Viewer.app"                       # binary is static; only system frameworks remain
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp build/lsl_viewer "$APP/Contents/MacOS/"
+          cp packaging/Info.plist "$APP/Contents/"
+          cp lsl_viewer.icns "$APP/Contents/Resources/"
+          mkdir dmgroot
+          cp -R "$APP" dmgroot/
+          ln -s /Applications dmgroot/Applications     # drag-to-install target
+          cp LICENSE THIRD_PARTY_LICENSES dmgroot/
+          hdiutil create -volname "LSL Viewer" -srcfolder dmgroot -ov -format UDZO LSL-Viewer.dmg
+
+      - name: Attest dmg provenance
+        if: matrix.name == 'macos' && github.event_name == 'push'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: LSL-Viewer.dmg
+
+      - name: Upload macOS .dmg
+        if: matrix.name == 'macos'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lsl-viewer-macos-dmg
+          if-no-files-found: error
+          path: LSL-Viewer.dmg
 
   # Portable single-file Linux build. Built on an older Ubuntu (older glibc) so it runs on
   # a wide range of distros, and packaged as an AppImage with a desktop entry + icon. SDL
   # dlopens the display-server libs at runtime, so the host provides X11/Wayland + the GPU
   # driver/Vulkan loader (always system components) — the AppImage carries the rest.
   appimage:
-    name: linux-appimage
-    runs-on: ubuntu-22.04
+    name: appimage-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     arch: x86_64 }
+          - { os: ubuntu-22.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write        # keyless signing of the build-provenance attestation
+      attestations: write
     steps:
       - uses: actions/checkout@v6
 
@@ -101,30 +191,37 @@ jobs:
 
       - name: Assemble AppDir
         run: |
-          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/bin AppDir/usr/share/doc/lsl_viewer
           cp build/lsl_viewer build/xdf_record AppDir/usr/bin/
           strip AppDir/usr/bin/lsl_viewer AppDir/usr/bin/xdf_record
+          cp LICENSE THIRD_PARTY_LICENSES AppDir/usr/share/doc/lsl_viewer/
 
       - name: Package AppImage
         run: |
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          chmod +x linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage
+          chmod +x linuxdeploy-${{ matrix.arch }}.AppImage
           export APPIMAGE_EXTRACT_AND_RUN=1   # runners have no FUSE
-          ./linuxdeploy-x86_64.AppImage \
+          ./linuxdeploy-${{ matrix.arch }}.AppImage \
             --appdir AppDir \
             --executable AppDir/usr/bin/lsl_viewer \
             --desktop-file packaging/lsl-viewer.desktop \
             --icon-file packaging/lsl-viewer.png \
             --output appimage
-          rm -f linuxdeploy-x86_64.AppImage          # drop the tool, leaving only the output
-          mv ./*.AppImage LSL-Viewer-x86_64.AppImage
+          rm -f linuxdeploy-${{ matrix.arch }}.AppImage   # drop the tool, leaving only the output
+          mv ./*.AppImage LSL-Viewer-${{ matrix.arch }}.AppImage
+
+      - name: Attest build provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: LSL-Viewer-${{ matrix.arch }}.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v7
         with:
-          name: lsl-viewer-appimage
+          name: lsl-viewer-appimage-${{ matrix.arch }}
           if-no-files-found: error
-          path: LSL-Viewer-x86_64.AppImage
+          path: LSL-Viewer-${{ matrix.arch }}.AppImage
 
   # Recording conformance: record the mock streams with our headless recorder AND the real
   # LabRecorder (LabRecorderCLI) at once, and check the two XDFs hold identical data. Both

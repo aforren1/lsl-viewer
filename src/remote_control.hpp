@@ -10,6 +10,8 @@
 //   filename <path>           set the output .xdf path
 //   start [path]              begin recording (optional path)
 //   stop                      stop recording
+//   get [path]                stream a finished recording to the client: a header line
+//                             "OK <bytes> <filename>" then <bytes> of raw file data
 //   quit                      close the connection
 //
 // Discovery: while running we also publish an LSL outlet (name "LSLViewerControl",
@@ -30,6 +32,8 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <cstdint>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,6 +78,8 @@ struct RemoteState {
     std::string streamsText;          // `streams` reply body
     std::string statusText;           // `status` reply body
     std::string selectedText = "all"; // `selected` reply body
+    bool        recording   = false;  // a recording is in progress (can't `get` mid-record)
+    std::string lastFile;             // path of the last completed + flushed recording ("" = none)
     // requests from the server, consumed by the main loop:
     std::optional<std::string>               setFilename;
     std::optional<std::vector<std::string>>  setSelection;  // empty vector = none, absent = unchanged; {"*"} = all
@@ -173,14 +179,46 @@ private:
 
     void reply(rc_socket_t fd, const std::string& s) { ::send(fd, s.data(), (int)s.size(), 0); }
 
+    // Stream the last completed recording (or a given path) to the client: a header line
+    // "OK <bytes> <filename>\n" followed by exactly <bytes> of raw file data. Blocking, on the
+    // server thread (not the recording/UI thread); only the state mutex is held, briefly, to
+    // read the path. The client reads the header, then reads <bytes> and saves them.
+    void sendFile(rc_socket_t fd, const std::string& arg) {
+        std::string path; bool recording;
+        { std::lock_guard<std::mutex> lk(st_->mtx);
+          recording = st_->recording;
+          path      = arg.empty() ? st_->lastFile : arg; }
+        if (recording)    { reply(fd, "error: stop the recording before `get`\n"); return; }
+        if (path.empty()) { reply(fd, "error: no completed recording yet\n"); return; }
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f) { reply(fd, "error: cannot open " + path + "\n"); return; }
+        const std::uint64_t size = (std::uint64_t)f.tellg();
+        f.seekg(0);
+        const std::size_t slash = path.find_last_of("/\\");
+        reply(fd, "OK " + std::to_string(size) + " " +
+                  (slash == std::string::npos ? path : path.substr(slash + 1)) + "\n");
+        char buf[65536];
+        while (f) {
+            f.read(buf, sizeof buf);
+            std::size_t off = 0, got = (std::size_t)f.gcount();
+            while (off < got) {                          // a send() can be partial
+                const int n = (int)::send(fd, buf + off, (int)(got - off), 0);
+                if (n <= 0) return;                      // client gone
+                off += (std::size_t)n;
+            }
+        }
+    }
+
     bool dispatch(rc_socket_t fd, const std::string& line) {
         if (line.empty()) return true;
         std::string arg, v = verb(line, arg);
+        if (v == "get") { sendFile(fd, arg); return true; }   // binary transfer; locks only briefly
         std::lock_guard<std::mutex> lk(st_->mtx);
         if (v == "help") {
-            reply(fd, "commands: help status streams selected select filename set start stop quit\n"
+            reply(fd, "commands: help status streams selected select filename set start stop get quit\n"
                       "  filename <template>   e.g. sub-{subject}_task-{task}_run-{run}_eeg.xdf\n"
-                      "  set <field> <value>   subject|session|task|run  (also {datetime}/{date}/{time})\n");
+                      "  set <field> <value>   subject|session|task|run  (also {datetime}/{date}/{time})\n"
+                      "  get [path]            stream a finished recording: 'OK <bytes> <name>' + raw data\n");
         } else if (v == "status") {
             reply(fd, st_->statusText + "\n");
         } else if (v == "streams") {

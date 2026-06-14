@@ -5,14 +5,24 @@
 Every push builds binaries on CI ([.github/workflows/build.yml](../.github/workflows/build.yml)) —
 grab them from the run's **Artifacts**:
 
-- `lsl-viewer-linux` / `lsl-viewer-macos` / `lsl-viewer-windows` — self-contained
-  (static) `lsl_viewer` + `xdf_record` for each OS.
-- `lsl-viewer-appimage` — a portable **`LSL-Viewer-x86_64.AppImage`** built on an older
-  glibc and with **both X11 and Wayland** backends, so it runs across desktops and distros
-  (the host still provides the GPU driver / Vulkan loader, as always for a GPU app).
+- `lsl-viewer-linux` / `lsl-viewer-linux-aarch64` / `lsl-viewer-macos` / `lsl-viewer-windows`
+  — self-contained (static) `lsl_viewer` + `xdf_record` for each OS/arch, plus `LICENSE`,
+  `THIRD_PARTY_LICENSES`, and `portable.txt` (a [portable](#data-and-config-locations) build).
+- `lsl-viewer-windows-installer` — **`lsl-viewer-setup.exe`**, an Inno Setup installer that
+  drops the app into `Program Files` and uses the standard per-user locations.
+- `lsl-viewer-macos-dmg` — **`LSL-Viewer.dmg`**, a drag-to-Applications disk image with an
+  `LSL Viewer.app` bundle.
+- `lsl-viewer-appimage-x86_64` / `lsl-viewer-appimage-aarch64` — a portable
+  **`LSL-Viewer-<arch>.AppImage`** built on an older glibc and with **both X11 and Wayland**
+  backends, so it runs across desktops and distros (the host still provides the GPU driver /
+  Vulkan loader, as always for a GPU app).
 
 The per-OS `lsl-viewer-linux` artifact is built on the latest Ubuntu (newer glibc); for
 broad Linux portability prefer the AppImage.
+
+None of the artifacts are code-signed, so first launch trips Gatekeeper on macOS
+(right-click → Open, or `xattr -dr com.apple.quarantine "LSL Viewer.app"`) and SmartScreen
+on Windows (More info → Run anyway).
 
 ## Build from source
 
@@ -47,6 +57,20 @@ uv run tools/lsl_test_streams.py --help          # all streams + tunables
 
 By default the viewer waits for you to connect streams from the **Streams** rail;
 set `LSL_AUTOCONNECT=1` to auto-connect everything it discovers.
+
+## Data and config locations
+
+User data and app state are kept separate:
+
+- **Recordings** default to a visible user folder — `~/Documents/lsl-recordings` (falling back to
+  your home directory); change it per session in the Recording panel.
+- **Config and state** (`imgui.ini`, saved workspaces) go to the OS app-data directory:
+  `%APPDATA%\lsl_viewer\` (Windows), `~/Library/Application Support/lsl_viewer/` (macOS), or
+  `~/.local/share/lsl_viewer/` (Linux).
+
+**Portable mode** instead keeps everything together in a `lsl_viewer_data/` folder beside the
+executable — handy for a self-contained directory or a USB stick. Enable it with `LSL_PORTABLE=1`,
+or by dropping an empty `portable.txt` next to the binary (or next to the `.AppImage`).
 
 ## Recording conformance test
 

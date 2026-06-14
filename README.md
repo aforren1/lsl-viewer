@@ -1,4 +1,4 @@
-# lsl-sdl
+# lsl_viewer
 
 A real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer)
 (LSL) streams. It plots live data (EEG, MEG, fNIRS, accelerometers, markers, …),
@@ -63,26 +63,70 @@ zoomed views use the conditioned signal.
 ## Remote control
 
 With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client
-can drive recording over TCP with newline-terminated commands: `status`, `start [path]`,
-`stop`, `help`. For example, starting and stopping a recording from the same script that
-runs an experiment:
+drives recording over TCP with newline-terminated commands; replies are human-readable
+lines. The commands:
+
+| command | effect |
+|---|---|
+| `streams` | list resolvable streams, one per line: `key \| name \| type \| Nch \| rate` |
+| `selected` | the keys currently connected (= what gets recorded) |
+| `select all\|none\|<k1,k2,…>` | choose which streams to connect/record (`key` = `source_id`) |
+| `set <subject\|session\|task\|run\|acq\|modality> <value>` | fill a filename-template field |
+| `filename <path>` | set the output path/template directly |
+| `start [path]` · `stop` | begin / end recording |
+| `get [path]` | stream a finished recording back to the client: a header line `OK <bytes> <name>` then `<bytes>` of raw XDF |
+| `status` | recording? + file / seconds / MB / streams |
+| `help` · `quit` | list commands / close the connection |
+
+So a script can query what's on the network, pick the streams it wants, fill the BIDS
+fields, and record-- all from the same process that runs the experiment:
 
 ```python
 import socket
 
-with socket.create_connection(("localhost", 22345)) as rc:
-    def cmd(c):
-        rc.sendall((c + "\n").encode())
-        return rc.recv(4096).decode().strip()
+def cmd(sock, line):
+    sock.sendall((line + "\n").encode())
+    return sock.recv(8192).decode().strip()
 
-    cmd("start sub-01_task-oddball_run-1_eeg.xdf")
+with socket.create_connection(("localhost", 22345)) as rc:
+    print(cmd(rc, "streams"))
+    #   mock-eeg            | MockEEG           | EEG     | 32ch | 500
+    #   mock-evoked-markers | MockEvokedMarkers | Markers |  1ch | 0
+    #   mock-audio          | MockAudio         | Audio   |  2ch | 48000
+
+    # record only the EEG + its markers (keys are the source_ids from `streams`)
+    cmd(rc, "select mock-eeg,mock-evoked-markers")
+    print(cmd(rc, "selected"))                 # -> mock-eeg mock-evoked-markers
+
+    for field, val in dict(subject="01", session="01", task="oddball", run="1").items():
+        cmd(rc, f"set {field} {val}")          # -> sub-01/ses-01/eeg/sub-01_…_eeg.xdf
+
+    cmd(rc, "start")
     # ... present stimuli, push markers via LSL ...
-    cmd("stop")
-    print(cmd("status"))
+    cmd(rc, "stop")
+    print(cmd(rc, "status"))
 ```
 
-The port is also advertised over LSL (in the control stream's `source_id`), so a client
-can discover it rather than hard-coding `22345`. `nc localhost 22345` works too.
+After `stop`, `get` streams the finished `.xdf` back over the same connection. This can be useful when the viewer runs on the acquisition machine and your analysis runs elsewhere:
+
+```python
+def fetch(rc, dest):
+    rc.sendall(b"get\n")
+    buf = b""
+    while b"\n" not in buf:                      # read the "OK <bytes> <name>" header line
+        buf += rc.recv(4096)
+    head, _, body = buf.partition(b"\n")
+    tag, size, _name = head.split(maxsplit=2)
+    if tag != b"OK":
+        raise RuntimeError(head.decode())
+    size = int(size)
+    while len(body) < size:                      # then read exactly <bytes> of raw XDF
+        body += rc.recv(1 << 16)
+    open(dest, "wb").write(body[:size])
+```
+
+The control endpoint is also advertised over LSL (type `ViewerControl`); resolve it to get the host and the port (encoded in `source_id` as `lsl-viewer-rc:<port>`) instead of
+hard-coding `22345`. `nc localhost 22345` works for poking at it by hand.
 
 ## Quick start
 
@@ -111,5 +155,9 @@ Connect streams from the Streams rail (or set `LSL_AUTOCONNECT=1`).
 
 - [docs/building.md](docs/building.md): building, CMake flags, static / single-file builds, Windows, repo layout.
 - [DESIGN.md](DESIGN.md): architecture and rationale (ring buffers, threading, the rendering path).
+
+## License
+
+MIT -- see [LICENSE](LICENSE). The viewer bundles third-party components (SDL3, Dear ImGui, ImPlot, liblsl, KissFFT, spdlog, the Roboto font) and adapts LabRecorder's `xdfwriter`. Their copyright notices and licenses are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
 
 Built with [SDL3](https://github.com/libsdl-org/SDL) + SDL_GPU, [Dear ImGui](https://github.com/ocornut/imgui) (docking) + [ImPlot](https://github.com/epezent/implot), [liblsl](https://github.com/sccn/liblsl), and [KissFFT](https://github.com/mborgerding/kissfft). C++20.

@@ -1341,6 +1341,32 @@ int main(int argc, char** argv) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;  // drag windows together to dock
 
+    // Data layout. Default: config/state (imgui.ini + saved workspaces) in the OS app-data dir
+    // (AppData / Application Support / ~/.local/share), recordings under ~/Documents. Portable:
+    // everything beside the binary instead, for a self-contained folder or USB stick — enabled
+    // by LSL_PORTABLE or a `portable.txt` dropped next to the executable / .AppImage.
+    std::string prefBase, iniPath, recDefault;
+    {
+        std::string base;                                  // dir of the .AppImage, else the exe
+        if (const char* ai = std::getenv("APPIMAGE")) {
+            const std::string p = ai; const auto s = p.find_last_of("/\\");
+            base = (s == std::string::npos) ? std::string() : p.substr(0, s + 1);
+        } else if (const char* bp = SDL_GetBasePath()) { base = bp; }   // SDL-owned, don't free
+
+        const bool portable = std::getenv("LSL_PORTABLE") != nullptr ||
+                              (!base.empty() && std::filesystem::exists(base + "portable.txt"));
+        if (portable && !base.empty()) {
+            prefBase   = base + "lsl_viewer_data/";
+            std::error_code ec; std::filesystem::create_directories(prefBase, ec);
+            recDefault = prefBase + "recordings";
+        } else {
+            if (char* pref = SDL_GetPrefPath("", "lsl_viewer")) { prefBase = pref; SDL_free(pref); }
+            if (const char* doc = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS))   recDefault = std::string(doc)  + "lsl-recordings";
+            else if (const char* home = SDL_GetUserFolder(SDL_FOLDER_HOME))  recDefault = std::string(home) + "lsl-recordings";
+        }
+        if (!prefBase.empty()) { iniPath = prefBase + "imgui.ini"; io.IniFilename = iniPath.c_str(); }
+    }
+
     loadEmbeddedFont(io, window);   // embedded Roboto, HiDPI-crisp (see theme.hpp)
     // Persist theme + recording path in imgui.ini (handler must be added before the
     // ini is auto-loaded on the first NewFrame).
@@ -1354,6 +1380,10 @@ int main(int argc, char** argv) {
         sh.WriteAllFn = SettingsWriteAll;
         ImGui::AddSettingsHandler(&sh);
     }
+    // Apply the recordings default (computed above) unless the ini, loaded on the first frame,
+    // overrides it; clearing the field in the UI falls back to the working directory.
+    if (g_recDir[0] == '\0' && !recDefault.empty())
+        std::snprintf(g_recDir, sizeof g_recDir, "%s", recDefault.c_str());
     applyTheme(g_light);
     bool themeApplied = false;   // re-applied once after the ini loads (first NewFrame)
 
@@ -1490,7 +1520,9 @@ int main(int argc, char** argv) {
     // ---- Workspaces: named snapshots of the whole view (per-stream settings, analysis
     // windows, and the dock layout). Streams are referenced by source_id so a workspace
     // re-applies itself when the same streams reconnect. Stored as ./workspaces/<name>.lslws.
-    const std::filesystem::path wsDir = "workspaces";
+    const std::filesystem::path wsDir =
+        prefBase.empty() ? std::filesystem::path("workspaces")
+                         : std::filesystem::path(prefBase) / "workspaces";
     char        wsNameBuf[128] = "";
     std::string pendingWs;            // a load deferred to end-of-frame (safe ImGui ini point)
     // Streams a loaded workspace needs (source_id, name): auto-connected as they appear and
@@ -1828,6 +1860,10 @@ int main(int argc, char** argv) {
                                   recorder.active() ? "true" : "false", fnow.c_str(), recorder.seconds(),
                                   recorder.streams(), (unsigned long long)recorder.bytes());
                     rcState.statusText = st;
+                    rcState.recording  = recorder.active();
+                    // Expose the last recording for `get` only once it's fully flushed/closed.
+                    rcState.lastFile = (!recorder.active() && recorder.fileFlushed() && !recorder.path().empty())
+                                       ? recorder.path() : std::string();
                     rcState.selectedText = [&]{
                         std::string j;
                         for (auto& info : found) if (connected(info)) j += streamKey(info) + " ";

@@ -25,6 +25,8 @@ public:
     ~Recorder() { stop(); if (closer_.joinable()) closer_.join(); }   // flush before exit
 
     bool active() const { return active_.load(std::memory_order_acquire); }
+    // True once the deferred close has flushed + closed the file (so it's safe to read back).
+    bool fileFlushed() const { return closeDone_.load(std::memory_order_acquire); }
     int  streams() const { return nstreams_; }
     const std::string& path() const { return path_; }
     double seconds() const { return active() ? lsl::local_clock() - t0_ : elapsed_; }
@@ -74,9 +76,11 @@ public:
         // then the writer drops here and flushes + closes. A subsequent stop() / the
         // dtor joins this thread, so the file is never truncated.
         if (closer_.joinable()) closer_.join();   // prior close (practically already done)
-        closer_ = std::thread([w = std::move(workers_), wr = std::move(writer_)]() mutable {
+        closeDone_.store(false, std::memory_order_release);
+        closer_ = std::thread([this, w = std::move(workers_), wr = std::move(writer_)]() mutable {
             w.clear();      // join each worker off the UI thread
             wr.reset();     // last ref -> flush footer + close the file
+            closeDone_.store(true, std::memory_order_release);
         });
         workers_.clear();   // already moved-from; ensure empty for the next start()
     }
@@ -142,6 +146,7 @@ private:
     std::vector<jthread>    workers_;
     std::thread                  closer_;   // deferred join + flush (keeps stop() off the UI thread)
     std::atomic<bool>            active_{false};
+    std::atomic<bool>            closeDone_{true};  // false while the deferred close is flushing
     double                       t0_ = 0.0, elapsed_ = 0.0;
     std::uint64_t                lastBytes_ = 0;   // file size at the last stop() (writer_ is moved away)
     std::string                  path_;
