@@ -79,9 +79,10 @@ jobs:
 
       # Provenance attestation: ties each binary's hash to this repo + workflow run + commit
       # (keyless, via GitHub OIDC + Sigstore). Verify with `gh attestation verify <file>`.
-      # Only on pushes — fork PRs can't mint an id-token.
+      # Only on pushes — fork PRs can't mint an id-token. Also only on public repos: the
+      # attestation store rejects private repos without GHAS, so skip rather than fail there.
       - name: Attest build provenance
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
@@ -103,7 +104,7 @@ jobs:
         run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\lsl-viewer.iss'
 
       - name: Attest installer provenance
-        if: matrix.name == 'windows' && github.event_name == 'push'
+        if: matrix.name == 'windows' && github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: lsl-viewer-setup.exe
@@ -141,7 +142,7 @@ jobs:
           hdiutil create -volname "LSL Viewer" -srcfolder dmgroot -ov -format UDZO LSL-Viewer.dmg
 
       - name: Attest dmg provenance
-        if: matrix.name == 'macos' && github.event_name == 'push'
+        if: matrix.name == 'macos' && github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: LSL-Viewer.dmg
@@ -211,7 +212,7 @@ jobs:
           mv ./*.AppImage LSL-Viewer-${{ matrix.arch }}.AppImage
 
       - name: Attest build provenance
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: LSL-Viewer-${{ matrix.arch }}.AppImage

@@ -1,9 +1,6 @@
 # lsl_viewer
 
-A real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer)
-(LSL) streams. It plots live data (EEG, MEG, fNIRS, accelerometers, markers, …),
-applies display filters, computes spectra and marker-averaged responses, and records
-to XDF, in a single GPU-rendered window.
+A real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreaminglayer) (LSL) streams. It plots live data (EEG, MEG, fNIRS, accelerometers, markers, …), applies display filters, computes spectra and marker-averaged responses, and records to XDF, in a single GPU-rendered window.
 
 ![Live scrolling EEG montage](docs/images/live.gif)
 
@@ -59,12 +56,9 @@ zoomed views use the conditioned signal.
 - TCP remote control for recording (see below).
 - Light / dark theme; layout persisted between sessions.
 
-
 ## Remote control
 
-With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client
-drives recording over TCP with newline-terminated commands; replies are human-readable
-lines. The commands:
+With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client drives recording over TCP with newline-terminated commands; replies are human-readable lines. The commands:
 
 | command | effect |
 |---|---|
@@ -125,13 +119,11 @@ def fetch(rc, dest):
     open(dest, "wb").write(body[:size])
 ```
 
-The control endpoint is also advertised over LSL (type `ViewerControl`); resolve it to get the host and the port (encoded in `source_id` as `lsl-viewer-rc:<port>`) instead of
-hard-coding `22345`. `nc localhost 22345` works for poking at it by hand.
+The control endpoint is also advertised over LSL (type `ViewerControl`); resolve it to get the host and the port (encoded in `source_id` as `lsl-viewer-rc:<port>`) instead of hard-coding `22345`. `nc localhost 22345` works for poking at it by hand.
 
 ## Quick start
 
-Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.23 (on Linux,
-also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
+Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.23 (on Linux, also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release

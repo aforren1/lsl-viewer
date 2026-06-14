@@ -38,11 +38,11 @@ FetchContent_Declare(SDL3
   GIT_TAG        release-3.4.10     # latest stable 3.4.x
   GIT_SHALLOW    TRUE
 )
-# Trim SDL to the subsystems the viewer actually uses — video + SDL_GPU (Vulkan/D3D12)
+# Trim SDL to the subsystems the viewer actually uses: video + SDL_GPU (Vulkan/D3D12)
 # for the window, events/timer (always built), and the file dialog (the recorder's
 # folder picker, SDL_ShowOpenFolderDialog). Everything else is dead weight; disabling
 # it shrinks the build and the binary. SDL_RENDER is the 2D SDL_Renderer API, which we
-# never touch — Dear ImGui drives SDL_GPU directly — so it goes too.
+# never touch (Dear ImGui drives SDL_GPU directly) so it goes too.
 set(SDL_AUDIO    OFF CACHE BOOL "" FORCE)
 set(SDL_RENDER   OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA   OFF CACHE BOOL "" FORCE)
@@ -52,7 +52,7 @@ set(SDL_HIDAPI   OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR   OFF CACHE BOOL "" FORCE)
 set(SDL_POWER    OFF CACHE BOOL "" FORCE)
 # The viewer never synthesizes input or warps the mouse globally, so it doesn't need the
-# X11 XTest extension — turning it off drops the libXtst build dependency on Linux. (The
+# X11 XTest extension. Turning it off drops the libXtst build dependency on Linux. (The
 # other X11 extensions SDL checks are kept; they cover normal windowing.)
 set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
 
