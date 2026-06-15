@@ -123,9 +123,10 @@ def push_chunk(outlet, chunk, ts):
 # stamping the last sample of the chunk; intermediate samples are inferred from
 # the nominal rate by the inlet.
 # ---------------------------------------------------------------------------
-def run_regular(name, outlet, srate, gen, stop, period=0.02, skew=0.0):
-    # `skew` offsets the pushed timestamps (simulates a stream on a differently-set
-    # clock); LabRecorder/pyxdf realign via the recorded time-correction offsets.
+def run_regular(name, outlet, srate, gen, stop, period=0.02, skew=0.0, drift=0.0):
+    # Put the stream on its own apparent clock: a constant `skew` (offset) plus a `drift` rate
+    # (the offset grows over the run, like a crystal ticking slightly fast/slow). Simulates an
+    # independent device timebase; the recorder must capture these timestamps faithfully.
     start = local_clock()
     pushed = 0
     while not stop.is_set():
@@ -133,7 +134,7 @@ def run_regular(name, outlet, srate, gen, stop, period=0.02, skew=0.0):
         target = int((now - start) * srate)
         n = target - pushed
         if n > 0:
-            push_chunk(outlet, gen(pushed, n), now + skew)
+            push_chunk(outlet, gen(pushed, n), now + skew + drift * (now - start))
             pushed += n
         time.sleep(period)
 
@@ -295,12 +296,14 @@ def run_mouse(outlet, stop, rng):
         outlet.push_sample([x, y], local_clock())
 
 
-def run_markers(outlet, stop, rng, labels, rate_hz, skew=0.0):
+def run_markers(outlet, stop, rng, labels, rate_hz, skew=0.0, drift=0.0):
+    start = local_clock()
     while not stop.is_set():
         time.sleep(rng.exponential(1.0 / rate_hz))
         if stop.is_set():
             break
-        outlet.push_sample([random.choice(labels)], local_clock() + skew)
+        now = local_clock()
+        outlet.push_sample([random.choice(labels)], now + skew + drift * (now - start))
 
 
 # A regular stream that repeatedly DISCONNECTS: it destroys its outlet, stays gone
@@ -372,14 +375,20 @@ def build_streams(selected, args, stop, host_suffix):
         th.start()
         threads.append(th)
 
-    # Per-stream timestamp skew (s) when --clock-skew is given, so streams sit on
-    # distinct apparent clocks (the recorder's time-correction chunks realign them).
-    _order = ["eeg", "accel", "sine", "markers", "chirp", "hd", "mouse"]
+    # Per-stream clock perturbation when --clock-skew / --clock-drift are set: each stream gets a
+    # DISTINCT constant offset (sk) and a DISTINCT rate drift (dr), so they sit on independent
+    # device timebases (worst case). The recorder must capture these timestamps faithfully. (On a
+    # single host this only shifts the recorded VALUES — there's no real clock to time-correct — so
+    # it exercises faithful capture, not cross-machine sync.) 0 by default = the reference clock.
+    _keys = ["eeg", "accel", "sine", "markers", "chirp", "hd", "drift", "audio", "fastmarkers"]
+    def _step(name):
+        return (_keys.index(name) - len(_keys) // 2) if name in _keys else 0
     def sk(name):
         base = getattr(args, "clock_skew", 0.0) or 0.0
-        if base == 0.0:
-            return 0.0
-        return round((_order.index(name) - 2 if name in _order else 0) * base, 4)
+        return round(_step(name) * base, 4) if base else 0.0
+    def dr(name):
+        base = getattr(args, "clock_drift", 0.0) or 0.0
+        return _step(name) * base if base else 0.0
 
     if "eeg" in selected:
         C, sr = args.eeg_channels, args.eeg_rate
@@ -389,7 +398,7 @@ def build_streams(selected, args, stop, host_suffix):
         add_channels(info, labels, "microvolts", "EEG")
         out = StreamOutlet(info, chunk_size=int(sr * 0.02), max_buffered=360)
         gen, _ = make_eeg_gen(C, sr, args.line_freq, rng, n_eog)
-        spawn(run_regular, "eeg", out, sr, gen, stop, 0.02, sk("eeg"))
+        spawn(run_regular, "eeg", out, sr, gen, stop, 0.02, sk("eeg"), dr("eeg"))
         started.append(f"eeg          {C}ch @ {sr:g} Hz  float  ({n_eog} EOG @ ~10x scale)")
 
     if "highdensity" in selected:
@@ -397,7 +406,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockHighDensity{host_suffix}", "EEG", C, sr, cf_float32, "mock-hd")
         add_channels(info, [f"ch{i}" for i in range(C)], "microvolts", "EEG")
         out = StreamOutlet(info, chunk_size=int(sr * 0.01), max_buffered=360)
-        spawn(run_regular, "hd", out, sr, make_highdensity_gen(C, sr, rng), stop)
+        spawn(run_regular, "hd", out, sr, make_highdensity_gen(C, sr, rng), stop, 0.02, sk("hd"), dr("hd"))
         started.append(f"highdensity  {C}ch @ {sr:g} Hz  float")
 
     if "chirp" in selected:
@@ -405,7 +414,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockChirp{host_suffix}", "Signal", 1, sr, cf_float32, "mock-chirp")
         add_channels(info, ["chirp"], "au", "misc")
         out = StreamOutlet(info)
-        spawn(run_regular, "chirp", out, sr, make_chirp_gen(sr, 1.0, 120.0, 8.0), stop)
+        spawn(run_regular, "chirp", out, sr, make_chirp_gen(sr, 1.0, 120.0, 8.0), stop, 0.02, sk("chirp"), dr("chirp"))
         started.append(f"chirp        1ch @ {sr} Hz  float  (1->120 Hz sweep)")
 
     if "sine" in selected:
@@ -413,7 +422,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockSine40{host_suffix}", "Signal", 1, sr, cf_float32, "mock-sine")
         add_channels(info, ["sine40"], "au", "misc")
         out = StreamOutlet(info)
-        spawn(run_regular, "sine", out, sr, make_sine_gen(sr, 40.0), stop, 0.02, sk("sine"))
+        spawn(run_regular, "sine", out, sr, make_sine_gen(sr, 40.0), stop, 0.02, sk("sine"), dr("sine"))
         started.append(f"sine         1ch @ {sr} Hz  float  (pure 40 Hz)")
 
     if "accel" in selected:
@@ -421,7 +430,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockAccel{host_suffix}", "Accelerometer", 3, sr, cf_float32, "mock-accel")
         add_channels(info, ["acc_x", "acc_y", "acc_z"], "g", "Accelerometer")
         out = StreamOutlet(info)
-        spawn(run_regular, "accel", out, sr, make_accel_gen(sr, rng), stop, 0.02, sk("accel"))
+        spawn(run_regular, "accel", out, sr, make_accel_gen(sr, rng), stop, 0.02, sk("accel"), dr("accel"))
         started.append(f"accel        3ch @ {sr} Hz  float")
 
     if "mouse" in selected:
@@ -442,7 +451,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockMarkers{host_suffix}", "Markers", 1, IRREGULAR_RATE,
                           cf_string, "mock-markers")
         out = StreamOutlet(info)
-        spawn(run_markers, out, stop, rng, labels, 1.0, sk("markers"))
+        spawn(run_markers, out, stop, rng, labels, 1.0, sk("markers"), dr("markers"))
         started.append("markers      1ch @ irregular  string (~1/s)")
 
     if "fastmarkers" in selected:
@@ -450,7 +459,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockFastMarkers{host_suffix}", "Markers", 1, IRREGULAR_RATE,
                           cf_string, "mock-fastmarkers")
         out = StreamOutlet(info)
-        spawn(run_markers, out, stop, rng, labels, 30.0)
+        spawn(run_markers, out, stop, rng, labels, 30.0, sk("fastmarkers"), dr("fastmarkers"))
         started.append("fastmarkers  1ch @ irregular  string (~30/s)")
 
     if "drift" in selected:
@@ -459,7 +468,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockDrift{host_suffix}", "EEG", len(freqs), sr, cf_float32, "mock-drift")
         add_channels(info, [f"{fr:g}Hz" for fr in freqs], "microvolts", "EEG")
         out = StreamOutlet(info, chunk_size=int(sr * 0.02), max_buffered=360)
-        spawn(run_regular, "drift", out, sr, make_drift_gen(sr, freqs), stop, 0.02, sk("drift"))
+        spawn(run_regular, "drift", out, sr, make_drift_gen(sr, freqs), stop, 0.02, sk("drift"), dr("drift"))
         started.append("drift        5ch @ 250 Hz  float  (sub-Hz drift 0.05-1Hz + 10Hz tone; high-pass test)")
 
     if "audio" in selected:
@@ -467,7 +476,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockAudio{host_suffix}", "Audio", 2, sr, cf_float32, "mock-audio")
         add_channels(info, ["L", "R"], "arbitrary", "Audio")
         out = StreamOutlet(info, chunk_size=int(sr * 0.02), max_buffered=360)
-        spawn(run_regular, "audio", out, sr, make_audio_gen(sr), stop)
+        spawn(run_regular, "audio", out, sr, make_audio_gen(sr), stop, 0.02, sk("audio"), dr("audio"))
         started.append("audio        2ch @ 48000 Hz  float  (440/660 Hz stereo tone)")
 
     if "evoked" in selected:
@@ -502,7 +511,9 @@ def main():
     p.add_argument("--line-freq", type=float, default=50.0,
                    help="mains interference frequency in the EEG stream (50 or 60)")
     p.add_argument("--clock-skew", type=float, default=0.0,
-                   help="give streams distinct timestamp offsets (s) to exercise clock sync")
+                   help="per-stream constant timestamp OFFSET spread (s) — each stream on its own epoch")
+    p.add_argument("--clock-drift", type=float, default=0.0,
+                   help="per-stream timestamp DRIFT/rate spread (fraction, e.g. 1e-3) — clocks tick fast/slow")
     p.add_argument("--suffix", default="",
                    help="appended to every stream name (run multiple senders apart)")
     args = p.parse_args()

@@ -4,13 +4,29 @@
 # at the same time, then compare. Because both recorders subscribe to the same outlets, the
 # two XDFs must agree — and this test checks that agreement at several levels:
 #
-#   * data:        identical sample VALUES and TIMESTAMPS over several windows of the run
+# Worst case: every stream is put on its OWN apparent clock — a distinct constant OFFSET plus a
+# distinct rate DRIFT (--clock-skew / --clock-drift), as if each came from a separate device — so
+# the recorder has to capture arbitrary, non-uniform per-stream timebases.
+#
+#   * data:        bit-IDENTICAL sample values AND timestamps over several windows of the run,
+#                  matched on identical timestamps — both recorders stamp the same LSL samples, so
+#                  there is NO tolerance (each stream is compared against itself across recorders,
+#                  which is offset/drift-agnostic)
+#   * skew:        the recorded per-stream start times span more than the offset, i.e. the recorder
+#                  preserved each stream's clock and never normalized them together
 #   * metadata:    identical stream header (type/rate/format/source_id) and per-channel
 #                  description (label/type/unit/location) for every shared stream
 #   * structure:   identical XDF chunk layout — both files carry a FileHeader, and every
 #                  stream has a StreamHeader, a StreamFooter, ClockOffset (time-correction)
 #                  chunks, and Sample chunks (parsed straight from the binary, below pyxdf)
+#   * dropouts:    a `flaky` stream disconnects/reconnects mid-run; both recorders must recover
+#                  it (recover=True) and still agree on the data either side of the gap
 #   * validity:    our recording is internally sound — timestamps non-decreasing, no NaN/Inf
+#
+# (The offset/drift only shift the recorded timestamp VALUES — on one host the real clocks ARE the
+# same, so time_correction is ~0 and cross-machine SYNC can't be exercised. This proves the
+# recorder captures arbitrary timebases faithfully and writes LabRecorder-shaped ClockOffset
+# chunks, not that it resolves real drift.)
 #
 # Requires LabRecorderCLI on PATH and a built `xdf_record` (override with $XDF_RECORD). It is
 # an integration test, not part of the C++ suite or the normal build CI (those have no
@@ -29,7 +45,8 @@ from pathlib import Path
 
 import numpy as np
 import pyxdf
-from pylsl import StreamInfo, StreamOutlet, local_clock
+# (pylsl is in the deps below so the mock-streams subprocess can import it — this script no
+#  longer creates LSL outlets itself; each stream is compared against itself across recorders.)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -153,54 +170,50 @@ def check_validity(name: str, s) -> int:
 
 
 # ---- data comparison over a window --------------------------------------------------------
-def compare_window(a, b, t0, t1, is_regular):
+def compare_window(a, b, t0, t1, is_regular, allow_edge=0):
+    # Both recorders subscribe to the SAME outlet, so LSL stamps each sample once and both write
+    # that exact timestamp — there is no clock to "sync" on a single host (time_correction ~= 0),
+    # the times are bit-identical. So we match on identical timestamps and require identical
+    # values there: no tolerance. `allow_edge` permits a few unmatched boundary samples ONLY for a
+    # flaky (disconnect/reconnect) stream, where one recorder may catch a sample at a reconnect the
+    # other misses; for every steady stream it's 0 (strict).
     tsa = np.asarray(a["time_stamps"], dtype=float)
     tsb = np.asarray(b["time_stamps"], dtype=float)
-    ma = (tsa >= t0) & (tsa <= t1)
-    mb = (tsb >= t0) & (tsb <= t1)
-    na, nb = int(ma.sum()), int(mb.sum())
-    if na != nb:
-        return False, f"sample count differs: ours={na} lr={nb}"
-    if na == 0:
-        if is_regular:
-            return False, "no samples in window (regular-rate stream should have data)"
-        return True, "no samples (both)"
+    ia = np.nonzero((tsa >= t0) & (tsa <= t1))[0]
+    ib = np.nonzero((tsb >= t0) & (tsb <= t1))[0]
+    if len(ia) == 0 and len(ib) == 0:
+        return (False, "no samples (regular-rate stream should have data)") if is_regular \
+               else (True, "no samples (both)")
 
+    common, ca, cb = np.intersect1d(tsa[ia], tsb[ib], return_indices=True)
+    unmatched = (len(ia) - len(common)) + (len(ib) - len(common))
+    if unmatched > allow_edge:
+        return False, f"timestamps differ: {unmatched} unmatched (ours={len(ia)} lr={len(ib)} shared={len(common)})"
+    if len(common) == 0:
+        return False, "no shared timestamps"
+
+    ai, bi = ia[ca], ib[cb]                                   # original indices of the shared samples
     da, db = a["time_series"], b["time_series"]
     is_str = isinstance(da, list) or (hasattr(da, "dtype") and da.dtype.kind in "OUS")
     if is_str:
-        va = [da[i] for i in np.nonzero(ma)[0]]
-        vb = [db[i] for i in np.nonzero(mb)[0]]
-        vals_ok = va == vb
+        vals_ok = [da[i] for i in ai] == [db[i] for i in bi]
     else:
-        vals_ok = np.array_equal(np.asarray(da)[ma], np.asarray(db)[mb])
+        vals_ok = np.array_equal(np.asarray(da)[ai], np.asarray(db)[bi])
     if not vals_ok:
-        return False, f"sample VALUES differ ({na} samples)"
-    if not np.allclose(tsa[ma], tsb[mb], atol=1e-6, rtol=0):
-        d = float(np.max(np.abs(tsa[ma] - tsb[mb])))
-        return False, f"timestamps differ (max {d:.2e}s, values OK)"
-    return True, f"{na} samples identical"
-
-
-def data_span(streams):
-    """[first, last] of the regular-rate streams' timestamps (where both recorders overlap)."""
-    los, his = [], []
-    for s in streams.values():
-        if float(s["info"]["nominal_srate"][0]) <= 0:
-            continue
-        ts = np.asarray(s["time_stamps"], dtype=float)
-        if ts.size > 1:
-            los.append(ts[0]); his.append(ts[-1])
-    return (max(los), min(his)) if los else (None, None)
+        return False, f"sample VALUES differ ({len(common)} shared samples)"
+    return True, f"{len(common)} samples identical" + (f" (+{unmatched} edge)" if unmatched else "")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--streams",
-                    default="eeg,sine,chirp,markers,evoked,drift,accel,audio,highdensity,mouse,fastmarkers")
+                    default="eeg,sine,chirp,markers,evoked,drift,accel,audio,highdensity,mouse,fastmarkers,flaky")
     ap.add_argument("--window", type=float, default=4.0, help="seconds per comparison window")
-    ap.add_argument("--cycles", type=int, default=2, help="number of start/stop windows to compare")
-    ap.add_argument("--gap", type=float, default=1.0, help="seconds between windows")
+    ap.add_argument("--cycles", type=int, default=2, help="number of windows compared per stream")
+    ap.add_argument("--clock-skew", type=float, default=2.0,
+                    help="per-stream constant timestamp OFFSET spread (s); the recorder must preserve it")
+    ap.add_argument("--clock-drift", type=float, default=1e-3,
+                    help="per-stream timestamp DRIFT/rate spread (fraction) — each clock ticks fast/slow")
     ap.add_argument("--keep", action="store_true", help="keep the temp XDFs")
     args = ap.parse_args()
 
@@ -211,38 +224,28 @@ def main():
 
     tmp = Path(tempfile.mkdtemp(prefix="lrcmp_"))
     ours_xdf, lr_xdf = str(tmp / "ours.xdf"), str(tmp / "lr.xdf")
-    connect_s, post_s = 5.0, 1.5     # generous so both recorders subscribe before the first 'start'
-    record_s = connect_s + args.cycles * args.window + (args.cycles - 1) * args.gap + post_s
+    connect_s, post_s = 5.0, 1.5     # generous so both recorders subscribe before recording matters
+    # long enough to also span a full flaky cycle (~8 s up / 3 s down) so the dropout is exercised
+    active_s = max(14.0, args.cycles * args.window + 2.0)
+    record_s = connect_s + active_s + post_s
 
     procs = []
     def spawn(cmd, **kw):
         p = subprocess.Popen(cmd, **kw); procs.append(p); return p
 
-    print(f"streams: {args.streams}\ncycles : {args.cycles} x {args.window:g}s windows\n")
+    print(f"streams: {args.streams}\nclock  : offset {args.clock_skew:g}s + drift {args.clock_drift:g}/s per stream"
+          f"   compare: {args.cycles} x {args.window:g}s/stream\n")
     mock = spawn([sys.executable, str(REPO / "tools" / "lsl_test_streams.py"),
-                  "--streams", args.streams])
-    time.sleep(3.0)   # let the outlets come up
-
-    ctl = StreamOutlet(StreamInfo("CompareControl", "Markers", 1, 0, "string", "cmp-ctl"))
-    time.sleep(0.5)
+                  "--streams", args.streams,
+                  "--clock-skew", str(args.clock_skew), "--clock-drift", str(args.clock_drift)])
+    time.sleep(3.5)   # let the outlets come up
 
     print("starting both recorders…")
     rec_ours = spawn([xdf_record, ours_xdf, "--seconds", str(record_s + 1.0), "--resolve-wait", "2.5"])
     rec_lr = spawn([lrcli, lr_xdf, "*"], stdin=subprocess.PIPE)   # stops on a newline
-    time.sleep(connect_s)            # both subscribe
-
-    # The windows are defined by the harness's local_clock at each start/stop push. All
-    # recorded timestamps live in that same clock domain, so both files window identically.
-    windows = []
-    for c in range(args.cycles):
-        ctl.push_sample(["start"]); w0 = local_clock()
-        time.sleep(args.window)
-        ctl.push_sample(["stop"]); w1 = local_clock()
-        windows.append((w0, w1))
-        print(f"  window {c + 1}: [{w0:.3f}, {w1:.3f}]")
-        if c < args.cycles - 1:
-            time.sleep(args.gap)
-    time.sleep(post_s)
+    # Each stream is compared against itself across the two recorders, so the comparison is
+    # skew-agnostic and needs no shared clock window — just let it record (incl. a flaky cycle).
+    time.sleep(connect_s + active_s + post_s)
 
     try:                             # LabRecorderCLI stops cleanly on a newline
         rec_lr.stdin.write(b"\n"); rec_lr.stdin.flush(); rec_lr.stdin.close()
@@ -255,12 +258,11 @@ def main():
     mock.send_signal(signal.SIGINT)
     try: mock.wait(timeout=5)
     except subprocess.TimeoutExpired: mock.kill()
-    del ctl
 
     ours, lr = load(ours_xdf), load(lr_xdf)
     print(f"\nours: {sorted(ours)}\nlr  : {sorted(lr)}")
-    names = sorted((set(ours) & set(lr)) - {"CompareControl"})
-    only = (set(ours) ^ set(lr)) - {"CompareControl"}
+    names = sorted(set(ours) & set(lr))
+    only = set(ours) ^ set(lr)
     if only:
         print(f"note: streams in only one recording: {sorted(only)}")
     if not names:
@@ -291,20 +293,36 @@ def main():
         print("  [PASS] all streams: timestamps non-decreasing, values finite")
     fails += vfails
 
-    # 4) sample-level data parity over each window (clamped to where both recorders overlap).
-    olo, ohi = data_span(ours); llo, lhi = data_span(lr)
-    if None in (olo, llo):
-        sys.exit("one recording has no regular-rate data")
-    lo, hi = max(olo, llo) + 0.05, min(ohi, lhi) - 0.05
-    print(f"\n-- data (overlap [{lo:.3f}, {hi:.3f}], {hi - lo:.2f}s) --")
+    # 4) skew preservation: with a skew set, the streams must land on distinct apparent clocks
+    #    (the recorder writes raw timestamps and never normalizes them across streams).
+    if args.clock_skew > 0:
+        firsts = [np.asarray(ours[n]["time_stamps"], float)[0]
+                  for n in names if np.asarray(ours[n]["time_stamps"], float).size]
+        spread = (max(firsts) - min(firsts)) if firsts else 0.0
+        ok = spread > args.clock_skew
+        print(f"\n-- skew (start-time spread across streams = {spread:.2f}s vs skew {args.clock_skew:g}s) --")
+        print(f"  [{'PASS' if ok else 'FAIL'}] per-stream clock offsets preserved")
+        fails += not ok
+
+    # 5) sample-level data parity. Each stream is compared against ITSELF across the two recorders
+    #    over its own [first, last] overlap (skew-agnostic), split into `cycles` windows.
+    print(f"\n-- data ({args.cycles} x {args.window:g}s window(s)/stream, exact match) --")
     for n in names:
-        is_regular = float(ours[n]["info"]["nominal_srate"][0]) > 0
+        flaky = "Flaky" in n                                  # disconnect/reconnect: gaps + boundary slack
+        is_regular = float(ours[n]["info"]["nominal_srate"][0]) > 0 and not flaky
+        ta = np.asarray(ours[n]["time_stamps"], float); tb = np.asarray(lr[n]["time_stamps"], float)
+        if ta.size == 0 or tb.size == 0:
+            print(f"  [FAIL] data {n:<18} empty in one recording"); fails += 1; continue
+        lo, hi = max(ta[0], tb[0]) + 0.05, min(ta[-1], tb[-1]) - 0.05
+        edge = 4 if flaky else 0
         results = []
-        for (w0, w1) in windows:
-            t0, t1 = max(w0, lo), min(w1, hi)
-            if t1 <= t0:
-                results.append((False, "window outside overlap")); continue
-            results.append(compare_window(ours[n], lr[n], t0, t1, is_regular))
+        if hi - lo < args.window:                             # short / irregular: one window over the overlap
+            results.append(compare_window(ours[n], lr[n], min(ta[0], tb[0]), max(ta[-1], tb[-1]), is_regular, edge))
+        else:
+            step = (hi - lo) / args.cycles
+            for c in range(args.cycles):
+                w0 = lo + c * step
+                results.append(compare_window(ours[n], lr[n], w0, min(w0 + args.window, lo + (c + 1) * step), is_regular, edge))
         ok = all(r[0] for r in results)
         detail = " | ".join(m for _, m in results)
         print(f"  [{'PASS' if ok else 'FAIL'}] data {n:<18} {detail}")
@@ -312,8 +330,8 @@ def main():
 
     if not args.keep:
         shutil.rmtree(tmp, ignore_errors=True)
-    print(f"\n{'OK' if fails == 0 else 'FAILED'}: {fails} check(s) failed across "
-          f"{len(names)} streams (structure + metadata + validity + {args.cycles} data windows)")
+    print(f"\n{'OK' if fails == 0 else 'FAILED'}: {fails} check(s) failed across {len(names)} streams "
+          f"(structure + metadata + validity + skew + dropout + {args.cycles} data windows/stream)")
     sys.exit(1 if fails else 0)
 
 
