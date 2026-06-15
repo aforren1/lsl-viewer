@@ -369,7 +369,10 @@ static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap) 
 // backing so the text stays legible; and hovering near a line shows a tooltip of the
 // event(s) there (with time) — handy where labels are too dense to all fit.
 // Call inside an active plot, after the data.
-static void drawMarkers(const std::vector<MarkerEvent>& evs) {
+// `contrast` is for drawing over a filled heatmap (the raster): a dim see-through line
+// vanishes against the colormap, so the line gets a black halo + opaque core (its hue is
+// kept, so per-label colors still read). On a normal trace it stays dim so data shows through.
+static void drawMarkers(const std::vector<MarkerEvent>& evs, bool contrast = false) {
     if (evs.empty()) return;
     const ImPlotRect lim = ImPlot::GetPlotLimits();
     ImDrawList*      dl  = ImPlot::GetPlotDrawList();
@@ -390,8 +393,14 @@ static void drawMarkers(const std::vector<MarkerEvent>& evs) {
         const float x = ImPlot::PlotToPixels(e.t, lim.Y.Max).x;
         const bool drewLine = (x - lastLine >= kCollapsePx);
         if (drewLine) {                       // collapse sub-3px clusters (caps the vertex budget)
-            const ImU32 lc = (e.col & 0x00FFFFFFu) | (110u << 24);   // dim so the trace shows
-            dl->AddLine(ImVec2(x, yTop), ImVec2(x, yBot), lc, 1.0f);
+            if (contrast) {                   // over a heatmap fill: black halo + opaque colored core
+                dl->AddLine(ImVec2(x, yTop), ImVec2(x, yBot), IM_COL32(0, 0, 0, 200), 3.0f);
+                const ImU32 lc = (e.col & 0x00FFFFFFu) | (235u << 24);
+                dl->AddLine(ImVec2(x, yTop), ImVec2(x, yBot), lc, 1.5f);
+            } else {
+                const ImU32 lc = (e.col & 0x00FFFFFFu) | (110u << 24);   // dim so the trace shows
+                dl->AddLine(ImVec2(x, yTop), ImVec2(x, yBot), lc, 1.0f);
+            }
             lastLine = x;
         }
         if (hov && !hit && std::abs(x - mx) <= 3.0f) hit = &e;
@@ -822,7 +831,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImPlot::PlotHeatmap("##r", sc.raster.data(), show, px, 0.0, 1.0, nullptr,
                                     ImPlotPoint(bMin, 0.0), ImPlotPoint(bMax, (double)show));
                 drawDropoutRed(s, 0.0, 0.0);
-                drawMarkers(sc.markers);
+                drawMarkers(sc.markers, /*contrast=*/true);   // over the heatmap fill
                 ImPlot::EndPlot();
                 ImGui::SameLine();
                 ImPlot::ColormapScale("p2p", 0.0, (double)o.gainUv, ImVec2(60, -1), "%.0f");
