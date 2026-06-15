@@ -2432,6 +2432,9 @@ int main(int argc, char** argv) {
                         ImPlot::SetupAxes("Hz", fftDb ? "dB" : "power",
                                           ImPlotAxisFlags_None,
                                           fftDb ? ImPlotAxisFlags_None : ImPlotAxisFlags_AutoFit);
+                        // Legend bottom-right: spectra peak at low Hz (left) and the dB floor sits
+                        // bottom-left, so the SE corner is the emptiest. User can still drag it.
+                        ImPlot::SetupLegend(ImPlotLocation_SouthEast);
                         // X axis: full 0..Nyquist by default. "Fit Hz" instead snaps it (once) to
                         // the band carrying energy — ImPlot's own AutoFit can't, since every PSD
                         // bin has a value and would just span the whole range. Uses last frame's
