@@ -4,6 +4,11 @@ A real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreamin
 
 ![Live scrolling EEG montage](docs/images/live.gif)
 
+
+## AI Note
+
+I used AI (Claude Opus 4.8) to help me develop this tool. Special thanks to the LSL, SDL, dear imgui/implot, spdlog, KISS FFT, and Tracy developers for developing such useful, important, and foundational tools and ecosystems.
+
 ---
 
 ## Features
