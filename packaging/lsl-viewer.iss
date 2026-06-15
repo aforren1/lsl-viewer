@@ -21,6 +21,7 @@ LicenseFile=..\LICENSE
 UninstallDisplayIcon={app}\{#MyAppExe}
 OutputDir=..
 OutputBaseFilename=lsl-viewer-setup
+SetupIconFile=lsl-viewer.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

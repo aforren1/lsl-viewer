@@ -1350,6 +1350,11 @@ int main(int argc, char** argv) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;  // drag windows together to dock
+    // Draw the mouse cursor ourselves (ImGui renders every shape from the font atlas) instead
+    // of relying on the OS cursors. The SDL3 text I-beam comes back blank on some setups (it
+    // went missing over text fields on both Windows and WSLg/Wayland); a software cursor is
+    // identical on every platform. Costs ~1 frame of cursor latency, imperceptible at 60 Hz.
+    io.MouseDrawCursor = true;
 
     // Data layout. Default: config/state (imgui.ini + saved workspaces) in the OS app-data dir
     // (AppData / Application Support / ~/.local/share), recordings under ~/Documents. Portable:

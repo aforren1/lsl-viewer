@@ -107,8 +107,11 @@ inline void MockStreams::run() {
     float eogFreq[N_EOG], eogPhase[N_EOG];
     for (int j = 0; j < N_EOG; ++j) { eogFreq[j] = uni(0.2f, 0.6f); eogPhase[j] = uni(0, TWO_PI); }
 
-    // ---- MockChirp: a 1 -> 120 Hz sawtooth sweep, continuous phase across chunks. --------
-    constexpr double CHIRP_SR = 1000.0, CHIRP_F0 = 1.0, CHIRP_F1 = 120.0, CHIRP_SWEEP = 8.0;
+    // ---- MockChirp: a 1 -> 40 Hz sawtooth sweep, continuous phase across chunks. The cap is
+    // kept modest so the time-series view stays legible (a pure tone of N Hz draws N cycles per
+    // second — sweeping to 120 Hz fills a 1 s window with a dense wall); the spectrogram still
+    // shows a clear diagonal sweep, which is what this stream is really for. --------------------
+    constexpr double CHIRP_SR = 1000.0, CHIRP_F0 = 1.0, CHIRP_F1 = 40.0, CHIRP_SWEEP = 8.0;
     stream_info chirpInfo("MockChirp", "Signal", 1, CHIRP_SR, lsl::cf_float32, "mock-chirp");
     chirpInfo.desc().append_child("channels").append_child("channel").append_child_value("label", "chirp");
     stream_outlet chirpOut(chirpInfo);
@@ -198,7 +201,7 @@ inline void MockStreams::run() {
                 const double u = std::fmod(t, CHIRP_SWEEP) / CHIRP_SWEEP;
                 const double finst = CHIRP_F0 + (CHIRP_F1 - CHIRP_F0) * u;
                 chirpPhase += TWO_PI * finst / CHIRP_SR;
-                buf[s] = 100.0f * float(std::sin(chirpPhase));
+                buf[s] = 40.0f * float(std::sin(chirpPhase));   // <90 so it fits the default lane (gainUv 150)
             }
             chirpPhase = std::fmod(chirpPhase, TWO_PI);
             chirpOut.push_chunk_multiplexed(buf, gridTs(want, CHIRP_SR));

@@ -182,6 +182,9 @@ add_executable(lsl_viewer src/main.cpp)
 target_include_directories(lsl_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lsl_viewer PRIVATE ui SDL3::SDL3 lsl spdlog::spdlog kissfft::kissfft)
 if(WIN32)
+  # Application icon: CMake compiles the .rc (rc.exe / windres) and links it in, so the
+  # exe carries its icon for the taskbar / Explorer / shortcuts. Path-relative to the .rc.
+  target_sources(lsl_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/packaging/lsl-viewer.rc)
   # VirtualAlloc2 / MapViewOfFile3 (magic_ring_buffer.hpp) live in onecore.lib;
   # ws2_32 = Winsock for the remote-control TCP server (remote_control.hpp).
   target_link_libraries(lsl_viewer PRIVATE onecore ws2_32)

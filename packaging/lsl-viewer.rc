@@ -1,0 +1,5 @@
+// Windows resource script: gives lsl_viewer.exe its application icon (taskbar, Explorer,
+// title bar, the installer/shortcut). ID 1 = the default application icon. The .ico is
+// generated from packaging/lsl-viewer.png by packaging/make_ico.py. Compiled into the exe
+// via CMakeLists (WIN32 only).
+1 ICON "lsl-viewer.ico"
