@@ -1296,12 +1296,20 @@ static char g_recDir[512]  = "";                          // output directory ("
 static char g_recTmpl[512] =
     "sub-{subject}/ses-{session}/{modality}/sub-{subject}_ses-{session}_task-{task}_run-{run}_{modality}.xdf";
 
+// Rewrite '/' to the OS-native separator ('\' on Windows, no-op on POSIX) so the recording-name
+// field reads naturally per platform. '/' is still accepted everywhere (recFullPath make_preferred's
+// the resolved path regardless); this is purely what the user sees in the template / default.
+static void toNativeSeparators(char* s) {
+    const char nat = (char)std::filesystem::path::preferred_separator;
+    for (; *s; ++s) if (*s == '/') *s = nat;
+}
+
 static void* SettingsReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char*) { return (void*)1; }
 static void SettingsReadLine(ImGuiContext*, ImGuiSettingsHandler*, void*, const char* line) {
     int v; char b[512];
     if      (std::sscanf(line, "light=%d", &v) == 1)        g_light = (v != 0);
     else if (std::sscanf(line, "recdir=%511[^\n]", b) == 1) std::snprintf(g_recDir,  sizeof(g_recDir),  "%s", b);
-    else if (std::sscanf(line, "rectmpl=%511[^\n]", b) == 1) std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", b);
+    else if (std::sscanf(line, "rectmpl=%511[^\n]", b) == 1) { std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", b); toNativeSeparators(g_recTmpl); }
 }
 static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBuffer* buf) {
     buf->appendf("[%s][State]\n", h->TypeName);
@@ -1413,6 +1421,7 @@ int main(int argc, char** argv) {
     // overrides it; clearing the field in the UI falls back to the working directory.
     if (g_recDir[0] == '\0' && !recDefault.empty())
         std::snprintf(g_recDir, sizeof g_recDir, "%s", recDefault.c_str());
+    toNativeSeparators(g_recTmpl);   // native separators in the default template (ini overrides keep their own)
     applyTheme(g_light);
     bool themeApplied = false;   // re-applied once after the ini loads (first NewFrame)
 
