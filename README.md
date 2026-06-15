@@ -126,8 +126,8 @@ The control endpoint is also advertised over LSL (type `ViewerControl`); resolve
 Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.23 (on Linux, also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ./build/lsl_viewer          # on WSL: ./run.sh
 
 # in another terminal, generate some synthetic streams to view:
