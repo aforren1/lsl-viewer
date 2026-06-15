@@ -133,8 +133,14 @@ inline void MockStreams::run() {
     stream_info evMarkInfo("MockEvokedMarkers", "Markers", 1, lsl::IRREGULAR_RATE, lsl::cf_string, "mock-evoked-markers");
     stream_outlet evMarkOut(evMarkInfo);
 
-    // ---- pacing: stamp each chunk with the time of its last sample; LSL derives the rest -
+    // ---- pacing: wall-clock decides HOW MANY samples are due, but each chunk is stamped on
+    // a regular nominal grid (start + index/srate) rather than the wall-clock `now` — LSL
+    // back-fills the rest, so timestamps are evenly spaced and continuous across chunk
+    // boundaries. (Stamping with `now` bunches/gaps samples at each boundary, which on a clean
+    // tone like the chirp reads as stair-steps.) Sample count tracks real time, so it doesn't
+    // drift. `gridTs(want, sr)` = the nominal timestamp of the chunk's last sample.
     const double start = lsl::local_clock();
+    auto gridTs = [&](long long want, double sr) { return start + double(want - 1) / sr; };
     long long eegN = 0, chirpN = 0, audioN = 0, evN = 0;
     struct Onset { long long sample; bool target; };
     std::vector<Onset> onsets;
@@ -179,7 +185,7 @@ inline void MockStreams::run() {
                         buf[(size_t)(r + i) * EEG_C + (EEG_C - N_EOG + j)] += 1200.0f * shape;
                 }
             }
-            eegOut.push_chunk_multiplexed(buf, now);
+            eegOut.push_chunk_multiplexed(buf, gridTs(want, EEG_SR));
             eegN = want;
         }
 
@@ -195,7 +201,7 @@ inline void MockStreams::run() {
                 buf[s] = 100.0f * float(std::sin(chirpPhase));
             }
             chirpPhase = std::fmod(chirpPhase, TWO_PI);
-            chirpOut.push_chunk_multiplexed(buf, now);
+            chirpOut.push_chunk_multiplexed(buf, gridTs(want, CHIRP_SR));
             chirpN = want;
         }
 
@@ -208,7 +214,7 @@ inline void MockStreams::run() {
                 buf[(size_t)s * 2 + 0] = 30.0f * float(std::sin(TWO_PI * 440.0 * t));
                 buf[(size_t)s * 2 + 1] = 30.0f * float(std::sin(TWO_PI * 660.0 * t));
             }
-            audioOut.push_chunk_multiplexed(buf, now);
+            audioOut.push_chunk_multiplexed(buf, gridTs(want, AUDIO_SR));
             audioN = want;
         }
 
@@ -235,7 +241,7 @@ inline void MockStreams::run() {
                 }
                 buf[s] = v;
             }
-            evOut.push_chunk_multiplexed(buf, now);
+            evOut.push_chunk_multiplexed(buf, gridTs(want, EV_SR));
             evN = want;
             const long long cutoff = evN - (long long)EV_SR;               // drop bumps now in the past
             onsets.erase(std::remove_if(onsets.begin(), onsets.end(),
