@@ -135,7 +135,10 @@ add_library(ui STATIC
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-  ${imgui_SOURCE_DIR}/imgui_demo.cpp
+  # imgui_demo.cpp deliberately omitted: nothing calls ShowDemoWindow/ShowStyleEditor/etc.
+  # (the Debug > Metrics window is ShowMetricsWindow, which lives in imgui.cpp). This doesn't
+  # change the binary (the linker already drops the unreferenced object from the static archive,
+  # and LTO eliminates it in shipping builds) — it just removes a ~5k-line TU from every build.
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp
   ${implot_SOURCE_DIR}/implot.cpp
@@ -222,8 +225,8 @@ if(LSL_TESTS)
 endif()
 
 # Link-time optimization for shipping builds — trims unreferenced library code
-# (measured ~45% smaller binary, mostly LTO dropping unused ImGui/ImPlot incl.
-# imgui_demo). Negligible runtime gain (the app is GPU-bound and the hot CPU code
+# (measured ~45% smaller binary, mostly LTO dropping unused ImGui/ImPlot; imgui_demo
+# is already omitted from the build above). Negligible runtime gain (the app is GPU-bound and the hot CPU code
 # is already header-only/single-TU). Enabled for Release, but NOT for the test
 # build (LSL_TESTS = the iteration loop) nor the default RelWithDebInfo dev build,
 # so iterative links stay fast.
