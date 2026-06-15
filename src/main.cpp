@@ -1433,32 +1433,40 @@ int main(int argc, char** argv) {
     //     normal (non-inverting) cursor, so it shows fine.
     //   - Repros identically in the upstream SDL_GPU and Win32+D3D12 examples; D3D11 is unaffected;
     //     unfocused windows fall back to DWM software composition so the I-beam reappears.
-    // SDL_GPU uses D3D12 on Windows, so we hit it. Fix: a custom ARGB (non-inverting) I-beam, which
-    // the overlay can draw. Hardware cursor, not io.MouseDrawCursor (the software cursor worked but
-    // perturbed frame timing).
+    // The fix is a custom ARGB (non-inverting) I-beam the overlay CAN draw — a hardware cursor,
+    // not io.MouseDrawCursor (the software cursor worked but perturbed frame timing). It's only
+    // built when the GPU backend is actually D3D12: SDL_GPU can also run Vulkan on Windows (and
+    // Vulkan/Metal elsewhere), none of which hit the overlay bug — there the native I-beam is fine.
     SDL_Cursor* iBeamCursor = nullptr;
-    {
-        const int W = 9, H = 16, cx = W / 2;  // ~matches the stock Windows I-beam at 100% DPI
-        // The white "ink" of an I-beam: top/bottom serifs + a 1px vertical stem, inset 1px so the
-        // outline has room on every edge. Outline = any transparent pixel touching ink, in black.
+    if (const char* drv = SDL_GetGPUDeviceDriver(gpu); drv && std::strcmp(drv, "direct3d12") == 0) {
+        // Base 9x16 shape (~the stock Windows I-beam at 100% DPI), then nearest-neighbor upscaled
+        // by the integer display scale so it isn't tiny on a HiDPI monitor. The white "ink" is the
+        // top/bottom serifs + a 1px stem, inset 1px so the 1px black outline has room every edge.
+        constexpr int BW = 9, BH = 16, cx = BW / 2;
         auto ink = [=](int x, int y) {
-            if (x < 1 || x >= W - 1 || y < 1 || y >= H - 1) return false;
-            if (y <= 2 || y >= H - 3) return (x >= cx - 2 && x <= cx + 2);  // serifs
-            return (x == cx);                                              // stem
+            if (x < 1 || x >= BW - 1 || y < 1 || y >= BH - 1) return false;
+            if (y <= 2 || y >= BH - 3) return (x >= cx - 2 && x <= cx + 2);  // serifs
+            return (x == cx);                                               // stem
         };
+        Uint32 base[BH][BW];
+        for (int y = 0; y < BH; ++y)
+            for (int x = 0; x < BW; ++x) {
+                Uint32 c = 0x00000000u;                 // transparent
+                if (ink(x, y)) c = 0xFFFFFFFFu;         // white core
+                else for (int dy = -1; dy <= 1 && !c; ++dy)
+                    for (int dx = -1; dx <= 1 && !c; ++dx)
+                        if (ink(x + dx, y + dy)) c = 0xFF000000u;  // black outline
+                base[y][x] = c;
+            }
+        const int scale = std::max(1, (int)std::lround(SDL_GetWindowDisplayScale(window)));
+        const int W = BW * scale, H = BH * scale;
         if (SDL_Surface* s = SDL_CreateSurface(W, H, SDL_PIXELFORMAT_RGBA32)) {
             Uint32* px = static_cast<Uint32*>(s->pixels);
             const int pitch = s->pitch / 4;
             for (int y = 0; y < H; ++y)
-                for (int x = 0; x < W; ++x) {
-                    Uint32 c = 0x00000000u;                 // transparent
-                    if (ink(x, y)) c = 0xFFFFFFFFu;         // white core
-                    else for (int dy = -1; dy <= 1 && !c; ++dy)
-                        for (int dx = -1; dx <= 1 && !c; ++dx)
-                            if (ink(x + dx, y + dy)) c = 0xFF000000u;  // black outline
-                    px[y * pitch + x] = c;
-                }
-            iBeamCursor = SDL_CreateColorCursor(s, cx, H / 2);  // hotspot at the stem centre
+                for (int x = 0; x < W; ++x)
+                    px[y * pitch + x] = base[y / scale][x / scale];   // crisp integer upscale
+            iBeamCursor = SDL_CreateColorCursor(s, cx * scale, (BH / 2) * scale);  // hotspot at the stem centre
             SDL_DestroySurface(s);
         }
     }
