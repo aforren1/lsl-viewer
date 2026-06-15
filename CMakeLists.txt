@@ -209,19 +209,6 @@ if(WIN32 AND NOT LSL_STATIC)
     COMMAND_EXPAND_LISTS)
 endif()
 
-# Tiny diagnostic: minimal ImGui+SDL3 window for the missing-text-cursor issue (no LSL deps).
-add_executable(cursor_test tools/cursor_test.cpp)
-target_link_libraries(cursor_test PRIVATE ui SDL3::SDL3)
-if(LSL_TESTS)
-  target_link_libraries(cursor_test PRIVATE imgui_te)  # ui has the test-engine hooks defined
-endif()
-if(WIN32 AND NOT LSL_STATIC)
-  add_custom_command(TARGET cursor_test POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_RUNTIME_DLLS:cursor_test> $<TARGET_FILE_DIR:cursor_test>
-    COMMAND_EXPAND_LISTS)
-endif()
-
 if(LSL_TRACY)
   target_compile_definitions(lsl_viewer PRIVATE LSL_TRACY)
   target_link_libraries(lsl_viewer PRIVATE Tracy::TracyClient)

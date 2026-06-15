@@ -1423,6 +1423,46 @@ int main(int argc, char** argv) {
     init_info.MSAASamples       = SDL_GPU_SAMPLECOUNT_1;
     ImGui_ImplSDLGPU3_Init(&init_info);
 
+    // Custom text cursor, to work around a D3D12-specific Windows bug (verified by building the
+    // stock Dear ImGui examples on each graphics backend — D3D12/SDL_GPU repro, D3D11 fine):
+    //   - The classic Windows I-beam (IDC_IBEAM) is an INVERTING/XOR cursor (no color of its own;
+    //     it inverts the pixels behind it).
+    //   - A D3D12 flip-model swapchain, while its window is focused, is promoted to a hardware
+    //     multi-plane overlay and the pointer is drawn by the hardware cursor plane — which can't
+    //     XOR-invert against overlay content, so the I-beam renders as nothing. The arrow is a
+    //     normal (non-inverting) cursor, so it shows fine.
+    //   - Repros identically in the upstream SDL_GPU and Win32+D3D12 examples; D3D11 is unaffected;
+    //     unfocused windows fall back to DWM software composition so the I-beam reappears.
+    // SDL_GPU uses D3D12 on Windows, so we hit it. Fix: a custom ARGB (non-inverting) I-beam, which
+    // the overlay can draw. Hardware cursor, not io.MouseDrawCursor (the software cursor worked but
+    // perturbed frame timing).
+    SDL_Cursor* iBeamCursor = nullptr;
+    {
+        const int W = 9, H = 16, cx = W / 2;  // ~matches the stock Windows I-beam at 100% DPI
+        // The white "ink" of an I-beam: top/bottom serifs + a 1px vertical stem, inset 1px so the
+        // outline has room on every edge. Outline = any transparent pixel touching ink, in black.
+        auto ink = [=](int x, int y) {
+            if (x < 1 || x >= W - 1 || y < 1 || y >= H - 1) return false;
+            if (y <= 2 || y >= H - 3) return (x >= cx - 2 && x <= cx + 2);  // serifs
+            return (x == cx);                                              // stem
+        };
+        if (SDL_Surface* s = SDL_CreateSurface(W, H, SDL_PIXELFORMAT_RGBA32)) {
+            Uint32* px = static_cast<Uint32*>(s->pixels);
+            const int pitch = s->pitch / 4;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    Uint32 c = 0x00000000u;                 // transparent
+                    if (ink(x, y)) c = 0xFFFFFFFFu;         // white core
+                    else for (int dy = -1; dy <= 1 && !c; ++dy)
+                        for (int dx = -1; dx <= 1 && !c; ++dx)
+                            if (ink(x + dx, y + dy)) c = 0xFF000000u;  // black outline
+                    px[y * pitch + x] = c;
+                }
+            iBeamCursor = SDL_CreateColorCursor(s, cx, H / 2);  // hotspot at the stem centre
+            SDL_DestroySurface(s);
+        }
+    }
+
 #ifdef LSL_TESTS
     const bool runTests = (argc > 1 && std::strcmp(argv[1], "--tests") == 0);
     // Optional filter: `--tests <query>` runs only matching tests (e.g. "ui/capture_*").
@@ -2966,6 +3006,10 @@ int main(int argc, char** argv) {
 #endif
             ImGui::Render();
         }
+        // Minimal fix: let the SDL backend manage every cursor as usual, but when it wants the
+        // (inverting, D3D12-invisible) text I-beam, swap in our custom non-inverting one.
+        if (iBeamCursor && ImGui::GetMouseCursor() == ImGuiMouseCursor_TextInput)
+            SDL_SetCursor(iBeamCursor);
         uiMs = pcSeconds(tUi0, SDL_GetPerformanceCounter()) * 1000.0;
 
         // ---- Render (two-stage: prepare BEFORE the render pass) ---------
@@ -3106,6 +3150,7 @@ int main(int argc, char** argv) {
     markerSources.clear();
 
     if (io.IniFilename) ImGui::SaveIniSettingsToDisk(io.IniFilename);  // persist theme/path on exit
+    if (iBeamCursor) SDL_DestroyCursor(iBeamCursor);
     ImGui_ImplSDL3_Shutdown();
     ImGui_ImplSDLGPU3_Shutdown();
     ImPlot::DestroyContext();
