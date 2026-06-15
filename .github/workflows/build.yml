@@ -138,6 +138,7 @@ jobs:
           mkdir dmgroot
           cp -R "$APP" dmgroot/
           ln -s /Applications dmgroot/Applications     # drag-to-install target
+          cp build/xdf_record dmgroot/                 # headless recorder CLI, beside the app
           cp LICENSE THIRD_PARTY_LICENSES dmgroot/
           hdiutil create -volname "LSL Viewer" -srcfolder dmgroot -ov -format UDZO LSL-Viewer.dmg
 
@@ -223,6 +224,64 @@ jobs:
           name: lsl-viewer-appimage-${{ matrix.arch }}
           if-no-files-found: error
           path: LSL-Viewer-${{ matrix.arch }}.AppImage
+
+  # Fully-static headless recorder. Built CLI-only (LSL_CLI_ONLY skips the GUI deps) against musl
+  # via zig as the C/C++ toolchain, then `-static` — so xdf_record has NO glibc / no shared-library
+  # dependencies and runs on any Linux (old glibc, Alpine/musl, containers) as a single file. The
+  # viewer can't be static (it needs the host's GPU driver + display libs at runtime), so it's not
+  # built here. Runs on a normal (glibc) runner so the checkout/upload actions work — zig cross-
+  # compiles to musl regardless of host.
+  xdf-record-musl:
+    name: xdf_record-linux-musl
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install zig
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          echo "ZIG=$PWD/zig-linux-x86_64-0.13.0/zig" >> "$GITHUB_ENV"
+      - name: Toolchain wrappers (zig as cc/c++/ar/ranlib targeting musl)
+        run: |
+          mkdir -p z
+          printf '#!/bin/sh\nexec "$ZIG" cc  -target x86_64-linux-musl "$@"\n' > z/zcc
+          printf '#!/bin/sh\nexec "$ZIG" c++ -target x86_64-linux-musl "$@"\n' > z/zxx
+          printf '#!/bin/sh\nexec "$ZIG" ar "$@"\n'     > z/zar
+          printf '#!/bin/sh\nexec "$ZIG" ranlib "$@"\n' > z/zranlib
+          chmod +x z/*
+      - name: Build (fully static, CLI only)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLSL_CLI_ONLY=ON -DLSL_STATIC=ON \
+            -DCMAKE_C_COMPILER="$PWD/z/zcc"   -DCMAKE_CXX_COMPILER="$PWD/z/zxx" \
+            -DCMAKE_AR="$PWD/z/zar"           -DCMAKE_RANLIB="$PWD/z/zranlib" \
+            -DCMAKE_C_COMPILER_AR="$PWD/z/zar"        -DCMAKE_CXX_COMPILER_AR="$PWD/z/zar" \
+            -DCMAKE_C_COMPILER_RANLIB="$PWD/z/zranlib" -DCMAKE_CXX_COMPILER_RANLIB="$PWD/z/zranlib" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          cmake --build build --target xdf_record --parallel
+          strip build/xdf_record
+      - name: Verify fully static
+        run: |
+          file build/xdf_record
+          ldd build/xdf_record || true        # expect: "not a dynamic executable"
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp build/xdf_record LICENSE THIRD_PARTY_LICENSES dist/
+      - name: Attest build provenance
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/xdf_record
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: xdf-record-linux-musl
+          if-no-files-found: error
+          path: dist/*
 
   # Recording conformance: record the mock streams with our headless recorder AND the real
   # LabRecorder (LabRecorderCLI) at once, and check the two XDFs hold identical data. Both

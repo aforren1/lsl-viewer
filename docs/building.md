@@ -11,14 +11,20 @@ grab them from the run's **Artifacts**:
 - `lsl-viewer-windows-installer` — **`lsl-viewer-setup.exe`**, an Inno Setup installer that
   drops the app into `Program Files` and uses the standard per-user locations.
 - `lsl-viewer-macos-dmg` — **`LSL-Viewer.dmg`**, a drag-to-Applications disk image with an
-  `LSL Viewer.app` bundle.
+  `LSL Viewer.app` bundle (and the `xdf_record` CLI alongside it).
 - `lsl-viewer-appimage-x86_64` / `lsl-viewer-appimage-aarch64` — a portable
   **`LSL-Viewer-<arch>.AppImage`** built on an older glibc and with **both X11 and Wayland**
   backends, so it runs across desktops and distros (the host still provides the GPU driver /
   Vulkan loader, as always for a GPU app).
+- `xdf-record-linux-musl` — the headless **`xdf_record`** recorder built **fully static against
+  musl** (CLI only; `-DLSL_CLI_ONLY=ON`). It has **no glibc and no shared-library dependencies**
+  (`ldd` says "not a dynamic executable"), so the single ~1.3 MB binary runs on **any** Linux —
+  ancient glibc, Alpine/musl, minimal containers — with nothing to install. The GUI viewer can't
+  be fully static (it needs the host's GPU driver + display libraries at runtime), which is why
+  only the recorder ships this way.
 
 The per-OS `lsl-viewer-linux` artifact is built on the latest Ubuntu (newer glibc); for
-broad Linux portability prefer the AppImage.
+broad Linux portability prefer the AppImage (viewer) or the musl `xdf_record` (recorder).
 
 None of the artifacts are code-signed, so first launch trips Gatekeeper on macOS
 (right-click → Open, or `xattr -dr com.apple.quarantine "LSL Viewer.app"`) and SmartScreen
@@ -92,6 +98,7 @@ uv run tests/compare_labrecorder.py        # all mock streams, incl. 48 kHz audi
 | `-DLSL_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]` |
 | `-DLSL_TRACY=ON`  | enable the [Tracy](https://github.com/wolfpld/tracy) frame profiler (connect the Tracy server to view) |
 | `-DLSL_STATIC=ON` | static-link SDL3 + liblsl into one self-contained binary (see below) |
+| `-DLSL_CLI_ONLY=ON` | build **only** the headless `xdf_record` (skip all GUI deps: SDL3/ImGui/ImPlot/KissFFT). With `-DLSL_STATIC=ON` + a musl toolchain + `-DCMAKE_EXE_LINKER_FLAGS=-static` → a fully-static recorder with no glibc/GPU deps |
 | `-DSDL_X11=OFF`   | Linux/WSL: build the Wayland backend only |
 
 There's also a lightweight built-in text profiler: run with `LSL_PROFILE=1` for a

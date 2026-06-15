@@ -13,6 +13,11 @@ endif()
 option(LSL_TRACY "Enable the Tracy frame profiler" OFF)
 option(LSL_TESTS "Build with the Dear ImGui Test Engine and UI tests" OFF)
 option(LSL_STATIC "Static-link SDL3 + liblsl (+ static MSVC CRT) into one self-contained binary" OFF)
+# CLI-only skips every GUI dependency (SDL3/ImGui/ImPlot/KissFFT) and builds just the headless
+# xdf_record. Combined with LSL_STATIC + -static it yields a fully-static recorder (no glibc/GPU
+# deps) — e.g. under musl/Alpine — that runs on any Linux. The viewer needs the GPU/display stack
+# and can't be fully static, so it's excluded here.
+option(LSL_CLI_ONLY "Build only the headless xdf_record CLI (no GUI deps)" OFF)
 
 # Static linking: fold SDL3 and liblsl into the executable so distribution is a
 # single file (no SDL3.dll/lsl.dll alongside; on Windows also no VC++ redist).
@@ -121,7 +126,11 @@ if(LSL_TESTS)
   )
 endif()
 
-FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog kissfft)
+if(LSL_CLI_ONLY)
+  FetchContent_MakeAvailable(liblsl spdlog)              # xdf_record only needs these
+else()
+  FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog kissfft)
+endif()
 if(LSL_TRACY)
   FetchContent_MakeAvailable(tracy)
 endif()
@@ -129,6 +138,7 @@ if(LSL_TESTS)
   FetchContent_MakeAvailable(imgui_test_engine)
 endif()
 
+if(NOT LSL_CLI_ONLY)
 # Build imgui core + SDL3/SDL_GPU backends + implot as one static lib.
 add_library(ui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
@@ -200,8 +210,10 @@ if(WIN32)
       COMMAND_EXPAND_LISTS)
   endif()
 endif()
+endif()  # NOT LSL_CLI_ONLY
 
-# Headless XDF recorder CLI (no GUI deps) — same Recorder/xdf_writer as the viewer.
+# Headless XDF recorder CLI (no GUI deps) — same Recorder/xdf_writer as the viewer. Always built;
+# the only target in an LSL_CLI_ONLY configure.
 add_executable(xdf_record tools/xdf_record.cpp)
 target_include_directories(xdf_record PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(xdf_record PRIVATE lsl spdlog::spdlog)
@@ -212,12 +224,12 @@ if(WIN32 AND NOT LSL_STATIC)
     COMMAND_EXPAND_LISTS)
 endif()
 
-if(LSL_TRACY)
+if(LSL_TRACY AND NOT LSL_CLI_ONLY)
   target_compile_definitions(lsl_viewer PRIVATE LSL_TRACY)
   target_link_libraries(lsl_viewer PRIVATE Tracy::TracyClient)
 endif()
 
-if(LSL_TESTS)
+if(LSL_TESTS AND NOT LSL_CLI_ONLY)
   target_sources(lsl_viewer PRIVATE tests/ui_tests.cpp)
   target_compile_definitions(lsl_viewer PRIVATE LSL_TESTS)
   target_link_libraries(lsl_viewer PRIVATE imgui_te)
@@ -230,7 +242,7 @@ endif()
 # is already header-only/single-TU). Enabled for Release, but NOT for the test
 # build (LSL_TESTS = the iteration loop) nor the default RelWithDebInfo dev build,
 # so iterative links stay fast.
-if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT LSL_TESTS)
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT LSL_TESTS AND NOT LSL_CLI_ONLY)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg LANGUAGES CXX)  # project is CXX-only
   if(_ipo_ok)
