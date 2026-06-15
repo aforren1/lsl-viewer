@@ -1036,11 +1036,13 @@ static void spectroReset(Spectro& sp, HfStreamSource& s) {
     constexpr double kTargetHop = 0.03;   // s/column target — small hop = fast columns = smooth scroll
     sp.psd.init(sp.nfft, (float)s.srate());
     sp.freqBins = sp.psd.bins();
-    // Y (frequency) range: seed to full 0..Nyquist on first init, else PRESERVE the user's
-    // zoom across resets (channel/NFFT change, Filtered toggle) — only clamp it to the new
-    // Nyquist (which can shrink on a stream switch). Avoids losing the Hz zoom on a toggle.
+    // Y (frequency) range: seed to full 0..Nyquist on first init AND whenever the stream
+    // changes (its Nyquist can differ wildly — 125 Hz EEG vs 24 kHz audio — so a preserved
+    // zoom would be meaningless). For same-stream resets (channel/NFFT change, Filtered
+    // toggle) PRESERVE the user's zoom, only clamping it to Nyquist.
     const float ny = (float)(s.srate() * 0.5);
-    if (sp.fMax <= 0.0f) { sp.fMin = 0.0f; sp.fMax = ny; }
+    const bool  streamChanged = (sp.uid != s.uid());     // sp.uid is still the previous stream here
+    if (sp.fMax <= 0.0f || streamChanged) { sp.fMin = 0.0f; sp.fMax = ny; }
     else { sp.fMin = std::clamp(sp.fMin, 0.0f, ny); sp.fMax = std::clamp(sp.fMax, sp.fMin, ny); }
     sp.yDirty = true;                                      // apply it on the next frame
     // Stride toward ~0.06 s columns regardless of sample rate, but never coarser
@@ -2097,6 +2099,7 @@ int main(int argc, char** argv) {
                     static double recPreviewAt = -1e18;
                     if (dueEvery(recPreviewAt, 0.25)) recPreview = recFullPath();
                     ImGui::TextDisabled("-> %s", recPreview.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(recPreview.c_str());
                     // Hold recording while a restored workspace is still missing streams, so a
                     // session can't quietly start short a stream (recording = every connected
                     // stream). Resolved by the streams connecting or dismissing the notice above.
@@ -2274,17 +2277,19 @@ int main(int argc, char** argv) {
                 // (chunky) newest data time, so the scroll doesn't snap per chunk.
                 double        edge       = 0.0;
                 std::uint64_t headFreeze = 0;             // 0 = live; set while paused
+                if (!paused && s->frozen()) s->unfreeze();   // pause ended -> back to the live ring
                 if (s->anchored()) {
                     auto it = edgeMap.find(s.get());
                     const double target = s->newestTime() - 0.15;  // slightly behind newest
                     const bool   stale  = s->staleSeconds() > 0.5;
                     if (paused) {
-                        // Freeze BOTH the edge and the data window so nothing scrolls or
-                        // gets pruned while paused.
+                        // Freeze the edge AND snapshot the data so nothing scrolls or scrolls
+                        // out of the (live, still-filling) ring while paused. freeze() also on a
+                        // stream that connects mid-pause. Reads anchor on the snapshot's head.
                         edge = (it != edgeMap.end()) ? it->second : target;
-                        if (justPaused) pauseHead[s.get()] = s->head();
-                        auto ph = pauseHead.find(s.get());
-                        headFreeze = (ph != pauseHead.end()) ? ph->second : s->head();
+                        if (!s->frozen()) s->freeze();
+                        pauseHead[s.get()] = s->snapHead();
+                        headFreeze = s->snapHead();
                     } else if (it == edgeMap.end()) {
                         edge = target;
                         edgeMap[s.get()] = edge;
@@ -2418,7 +2423,7 @@ int main(int argc, char** argv) {
                         psdFreq.resize(psd.bins());
                         for (int k = 0; k < psd.bins(); ++k) psdFreq[k] = psd.binHz(k);
                     }
-                    if (ImPlot::BeginPlot("##psd", ImVec2(-1, -1))) {
+                    if (ImPlot::BeginPlot("##psd", ImVec2(-1, -1), ImPlotFlags_NoMouseText)) {
                         // Fixed axes (re-fit only after a mode change, not every
                         // frame) so the spectrum doesn't jump; user can still zoom.
                         const ImPlotCond cond = fitCond(fftRefit);
@@ -2501,6 +2506,16 @@ int main(int argc, char** argv) {
                                 if (fftSel[c])
                                     ImPlot::PlotLine(labels[c].c_str(), psdFreq.data(),
                                                      fftCache.data() + (std::size_t)c * bins, bins);
+                        }
+                        // Cursor: a vertical line at the mouse frequency with the Hz value tagged
+                        // on the X axis — more useful on a spectrum than the raw "x, y" readout.
+                        if (ImPlot::IsPlotHovered()) {
+                            const double fx = ImPlot::GetPlotMousePos().x;
+                            const ImPlotRect lim = ImPlot::GetPlotLimits();
+                            ImPlot::GetPlotDrawList()->AddLine(
+                                ImPlot::PlotToPixels(fx, lim.Y.Max), ImPlot::PlotToPixels(fx, lim.Y.Min),
+                                IM_COL32(200, 200, 200, 130), 1.0f);
+                            ImPlot::TagX(fx, ImVec4(0.78f, 0.78f, 0.78f, 1.0f), "%.1f Hz", fx);
                         }
                         fftRefit = false;
                         ImPlot::EndPlot();

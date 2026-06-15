@@ -207,6 +207,21 @@ public:
         return (const float*)mem_.data() + off * channels_;
     }
 
+    // Copy another ring's full state into this one (for the pause snapshot: a frozen view that
+    // survives the live ring overwriting the same span). Same byte size -> same capacity, so
+    // absolute indices resolve identically; the head is copied too. Reading the live ring while
+    // the producer writes its newest samples can tear at the head, but the displayed window ends
+    // at that head, so any torn tail is off-screen — no lock needed (as elsewhere here).
+    void snapshotFrom(const InterleavedRing& src) {
+        if (channels_ != src.channels_ || mem_.bytes() != src.mem_.bytes()) {
+            channels_ = src.channels_;
+            mem_.allocate(src.mem_.bytes());
+            cap_samples_ = mem_.bytes() / ((std::size_t)channels_ * sizeof(float));
+        }
+        std::memcpy(mem_.data(), src.mem_.data(), src.mem_.bytes());
+        head_.store(src.head_.load(std::memory_order_acquire), std::memory_order_release);
+    }
+
 private:
     MagicRingBuffer            mem_;
     int                        channels_ = 0;

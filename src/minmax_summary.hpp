@@ -70,6 +70,15 @@ public:
         return n;
     }
 
+    // Copy another summary's committed-bin state (for the pause snapshot — read() only needs
+    // these). The open accumulators are irrelevant to readers, so they're left as-is.
+    void snapshotFrom(const MinMaxSummary& src) {
+        C_ = src.C_; B_ = src.B_; capB_ = src.capB_;
+        mn_ = src.mn_; mx_ = src.mx_;
+        binAbs_ = src.binAbs_;
+        closed_.store(src.closed_.load(std::memory_order_acquire), std::memory_order_release);
+    }
+
 private:
     void commit() {
         const std::size_t base = (std::size_t)(binAbs_ % capB_) * C_;

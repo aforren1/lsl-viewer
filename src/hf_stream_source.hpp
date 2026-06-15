@@ -155,10 +155,24 @@ public:
     void setRefChannel(int c)     { refChan_.store(c, std::memory_order_relaxed); }
 
     // --- live state (lock-free reads from the render thread) -----------------
-    InterleavedRing&     ring()       { return ring_; }       // raw full-rate
-    InterleavedRing&     ringHp()     { return ringHp_; }     // filter-chain full-rate (FFT/spectro/zoom)
-    MinMaxSummary&       summary()    { return summary_; }    // raw envelope
-    MinMaxSummary&       summaryHp()  { return summaryHp_; }  // filtered envelope
+    // While paused (frozen) these return the snapshot so the view survives the live ring
+    // overwriting the paused span; the producer keeps writing the live ring_ underneath.
+    InterleavedRing&     ring()       { return frozen() ? snapRing_     : ring_; }     // raw full-rate
+    InterleavedRing&     ringHp()     { return frozen() ? snapRingHp_   : ringHp_; }   // filter-chain (FFT/spectro/zoom)
+    MinMaxSummary&       summary()    { return frozen() ? snapSummary_  : summary_; }  // raw envelope
+    MinMaxSummary&       summaryHp()  { return frozen() ? snapSummaryHp_: summaryHp_; }// filtered envelope
+
+    // Pause snapshot control (render thread). freeze() copies the rings + summaries; snapHead()
+    // is the frozen head to anchor reads on (use it for the paused window's end index).
+    bool          frozen()  const { return frozen_.load(std::memory_order_acquire); }
+    std::uint64_t snapHead() const { return snapHead_; }
+    void freeze() {
+        snapRing_.snapshotFrom(ring_);       snapRingHp_.snapshotFrom(ringHp_);
+        snapSummary_.snapshotFrom(summary_); snapSummaryHp_.snapshotFrom(summaryHp_);
+        snapHead_ = snapRing_.head();        // the head captured into the snapshot
+        frozen_.store(true, std::memory_order_release);
+    }
+    void unfreeze() { frozen_.store(false, std::memory_order_release); }
     std::vector<float>&  chanGain()   { return chanGain_; }   // per-channel display gain
     std::vector<float>&  chanAmp()    { return chanAmp_; }    // measured µV amplitude
     bool          anchored() const { return anchored_.load(std::memory_order_acquire); }
@@ -554,6 +568,14 @@ private:
     InterleavedRing  ringHp_;      // filter-chain full-rate (parallel to ring_)
     MinMaxSummary    summary_;     // raw envelope
     MinMaxSummary    summaryHp_;   // filtered envelope
+
+    // Pause snapshot: a frozen copy of the rings + summaries, captured on pause. While frozen
+    // the read accessors below hand out these copies, so the paused plots stay put even after
+    // the producer (which keeps running) overwrites that span of the live ring.
+    InterleavedRing   snapRing_, snapRingHp_;
+    MinMaxSummary     snapSummary_, snapSummaryHp_;
+    std::atomic<bool> frozen_{false};
+    std::uint64_t     snapHead_ = 0;
 
     // Producer-only display filter chain: DC blocker (high-pass) -> notch -> low-pass.
     // Cutoffs/enables are read atomically (UI may change); biquad state is producer-only.
