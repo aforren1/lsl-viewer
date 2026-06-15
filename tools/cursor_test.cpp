@@ -100,6 +100,13 @@ int main(int, char**) {
                     io.MouseDrawCursor);
         ImGui::Text("SDL_CursorVisible() = %d", SDL_CursorVisible());
         ImGui::Text("SDL TEXT system cursor created: %s", text ? "yes (non-null)" : "NO (null!)");
+        // The active OS cursor. When hovering a text box this SHOULD be the TEXT cursor — if it
+        // is (and CursorVisible=1) but you still see no I-beam, SDL set a cursor the OS won't
+        // render; if it's NOT the TEXT cursor, the imgui_impl_sdl3 backend never applied it.
+        SDL_Cursor* active = SDL_GetCursor();
+        ImGui::Text("SDL_GetCursor() = %p   (== TEXT? %s   == Arrow? %s)", (void*)active,
+                    active == text ? "YES" : "no", active == arrow ? "YES" : "no");
+        ImGui::Text("SDL_GetDefaultCursor() = %p", (void*)SDL_GetDefaultCursor());
         ImGui::Text("SDL_GetCurrentVideoDriver() = %s", SDL_GetCurrentVideoDriver());
         ImGui::Separator();
 

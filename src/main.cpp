@@ -1493,7 +1493,9 @@ int main(int argc, char** argv) {
             if (d.back() != '/' && d.back() != '\\') d += '/';
             fn = d + fn;
         }
-        return fn;
+        // Normalize to the OS-native separator (backslashes on Windows) — the template and the
+        // dir join above use '/', which is valid but looks foreign in the preview / saved file.
+        return std::filesystem::path(fn).make_preferred().string();
     };
     PlotScratch scratch;
 
@@ -2507,15 +2509,26 @@ int main(int argc, char** argv) {
                                     ImPlot::PlotLine(labels[c].c_str(), psdFreq.data(),
                                                      fftCache.data() + (std::size_t)c * bins, bins);
                         }
-                        // Cursor: a vertical line at the mouse frequency with the Hz value tagged
-                        // on the X axis — more useful on a spectrum than the raw "x, y" readout.
+                        // Cursor: a vertical line at the mouse frequency + the Hz value as a
+                        // floating label — more useful on a spectrum than the raw "x, y" readout.
+                        // Drawn with the draw list (NOT ImPlot::TagX, which reserves axis padding
+                        // for the tag and so jitters the plot size as the cursor enters/leaves).
                         if (ImPlot::IsPlotHovered()) {
                             const double fx = ImPlot::GetPlotMousePos().x;
                             const ImPlotRect lim = ImPlot::GetPlotLimits();
-                            ImPlot::GetPlotDrawList()->AddLine(
-                                ImPlot::PlotToPixels(fx, lim.Y.Max), ImPlot::PlotToPixels(fx, lim.Y.Min),
-                                IM_COL32(200, 200, 200, 130), 1.0f);
-                            ImPlot::TagX(fx, ImVec4(0.78f, 0.78f, 0.78f, 1.0f), "%.1f Hz", fx);
+                            const ImVec2 top = ImPlot::PlotToPixels(fx, lim.Y.Max);
+                            const ImVec2 bot = ImPlot::PlotToPixels(fx, lim.Y.Min);
+                            ImDrawList* dl = ImPlot::GetPlotDrawList();
+                            dl->AddLine(top, bot, IM_COL32(200, 200, 200, 130), 1.0f);
+                            char hz[24]; std::snprintf(hz, sizeof hz, "%.1f Hz", fx);
+                            const ImVec2 sz = ImGui::CalcTextSize(hz);
+                            const float  pr = ImPlot::GetPlotPos().x + ImPlot::GetPlotSize().x;  // plot right edge (px)
+                            // label just right of the line near the top, flipping left near the edge
+                            const bool   left = top.x + 6.0f + sz.x > pr;
+                            const ImVec2 p(left ? top.x - 6.0f - sz.x : top.x + 6.0f, top.y + 3.0f);
+                            dl->AddRectFilled(ImVec2(p.x - 2, p.y - 1), ImVec2(p.x + sz.x + 2, p.y + sz.y + 1),
+                                              IM_COL32(0, 0, 0, 150));
+                            dl->AddText(p, IM_COL32(220, 220, 220, 255), hz);
                         }
                         fftRefit = false;
                         ImPlot::EndPlot();
