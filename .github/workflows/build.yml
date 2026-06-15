@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']        # vX.Y.Z -> build everything and publish a GitHub Release (see the `release` job)
   pull_request:
 
 # Cancel superseded runs on the same ref (e.g. force-pushes to a PR).
@@ -101,7 +102,10 @@ jobs:
       # the per-user locations. The portable .zip above is the no-install alternative.
       - name: Build Windows installer
         if: matrix.name == 'windows'
-        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\lsl-viewer.iss'
+        run: |
+          $ver = '${{ github.ref_name }}' -replace '^v', ''     # tag vX.Y.Z -> X.Y.Z
+          if ($ver -notmatch '^\d') { $ver = '0.1.0' }          # non-tag (branch) build -> default
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" packaging\lsl-viewer.iss
 
       - name: Attest installer provenance
         if: matrix.name == 'windows' && github.event_name == 'push' && github.event.repository.visibility == 'public'
@@ -135,6 +139,9 @@ jobs:
           cp build/lsl_viewer "$APP/Contents/MacOS/"
           cp packaging/Info.plist "$APP/Contents/"
           cp lsl_viewer.icns "$APP/Contents/Resources/"
+          ver="${GITHUB_REF_NAME#v}"; [[ "$ver" =~ ^[0-9] ]] || ver="0.1.0"   # tag vX.Y.Z -> X.Y.Z, else default
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $ver" \
+                                  -c "Set :CFBundleShortVersionString $ver" "$APP/Contents/Info.plist"
           mkdir dmgroot
           cp -R "$APP" dmgroot/
           ln -s /Applications dmgroot/Applications     # drag-to-install target
@@ -305,10 +312,10 @@ jobs:
           curl -fsSL -o /tmp/labrec.deb https://github.com/labstreaminglayer/App-LabRecorder/releases/download/v1.17.1/LabRecorder-1.17.0-noble_amd64.deb
           sudo apt-get install -y /tmp/labrec.deb
 
-      # Only the headless recorder is needed; --target skips building SDL/the viewer.
+      # Only the headless recorder is needed; LSL_CLI_ONLY skips configuring SDL/ImGui entirely.
       - name: Build xdf_record
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_X11=OFF
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLSL_CLI_ONLY=ON
           cmake --build build --target xdf_record --parallel
 
       - name: Install Python deps
@@ -320,3 +327,37 @@ jobs:
           printf '[lab]\nKnownPeers = {127.0.0.1}\n[multicast]\nResolveScope = link\n' > lsl_api.cfg
           export LSLAPICFG="$PWD/lsl_api.cfg" XDF_RECORD="$PWD/build/xdf_record"
           python3 tests/compare_labrecorder.py
+
+  # On a version tag (vX.Y.Z) gather every build artifact and publish them as a GitHub Release.
+  # Single-file artifacts (.dmg / installer .exe / .AppImage) attach directly; multi-file bundles
+  # (the portable per-OS folders, the musl recorder) are zipped first. Uses the gh CLI (first-party,
+  # always current on the runner) so there are no version-pinned third-party actions to break.
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, appimage, xdf-record-musl]      # the artifact producers (build runs the UI tests)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write                              # create the release + upload assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download this run's artifacts
+        run: gh run download "${{ github.run_id }}" --dir dl --repo "${{ github.repository }}"
+      - name: Assemble release assets
+        run: |
+          mkdir -p assets
+          for d in dl/*/; do
+            name="$(basename "$d")"
+            if [ "$(find "$d" -maxdepth 1 -type f | wc -l)" -eq 1 ]; then
+              cp "$d"/* assets/                                            # one file -> attach as-is
+            else
+              (cd "$d" && zip -qr "$GITHUB_WORKSPACE/assets/${name}.zip" .)  # bundle -> one .zip
+            fi
+          done
+          ls -la assets
+      - name: Publish release
+        run: |
+          TAG="${{ github.ref_name }}"
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --generate-notes assets/* \
+            || gh release upload "$TAG" --repo "${{ github.repository }}" --clobber assets/*
