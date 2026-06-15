@@ -183,13 +183,13 @@ public:
         return oldT + off;
     }
     // In-place old-frame -> real time for a monotonically increasing array.
-    void applyGaps(float* x, int n) const {
+    void applyGaps(double* x, int n) const {
         std::lock_guard<std::mutex> lk(gapMtx_);
         double off = gapBase_; std::size_t gi = 0;
         if (gaps_.empty() && off == 0.0) return;
         for (int i = 0; i < n; ++i) {
-            while (gi < gaps_.size() && gaps_[gi].first <= (double)x[i]) { off += gaps_[gi].second; ++gi; }
-            x[i] = (float)((double)x[i] + off);
+            while (gi < gaps_.size() && gaps_[gi].first <= x[i]) { off += gaps_[gi].second; ++gi; }
+            x[i] += off;
         }
     }
     // Snapshot of recorded dropouts as (old-frame time, seconds).

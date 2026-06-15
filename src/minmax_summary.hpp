@@ -51,7 +51,7 @@ public:
     // number of bins written. Pass a frozen endBin (e.g. head/B at pause) to keep
     // a paused view anchored instead of following new data.
     int read(int c, std::size_t bins, double dt, double t0,
-             float* x, float* mn, float* mx, std::uint64_t endBin = 0) const {
+             double* x, double* mn, double* mx, std::uint64_t endBin = 0) const {
         const std::uint64_t closed   = closed_.load(std::memory_order_acquire);
         const std::uint64_t end      = (endBin == 0 || endBin > closed) ? closed : endBin;
         const std::uint64_t resident = std::min<std::uint64_t>(closed, capB_ - 1); // guard slot
@@ -62,7 +62,7 @@ public:
         int n = 0;
         for (std::uint64_t k = first; k < end; ++k) {
             const std::size_t slot = (std::size_t)(k % capB_) * C_ + c;
-            x[n]  = (float)(t0 + dt * ((double)k * B_ + B_ * 0.5));
+            x[n]  = t0 + dt * ((double)k * B_ + B_ * 0.5);   // double: absolute LSL time
             mn[n] = mn_[slot];
             mx[n] = mx_[slot];
             ++n;

@@ -211,7 +211,11 @@ struct MarkerStreamView {
 
 // Reusable per-frame scratch so the plot path allocates nothing steady-state.
 struct PlotScratch {
-    std::vector<float>       x, mn, mx, y, mid;
+    // x is the time axis: it MUST be double. LSL timestamps are absolute local_clock seconds
+    // (tens of thousands of seconds and up), where float32's ~0.01 s resolution is coarser than
+    // a sample step — collapsing many samples onto one x and drawing the trace as a staircase.
+    // mn/mx/y share x's type because ImPlot's PlotLine/PlotShaded take one type for both axes.
+    std::vector<double>      x, mn, mx, y, mid;
     std::vector<double>      tvals;   // stacked-mode Y tick positions
     std::vector<const char*> tlabs;   // stacked-mode Y tick labels (-> tstr)
     std::vector<std::string> tstr;    // backing storage for tick labels
@@ -460,6 +464,11 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                        const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
     LSL_ZONE("drawStream");
     constexpr float kCfgWidth = 230.0f;
+    // Above this many visible line points (samples-in-view x channels) the stacked/overlay
+    // views fall back to the min/max envelope; below it they draw the raw trace (which looks
+    // better but costs a point per sample). ~200k keeps even a 32 ch x 10 s @ 500 Hz montage
+    // on the raw path while still capping audio / high-density streams.
+    constexpr double kRawPointBudget = 200000.0;
 
     const std::string err = s.error();
     if (!err.empty())
@@ -732,7 +741,6 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     const int    B  = s.binSamples();
     // Paused: anchor the summary read to the bin holding the frozen head.
     const std::uint64_t endBin = headFreeze ? headFreeze / (std::uint64_t)B : 0;
-    const double windowSamples = o.history * rate;
     const double viewSamples   = (o.history + 0.5) * rate;  // read past both edges
     // Show the conditioned (filtered) signal when ANY stage is enabled, else raw.
     const bool   filtered = o.highpass || o.notch || o.lowpass || (o.refMode != 0);
@@ -745,7 +753,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     // channel over the visible window. Used when zoomed in enough to resolve the
     // actual waveform — the min/max band can't (its midline is flat for signals
     // oscillating faster than a bin, e.g. a 40 Hz sine).
-    auto fillRaw = [&](int c, std::vector<float>& xs, std::vector<float>& ys) -> int {
+    auto fillRaw = [&](int c, std::vector<double>& xs, std::vector<double>& ys) -> int {
         // Read the pre-filtered ring when the display filter is on (full chain:
         // high-pass -> notch -> low-pass), else the raw ring. Both rings share indices
         // (written in lockstep), so no per-frame filtering or warm-up is needed.
@@ -757,7 +765,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         const int vis = (int)count;
         xs.resize(vis); ys.resize(vis);
         for (int j = 0; j < vis; ++j) ys[j] = p[(std::size_t)j * (std::size_t)C + c];
-        for (int j = 0; j < vis; ++j) xs[j] = (float)(t0 + (double)(start + (std::size_t)j) * dt);
+        for (int j = 0; j < vis; ++j) xs[j] = t0 + (double)(start + (std::size_t)j) * dt;  // double: absolute LSL time
         s.applyGaps(xs.data(), vis);
         return vis;
     };
@@ -872,7 +880,14 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
 
             const int    px     = std::max(64, (int)ImPlot::GetPlotSize().x);
             o.lastPlotPx = ImPlot::GetPlotSize().x;   // for next frame's edge snap
-            const bool   useEnv = windowSamples > 3.0 * (double)px;   // min/max band once samples overlap (>3/px)
+            // Raw-vs-envelope decision. Use the min/max band only when drawing the raw trace
+            // would be genuinely heavy: the visible point count (samples-in-view x channels)
+            // exceeds a budget. Below that, raw is cheap and looks far better — the coarse
+            // ~0.03 s band reads as a staircase for clean / low-frequency signals and a jagged
+            // ribbon for noise. The visible range (not the whole history) is what's measured, so
+            // zooming in also drops to raw. Live, the visible range == history.
+            const double visSamples = ImPlot::GetPlotLimits().X.Size() * rate;
+            const bool   useEnv = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
             const float  inv    = (o.gainUv > 0.0f) ? 1.0f / o.gainUv : 0.0f;
             const std::size_t bins = envelopeBins();
             for (int j = 0; j < show; ++j) {
@@ -936,7 +951,9 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
 
         const int    px     = std::max(64, (int)ImPlot::GetPlotSize().x);
         o.lastPlotPx = ImPlot::GetPlotSize().x;   // for next frame's edge snap
-        const bool   useEnv = windowSamples > 3.0 * (double)px;   // min/max band once samples overlap (>3/px)
+        // Same point-budget decision as the stacked branch (raw unless it'd be heavy).
+        const double visSamples = ImPlot::GetPlotLimits().X.Size() * rate;
+        const bool   useEnv = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
         const std::size_t bins = envelopeBins();
 
         for (int j = 0; j < show; ++j) {
@@ -1350,11 +1367,6 @@ int main(int argc, char** argv) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;  // drag windows together to dock
-    // Draw the mouse cursor ourselves (ImGui renders every shape from the font atlas) instead
-    // of relying on the OS cursors. The SDL3 text I-beam comes back blank on some setups (it
-    // went missing over text fields on both Windows and WSLg/Wayland); a software cursor is
-    // identical on every platform. Costs ~1 frame of cursor latency, imperceptible at 60 Hz.
-    io.MouseDrawCursor = true;
 
     // Data layout. Default: config/state (imgui.ini + saved workspaces) in the OS app-data dir
     // (AppData / Application Support / ~/.local/share), recordings under ~/Documents. Portable:
