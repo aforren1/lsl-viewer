@@ -26,6 +26,7 @@
 #include <SDL3/SDL.h>
 
 #include "hf_stream_source.hpp"
+#include "mock_streams.hpp"
 #include "recorder.hpp"
 #include "remote_control.hpp"
 #include <ctime>
@@ -1430,6 +1431,8 @@ int main(int argc, char** argv) {
 #endif
 
     Discovery discovery;   // resolves streams continuously in the background
+    MockStreams mockStreams;   // built-in demo: publishes synthetic streams on loopback
+    if (std::getenv("LSL_DEMO")) mockStreams.start();   // auto-emit on launch (also via the UI toggle)
     std::vector<std::unique_ptr<HfStreamSource>> sources;
     std::vector<std::unique_ptr<HfStreamSource>> closing;  // disconnected, awaiting worker exit
     std::vector<std::unique_ptr<MarkerSource>>   markerSources;  // string/event streams
@@ -1718,20 +1721,38 @@ int main(int argc, char** argv) {
                     ImGui::Separator();
                     const auto names = wsList();
                     if (names.empty()) ImGui::TextDisabled("(no saved workspaces)");
-                    for (const auto& n : names)
-                        if (ImGui::MenuItem(n.c_str())) wsLoad(n);   // load on click (applied next frame)
-                    if (!names.empty() && ImGui::BeginMenu("Delete")) {
-                        for (const auto& n : names) {
-                            std::error_code ec;
-                            if (ImGui::MenuItem(n.c_str())) std::filesystem::remove(wsDir / (n + ".lslws"), ec);
+                    // Each row: click the name to load (closes the menu); click the × to delete
+                    // in place (keeps the menu open so several can be pruned). The name column is
+                    // sized to the widest entry so the × buttons line up.
+                    float nameW = 0.0f;
+                    for (const auto& n : names) nameW = std::max(nameW, ImGui::CalcTextSize(n.c_str()).x);
+                    for (const auto& n : names) {
+                        ImGui::PushID(n.c_str());
+                        if (ImGui::Selectable(n.c_str(), false, ImGuiSelectableFlags_None, ImVec2(nameW, 0.0f))) {
+                            wsLoad(n); ImGui::CloseCurrentPopup();   // applied next frame
                         }
-                        ImGui::EndMenu();
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("\xc3\x97")) {        // × — delete this workspace
+                            std::error_code ec; std::filesystem::remove(wsDir / (n + ".lslws"), ec);
+                        }
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete \"%s\"", n.c_str());
+                        ImGui::PopID();
                     }
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("Debug")) {
                     ImGui::MenuItem("Performance", nullptr, &showPerf);   // a section in the Streams rail
                     if (ImGui::MenuItem("Metrics (ImGui)", nullptr, showMetrics)) { showMetrics = true; focusMetrics = true; wantBottom = true; }
+                    // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
+                    // (auto-connected below), so every view can be explored with no external source.
+                    const bool demo = mockStreams.running();
+                    if (ImGui::MenuItem("Emit demo streams", nullptr, demo)) {
+                        if (demo) { mockStreams.stop();  spdlog::info("demo streams stopped"); }
+                        else      { mockStreams.start(); spdlog::info("demo streams started"); }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->120 Hz chirp, a 48 kHz stereo\n"
+                                          "tone, and an evoked-response stream with markers.");
                     ImGui::Separator();
                     ImGui::TextDisabled("GPU backend: %s", SDL_GetGPUDeviceDriver(gpu));
                     ImGui::EndMenu();
@@ -1793,6 +1814,15 @@ int main(int argc, char** argv) {
             if (autoConnect)
                 for (auto& info : found)
                     if (!dismissed.count(streamKey(info)) && !connected(info))
+                        connectStream(info);
+
+            // Built-in demo: while it's emitting, auto-connect its own streams (source_id
+            // "mock-*") so one click both publishes and shows them — but still honor a manual
+            // disconnect (dismissed), so a row's X stays closed without fighting it.
+            if (mockStreams.running())
+                for (auto& info : found)
+                    if (info.source_id().rfind("mock-", 0) == 0 &&
+                        !dismissed.count(streamKey(info)) && !connected(info))
                         connectStream(info);
 
             // Workspace restore: connect each required stream the FIRST time it appears (once,

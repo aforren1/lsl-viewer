@@ -136,6 +136,8 @@ uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers,evoked
 
 Connect streams from the Streams rail (or set `LSL_AUTOCONNECT=1`).
 
+Pick **Debug -> Emit demo streams** (or launch with `LSL_DEMO=1`) to publish a built-in synthetic set and exercise every view: EEG with EOG, a 1→120 Hz chirp, a 48 kHz stereo tone, and an evoked-response stream with markers.
+
 ## Roadmap
 
 - Scalp topography (topomap): interpolated head map of amplitude / band power. Per-channel sensor positions are already parsed from stream metadata (so it is modality-agnostic: EEG/MEG/fNIRS), and the Info panel reports how many channels carry a layout.
