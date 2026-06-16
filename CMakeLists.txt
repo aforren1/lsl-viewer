@@ -1,11 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
 
-# Minimum macOS version (the floor SDL_GPU's Metal backend needs). MUST be set before project() so
-# it propagates to compiler detection + every FetchContent subproject (SDL3 included). Without it a
-# binary built on a newer CI runner inherits that runner's floor and won't launch on older macOS
-# ("requires a newer version"). Ignored off Apple. (Apple-silicon builds clamp up to 11.0 anyway —
-# arm64 didn't exist before macOS 11 — so 10.14 really only widens a future x86_64 / universal build.)
-set(CMAKE_OSX_DEPLOYMENT_TARGET "10.14" CACHE STRING "Minimum macOS version")
+# Minimum macOS version. MUST be set before project() so it propagates to compiler detection + every
+# FetchContent subproject (SDL3 included). Without it, a binary built on a newer CI runner inherits
+# that runner's floor and won't launch on older macOS ("requires a newer version"). Ignored off Apple.
+# 11.0 is the real floor: the CI arch is arm64 (which didn't exist before macOS 11), AND C++17
+# std::filesystem is weak-linked / unavailable below 10.15 (recorder.hpp's path() needs it). SDL_GPU's
+# Metal backend is fine well below both, so it's not the binding constraint despite the name.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 
 project(lsl_viewer CXX)
 

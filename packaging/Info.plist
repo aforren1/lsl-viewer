@@ -19,7 +19,7 @@
     <key>CFBundleIconFile</key>
     <string>lsl_viewer</string>
     <key>LSMinimumSystemVersion</key>
-    <string>10.14</string>
+    <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
