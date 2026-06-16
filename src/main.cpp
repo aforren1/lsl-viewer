@@ -1358,9 +1358,14 @@ int main(int argc, char** argv) {
     SDL_Window* window = SDL_CreateWindow("LSL Stream Viewer", winW, winH, wflags);
     if (!window) { spdlog::critical("SDL_CreateWindow: {}", SDL_GetError()); return 1; }
 
+    // NOTE: MSL but deliberately NOT METALLIB. The Dear ImGui SDL_GPU backend prefers its
+    // precompiled .metallib shaders whenever the device advertises METALLIB — and those are built
+    // for MSL 3.1, which needs macOS 14+ (on macOS 13 the pipeline fails: "language version 3.1
+    // incompatible with this OS", then the draw asserts "Graphics pipeline not found"). Advertising
+    // only MSL makes the backend ship MSL *source* that SDL compiles at runtime to the device's
+    // version, restoring macOS 11+ support. (Metal-only concern; SPIRV/DXIL drive Vulkan/D3D12.)
     SDL_GPUDevice* gpu = SDL_CreateGPUDevice(
-        SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL |
-        SDL_GPU_SHADERFORMAT_MSL  | SDL_GPU_SHADERFORMAT_METALLIB,
+        SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL,
         gpuDebug, nullptr);
     if (!gpu) { spdlog::critical("SDL_CreateGPUDevice: {}", SDL_GetError()); return 1; }
 
