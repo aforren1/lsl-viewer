@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
+
+# Minimum macOS version (the floor SDL_GPU's Metal backend needs). MUST be set before project() so
+# it propagates to compiler detection + every FetchContent subproject (SDL3 included). Without it a
+# binary built on a newer CI runner inherits that runner's floor and won't launch on older macOS
+# ("requires a newer version"). Ignored off Apple. (Apple-silicon builds clamp up to 11.0 anyway —
+# arm64 didn't exist before macOS 11 — so 10.14 really only widens a future x86_64 / universal build.)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "10.14" CACHE STRING "Minimum macOS version")
+
 project(lsl_viewer CXX)
 
 set(CMAKE_CXX_STANDARD 20)

@@ -104,7 +104,7 @@ jobs:
         if: matrix.name == 'windows'
         run: |
           $ver = '${{ github.ref_name }}' -replace '^v', ''     # tag vX.Y.Z -> X.Y.Z
-          if ($ver -notmatch '^\d') { $ver = '0.1.0' }          # non-tag (branch) build -> default
+          if ($ver -notmatch '^\d') { $ver = '0.0.0' }          # non-tag (branch) build -> obvious 0.0.0
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" packaging\lsl-viewer.iss
 
       - name: Attest installer provenance
@@ -139,7 +139,7 @@ jobs:
           cp build/lsl_viewer "$APP/Contents/MacOS/"
           cp packaging/Info.plist "$APP/Contents/"
           cp lsl_viewer.icns "$APP/Contents/Resources/"
-          ver="${GITHUB_REF_NAME#v}"; [[ "$ver" =~ ^[0-9] ]] || ver="0.1.0"   # tag vX.Y.Z -> X.Y.Z, else default
+          ver="${GITHUB_REF_NAME#v}"; [[ "$ver" =~ ^[0-9] ]] || ver="0.0.0"   # tag vX.Y.Z -> X.Y.Z, else obvious 0.0.0
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $ver" \
                                   -c "Set :CFBundleShortVersionString $ver" "$APP/Contents/Info.plist"
           mkdir dmgroot
