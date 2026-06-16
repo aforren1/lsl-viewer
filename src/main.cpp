@@ -128,6 +128,22 @@ static double pcSeconds(Uint64 a, Uint64 b) {
     return (double)(b - a) / (double)SDL_GetPerformanceFrequency();
 }
 
+// ImPlot tick formatter for the absolute-time (LSL clock) x-axis. LSL timestamps run large
+// (lsl_local_clock is uptime-based — easily 1e5+ on a machine that's been up a while, and macOS
+// starts higher than a fresh Linux boot), which ImPlot's default "%g" renders as "1.2e5". Force
+// fixed-point and trim trailing zeros so a 0.5 s grid reads "523456.5", not "523456.500" or "5.2e5".
+static int fmtTimeAxis(double value, char* buff, int size, void*) {
+    int n = snprintf(buff, size, "%.3f", value);
+    if (n <= 0 || n >= size) return n;
+    bool hasDot = false;
+    for (int i = 0; i < n; ++i) if (buff[i] == '.') { hasDot = true; break; }
+    if (hasDot) {
+        while (n > 0 && buff[n - 1] == '0') buff[--n] = '\0';
+        if (n > 0 && buff[n - 1] == '.') buff[--n] = '\0';
+    }
+    return n;
+}
+
 // Is this connected source the same stream as `info`? Prefer source_id (globally
 // unique and stable across reconnects) so a reconnected stream — which gets a new
 // uid — isn't treated as a brand-new stream and double-connected. Templated so it
@@ -792,6 +808,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImPlot::BeginPlot("##plot", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+            ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
             if (followX)
                 ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)show, ImPlotCond_Always);
@@ -857,6 +874,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+            ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
             if (followX)
                 ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, -0.6, (double)show - 0.4, ImPlotCond_Always);
@@ -945,6 +963,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         // FREE so the mouse can zoom/pan the amplitude axis (double-click re-fits).
         const ImPlotAxisFlags yf = o.overlayYFit ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
         ImPlot::SetupAxes("time (s)", streamUnit, ImPlotAxisFlags_None, yf);
+        ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
         o.overlayYFit = false;
         if (followX)
             ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
@@ -1358,12 +1377,13 @@ int main(int argc, char** argv) {
     SDL_Window* window = SDL_CreateWindow("LSL Stream Viewer", winW, winH, wflags);
     if (!window) { spdlog::critical("SDL_CreateWindow: {}", SDL_GetError()); return 1; }
 
-    // NOTE: MSL but deliberately NOT METALLIB. The Dear ImGui SDL_GPU backend prefers its
-    // precompiled .metallib shaders whenever the device advertises METALLIB — and those are built
-    // for MSL 3.1, which needs macOS 14+ (on macOS 13 the pipeline fails: "language version 3.1
-    // incompatible with this OS", then the draw asserts "Graphics pipeline not found"). Advertising
-    // only MSL makes the backend ship MSL *source* that SDL compiles at runtime to the device's
-    // version, restoring macOS 11+ support. (Metal-only concern; SPIRV/DXIL drive Vulkan/D3D12.)
+    // We want the ImGui backend to use MSL on Metal (not its macOS-14-only .metallib, built for
+    // MSL 3.1) so the viewer runs on macOS 11+. NB: these flags alone don't achieve that — SDL's
+    // Metal backend ignores the requested formats and always advertises MSL|METALLIB, and the ImGui
+    // backend then prefers the metallib (pipeline fails on macOS 13: "language version 3.1
+    // incompatible with this OS" → draw asserts "Graphics pipeline not found"). The real steer is
+    // cmake/patch_imgui_msl.cmake, which patches the backend to prefer MSL; we request MSL here to
+    // match that intent. (Metal-only concern; SPIRV drives Vulkan, DXIL drives D3D12.)
     SDL_GPUDevice* gpu = SDL_CreateGPUDevice(
         SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL,
         gpuDebug, nullptr);
@@ -2790,6 +2810,7 @@ int main(int argc, char** argv) {
                         ImPlot::PushColormap(ImPlotColormap_Viridis);
                         if (ImPlot::BeginPlot("##spectro", ImVec2(-70, -1))) {
                             ImPlot::SetupAxes("time (s)", "Hz");
+                            ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
                             if (!paused)   // live: follow the scroll; paused: free to pan/zoom the frozen view
                                 ImPlot::SetupAxisLimits(ImAxis_X1, viewX0, viewNewest, ImPlotCond_Always);
                             // Y range is the user's freq window (control or mouse-zoom). Force it

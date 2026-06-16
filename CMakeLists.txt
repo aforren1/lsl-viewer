@@ -84,6 +84,9 @@ FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
   GIT_TAG        docking
   GIT_SHALLOW    TRUE
+  # Force the SDL_GPU backend to use MSL source instead of its macOS-14-only .metallib, so the
+  # viewer renders on macOS 11–13. See cmake/patch_imgui_msl.cmake for the full why.
+  PATCH_COMMAND  ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_imgui_msl.cmake
 )
 
 # --- ImPlot -----------------------------------------------------------------
