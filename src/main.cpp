@@ -1823,7 +1823,7 @@ int main(int argc, char** argv) {
                         else      { mockStreams.start(); spdlog::info("demo streams started"); }
                     }
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->120 Hz chirp, a 48 kHz stereo\n"
+                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->40 Hz chirp, a 48 kHz stereo\n"
                                           "tone, and an evoked-response stream with markers.");
                     ImGui::Separator();
                     if (ImGui::MenuItem("Light theme", nullptr, &g_light)) {
