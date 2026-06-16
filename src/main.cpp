@@ -1815,6 +1815,17 @@ int main(int argc, char** argv) {
             if (ImGui::BeginMainMenuBar()) {
                 if (ImGui::BeginMenu("App")) {
                     ImGui::MenuItem("Pause", "P", &paused);
+                    // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
+                    // (auto-connected below) so a newcomer can explore every view with no external source.
+                    const bool demo = mockStreams.running();
+                    if (ImGui::MenuItem("Emit demo streams", nullptr, demo)) {
+                        if (demo) { mockStreams.stop();  spdlog::info("demo streams stopped"); }
+                        else      { mockStreams.start(); spdlog::info("demo streams started"); }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->120 Hz chirp, a 48 kHz stereo\n"
+                                          "tone, and an evoked-response stream with markers.");
+                    ImGui::Separator();
                     if (ImGui::MenuItem("Light theme", nullptr, &g_light)) {
                         applyTheme(g_light); ImGui::MarkIniSettingsDirty();
                     }
@@ -1896,16 +1907,6 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginMenu("Debug")) {
                     ImGui::MenuItem("Performance", nullptr, &showPerf);   // a section in the Streams rail
                     if (ImGui::MenuItem("Metrics (ImGui)", nullptr, showMetrics)) { showMetrics = true; focusMetrics = true; wantBottom = true; }
-                    // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
-                    // (auto-connected below), so every view can be explored with no external source.
-                    const bool demo = mockStreams.running();
-                    if (ImGui::MenuItem("Emit demo streams", nullptr, demo)) {
-                        if (demo) { mockStreams.stop();  spdlog::info("demo streams stopped"); }
-                        else      { mockStreams.start(); spdlog::info("demo streams started"); }
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->120 Hz chirp, a 48 kHz stereo\n"
-                                          "tone, and an evoked-response stream with markers.");
                     ImGui::Separator();
                     ImGui::TextDisabled("GPU backend: %s", SDL_GetGPUDeviceDriver(gpu));
                     ImGui::EndMenu();

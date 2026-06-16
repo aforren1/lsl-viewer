@@ -141,7 +141,7 @@ uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers,evoked
 
 Connect streams from the Streams rail (or set `LSL_AUTOCONNECT=1`).
 
-Pick **Debug -> Emit demo streams** (or launch with `LSL_DEMO=1`) to publish a built-in synthetic set and exercise every view: EEG with EOG, a 1→40 Hz chirp, a 48 kHz stereo tone, and an evoked-response stream with markers.
+Pick **App -> Emit demo streams** (or launch with `LSL_DEMO=1`) to publish a built-in synthetic set and exercise every view: EEG with EOG, a 1→40 Hz chirp, a 48 kHz stereo tone, and an evoked-response stream with markers.
 
 ## Roadmap
 
