@@ -10,16 +10,13 @@
 #include <SDL3/SDL.h>
 #include <cmath>
 
-// User-facing UI scale (persisted in imgui.ini as `scale=`). macOS renders DPI-independent
-// "points", which run physically larger than this app's sizing elsewhere, so the default is
-// smaller there; a loaded ini value overrides it. Applied in applyTheme() via style.FontScaleMain
-// (fonts) + ScaleAllSizes (paddings/borders). Retina/DPI crispness is automatic: ImGui 1.92's
-// dynamic atlas rasterizes at the backend-provided framebuffer density, so no manual DPI factor.
-#ifdef __APPLE__
-inline float g_uiScale = 0.75f;
-#else
+// User-facing UI scale (persisted in imgui.ini as `scale=`). Defaults to 1.0 on every platform —
+// like most cross-platform apps we let the OS handle DPI rather than baking in a per-OS scale, and
+// retina/DPI crispness is automatic (ImGui 1.92's dynamic atlas rasterizes at the backend-provided
+// framebuffer density, no manual factor). Applied in applyTheme() via style.FontScaleMain (fonts) +
+// ScaleAllSizes (paddings/borders); a loaded ini value overrides it, and the user can adjust it from
+// the App menu.
 inline float g_uiScale = 1.0f;
-#endif
 
 // Scale a hard-coded pixel size by the UI scale. ScaleAllSizes (paddings/borders) and FontScaleMain
 // (fonts) cover the style + text automatically, but raw pixel literals passed to layout calls —
