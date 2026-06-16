@@ -126,6 +126,18 @@ def fetch(rc, dest):
 
 The control endpoint is also advertised over LSL (type `ViewerControl`); resolve it to get the host and the port (encoded in `source_id` as `lsl-viewer-rc:<port>`) instead of hard-coding `22345`. `nc localhost 22345` works for poking at it by hand.
 
+## System requirements
+
+The viewer renders through **SDL_GPU** (SDL3's GPU abstraction), so it needs a GPU and driver supporting one of SDL_GPU's backends, plus a desktop display server. It is otherwise light-- a few hundred MB of RAM and any modern multi-core CPU.
+
+- **Windows:** Windows 10 or later (64-bit) with a **Direct3D 12**-capable GPU/driver. (SDL_GPU will use Vulkan instead if it is present.)
+- **macOS:** macOS 11 (Big Sur) or later on a **Metal**-capable Mac, i.e. Apple Silicon or an Intel Mac with a Metal GPU. The `.app`/`.dmg` is unsigned, so the first launch is right-click -> **Open**.
+- **Linux:** a **Vulkan** loader and driver (`libvulkan` plus an ICD for your GPU) and **Wayland or X11**. The AppImage is the easiest way to run across distributions.
+
+**Network:** LSL discovers and reads streams over the local network (UDP multicast to resolve, TCP to stream), so sources must be reachable on the same subnet and the viewer may need to be allowed through the firewall.
+
+**Headless recorder:** `xdf_record` has none of the GPU/display requirements — it links only liblsl, and the musl-static Linux build runs on any Linux.
+
 ## Quick start
 
 Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.23 (on Linux, also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
