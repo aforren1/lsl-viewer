@@ -65,9 +65,11 @@ set(SDL_HAPTIC   OFF CACHE BOOL "" FORCE)
 set(SDL_HIDAPI   OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR   OFF CACHE BOOL "" FORCE)
 set(SDL_POWER    OFF CACHE BOOL "" FORCE)
-# The viewer never synthesizes input or warps the mouse globally, so it doesn't need the
-# X11 XTest extension. Turning it off drops the libXtst build dependency on Linux. (The
-# other X11 extensions SDL checks are kept; they cover normal windowing.)
+# The viewer warps the cursor only *within* its own window (the UI-scale steppers, via
+# SDL_WarpMouseInWindow) and never synthesizes input or warps globally, so it doesn't need the X11
+# XTest extension: SDL's X11_WarpMouse falls back to core XWarpPointer when XTest is compiled out.
+# Turning it off drops the libXtst build dependency on Linux. (Other X11 extensions SDL checks are
+# kept; they cover normal windowing.)
 set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
 
 # --- liblsl -----------------------------------------------------------------

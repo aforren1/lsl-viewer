@@ -10,6 +10,24 @@
 #include <SDL3/SDL.h>
 #include <cmath>
 
+// User-facing UI scale (persisted in imgui.ini as `scale=`). macOS renders DPI-independent
+// "points", which run physically larger than this app's sizing elsewhere, so the default is
+// smaller there; a loaded ini value overrides it. Applied in applyTheme() via style.FontScaleMain
+// (fonts) + ScaleAllSizes (paddings/borders). Retina/DPI crispness is automatic: ImGui 1.92's
+// dynamic atlas rasterizes at the backend-provided framebuffer density, so no manual DPI factor.
+#ifdef __APPLE__
+inline float g_uiScale = 0.75f;
+#else
+inline float g_uiScale = 1.0f;
+#endif
+
+// Scale a hard-coded pixel size by the UI scale. ScaleAllSizes (paddings/borders) and FontScaleMain
+// (fonts) cover the style + text automatically, but raw pixel literals passed to layout calls —
+// panel/rail widths, initial window sizes, fixed item widths, plot label-reserve margins — do not.
+// Wrap those in uiScaled(). Do NOT wrap values already derived from text metrics (CalcTextSize) or
+// style fields (ItemSpacing): those are scaled once already and would compound.
+inline float uiScaled(float px) { return px * g_uiScale; }
+
 // Apply a light or dark theme to both ImGui and ImPlot, plus shared style polish.
 inline void applyTheme(bool light) {
     if (light) { ImGui::StyleColorsLight(); ImPlot::StyleColorsLight(); }
@@ -128,20 +146,23 @@ inline void applyTheme(bool light) {
     s.FramePadding      = ImVec2(7, 4);
     s.ItemSpacing       = ImVec2(8, 5);
     s.AntiAliasedLinesUseTex = true;          // texture AA = fewer line vertices
+
+    // Apply the UI scale: FontScaleMain scales every font (1.92 re-rasterizes crisply at the new
+    // size), ScaleAllSizes grows/shrinks paddings, rounding, borders, spacing. Both run last on the
+    // freshly-reset base values above, so re-calling applyTheme() after a scale change is idempotent
+    // rather than compounding. (DPI density stays automatic — it's orthogonal to FontScaleMain.)
+    s.FontScaleMain = g_uiScale;
+    s.ScaleAllSizes(g_uiScale);
 }
 
-// Embedded Roboto-Regular (the face Tracy uses) rasterized at the framebuffer pixel
-// size for crisp HiDPI text, then drawn at logical size via FontGlobalScale.
-// Embedding (vs a system font path) keeps text identical on every platform — and
-// works in a static single-file build with no assets.
-inline void loadEmbeddedFont(ImGuiIO& io, SDL_Window* window) {
-    int lw = 0, lh = 0, pw = 0, ph = 0;
-    SDL_GetWindowSize(window, &lw, &lh);
-    SDL_GetWindowSizeInPixels(window, &pw, &ph);
-    const float fb = (lw > 0) ? (float)pw / (float)lw : 1.0f;
+// Embedded Roboto-Regular (the face Tracy uses), loaded at its natural logical size. ImGui 1.92's
+// dynamic font atlas rasterizes on demand at the display's framebuffer density (the SDL3 backend
+// feeds it via DisplayFramebufferScale / Platform_GetWindowFramebufferScale), so retina stays crisp
+// automatically — no manual DPI pre-scaling. Global UI scale rides on style.FontScaleMain (see
+// applyTheme). Embedding (vs a system font path) keeps text identical everywhere and works in a
+// static single-file build with no assets.
+inline void loadEmbeddedFont(ImGuiIO& io) {
     ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 1;
     io.Fonts->AddFontFromMemoryCompressedTTF(
-        RobotoRegular_compressed_data, RobotoRegular_compressed_size,
-        std::round(15.0f * fb), &cfg);
-    io.FontGlobalScale = 1.0f / fb;
+        RobotoRegular_compressed_data, RobotoRegular_compressed_size, 15.0f, &cfg);
 }

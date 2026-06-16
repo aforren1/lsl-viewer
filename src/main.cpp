@@ -144,6 +144,18 @@ static int fmtTimeAxis(double value, char* buff, int size, void*) {
     return n;
 }
 
+// Warp the OS cursor to the center of the last-submitted ImGui item. Used to keep a stepper button
+// under the mouse after a UI-scale change reflows the menu and moves the button, so it stays
+// clickable for repeated steps. ImGui and SDL3 window coords are both logical points (no DPI
+// conversion); this app is single-window (no multi-viewports) so the main-viewport origin is (0,0).
+// (On macOS the warp may be ignored due to cursor-position handling — harmless: the cursor just
+// doesn't follow, same as not having the feature.)
+static void warpMouseToItemCenter(SDL_Window* window) {
+    const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    const ImVec2 vp = ImGui::GetMainViewport()->Pos;
+    SDL_WarpMouseInWindow(window, 0.5f * (mn.x + mx.x) - vp.x, 0.5f * (mn.y + mx.y) - vp.y);
+}
+
 // Is this connected source the same stream as `info`? Prefer source_id (globally
 // unique and stable across reconnects) so a reconnected stream — which gets a new
 // uid — isn't treated as a brand-new stream and double-connected. Templated so it
@@ -479,7 +491,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                        std::uint64_t headFreeze,
                        const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
     LSL_ZONE("drawStream");
-    constexpr float kCfgWidth = 230.0f;
+    const float kCfgWidth = uiScaled(230.0f);
     // Above this many visible line points (samples-in-view x channels) the stacked/overlay
     // views fall back to the min/max envelope; below it they draw the raw trace (which looks
     // better but costs a point per sample). ~200k keeps even a 32 ch x 10 s @ 500 Hz montage
@@ -533,7 +545,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     ImGui::BeginChild("cfg", ImVec2(kCfgWidth, 0), ImGuiChildFlags_Borders);
     if (ImGui::SmallButton("< hide")) o.cfgShown = false;   // hide to widen the plot
     if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         ImGui::SliderFloat("History (s)", &o.history, 1.0f, 60.0f, "%.0f");
         ImGui::Checkbox("Stacked montage", &o.stacked);
         ImGui::BeginDisabled(!o.stacked);          // raster is a stacked-montage render style
@@ -543,16 +555,16 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                               "instead of N line lanes — far cheaper at high channel counts");
         ImGui::EndDisabled();
         ImGui::BeginDisabled(!o.stacked);          // lane gain: stacked montage only
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         ImGui::SliderFloat("Gain/lane", &o.gainUv, 5.0f, 2000.0f, "%.0f",
                            ImGuiSliderFlags_Logarithmic);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("per-lane gain (%s)", streamUnit);
         ImGui::EndDisabled();
         ImGui::BeginDisabled(o.stacked);           // channel spacing: overlay only
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         if (ImGui::SliderFloat("Spacing", &o.spacing, 0.0f, 5000.0f, "%.0f")) o.overlayYFit = true;
         ImGui::EndDisabled();
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         ImGui::SliderFloat("Line width", &o.lineWidth, 0.5f, 4.0f, "%.1f");
         // Conditioning stages (re-reference -> high-pass -> notch -> low-pass) are each
         // INDEPENDENT — press any combination. The plot shows the conditioned signal
@@ -561,7 +573,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImGui::Checkbox("High-pass", &o.highpass)) { s.setHighpass(o.highpass); o.overlayYFit = true; }
         ImGui::SameLine();
         ImGui::BeginDisabled(!o.highpass);
-        ImGui::SetNextItemWidth(90);
+        ImGui::SetNextItemWidth(uiScaled(90));
         if (ImGui::SliderFloat("##hpcut", &o.hpHz, 0.1f, 5.0f, "%.2f Hz",
                                ImGuiSliderFlags_Logarithmic))
             s.setHighpassHz(o.hpHz);
@@ -572,7 +584,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip("band-reject the mains line frequency (50/60 Hz) and its hum");
         ImGui::SameLine();
         ImGui::BeginDisabled(!o.notch);
-        ImGui::SetNextItemWidth(60);
+        ImGui::SetNextItemWidth(uiScaled(60));
         if (ImGui::SliderFloat("##notchhz", &o.notchHz, 45.0f, 65.0f, "%.0f Hz")) s.setNotchHz(o.notchHz);
         ImGui::SameLine();
         const bool is50 = o.notchHz < 55.0f;
@@ -587,20 +599,20 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip("smooth / anti-EMG: attenuate everything above the cutoff");
         ImGui::SameLine();
         ImGui::BeginDisabled(!o.lowpass);
-        ImGui::SetNextItemWidth(90);
+        ImGui::SetNextItemWidth(uiScaled(90));
         if (ImGui::SliderFloat("##lphz", &o.lpHz, 5.0f, 120.0f, "%.0f Hz",
                                ImGuiSliderFlags_Logarithmic)) s.setLowpassHz(o.lpHz);
         ImGui::EndDisabled();
         // Re-reference montage — the FIRST stage of the conditioned chain (reference ->
         // high-pass -> notch -> low-pass), so it lives with the filter controls.
         const char* refModes[] = { "None", "Avg (CAR)", "Channel" };
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         if (ImGui::Combo("Reference", &o.refMode, refModes, 3)) { s.setReference(o.refMode); o.overlayYFit = true; }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("re-reference the montage: subtract the common average (CAR,\n"
                               "over the EEG channels only) or a chosen channel from every channel");
         if (o.refMode == 2) {
-            ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
             if (o.refChan >= C) o.refChan = 0;
             const char* rc = (o.refChan < (int)labels.size()) ? labels[o.refChan].c_str() : "ch";
             if (ImGui::BeginCombo("##refch", rc)) {
@@ -627,7 +639,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip(filtering ? "deselect channels matching the filter"
                                         : "deselect all channels");
         o.chanFilter.Draw("filter", 140.0f);       // own line; e.g. "Cz" or "Cz,Pz" or "-EOG"
-        ImGui::BeginChild("chsel", ImVec2(0, 120), ImGuiChildFlags_Borders);
+        ImGui::BeginChild("chsel", ImVec2(0, uiScaled(120)), ImGuiChildFlags_Borders);
         for (int c = 0; c < C; ++c) {
             if (!pass(c)) continue;
             bool on = o.visible[c] != 0;
@@ -647,7 +659,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         for (int j = 0; j < show; ++j) {
             const int c = sc.visIdx[j];
             ImGui::PushID(c);
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(uiScaled(120));
             ImGui::DragFloat(labels[c].c_str(), &gain[c], 0.01f, 0.01f, 100.0f, "%.2fx",
                              ImGuiSliderFlags_Logarithmic);
             ImGui::PopID();
@@ -805,7 +817,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     // line traces are too short to read. Only applies to the stacked layout (there's no
     // meaningful overlay heatmap), so overlay mode below ignores it. Reuses the envelope.
     if (o.stacked && o.raster) {
-        if (ImPlot::BeginPlot("##plot", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
+        if (ImPlot::BeginPlot("##plot", ImVec2(uiScaled(-70), -1), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
             ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
@@ -1325,14 +1337,16 @@ static void toNativeSeparators(char* s) {
 
 static void* SettingsReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char*) { return (void*)1; }
 static void SettingsReadLine(ImGuiContext*, ImGuiSettingsHandler*, void*, const char* line) {
-    int v; char b[512];
+    int v; float fv; char b[512];
     if      (std::sscanf(line, "light=%d", &v) == 1)        g_light = (v != 0);
+    else if (std::sscanf(line, "scale=%f", &fv) == 1)       g_uiScale = std::clamp(fv, 0.5f, 2.0f);
     else if (std::sscanf(line, "recdir=%511[^\n]", b) == 1) std::snprintf(g_recDir,  sizeof(g_recDir),  "%s", b);
     else if (std::sscanf(line, "rectmpl=%511[^\n]", b) == 1) { std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", b); toNativeSeparators(g_recTmpl); }
 }
 static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBuffer* buf) {
     buf->appendf("[%s][State]\n", h->TypeName);
     buf->appendf("light=%d\n",   g_light ? 1 : 0);
+    buf->appendf("scale=%.3f\n", g_uiScale);
     buf->appendf("recdir=%s\n",  g_recDir);
     buf->appendf("rectmpl=%s\n", g_recTmpl);
     buf->append("\n");
@@ -1429,7 +1443,7 @@ int main(int argc, char** argv) {
         if (!prefBase.empty()) { iniPath = prefBase + "imgui.ini"; io.IniFilename = iniPath.c_str(); }
     }
 
-    loadEmbeddedFont(io, window);   // embedded Roboto, HiDPI-crisp (see theme.hpp)
+    loadEmbeddedFont(io);   // embedded Roboto, HiDPI-crisp (see theme.hpp)
     // Persist theme + recording path in imgui.ini (handler must be added before the
     // ini is auto-loaded on the first NewFrame).
     g_light = (std::getenv("LSL_LIGHT") != nullptr);   // env default; ini overrides on load
@@ -1796,13 +1810,40 @@ int main(int argc, char** argv) {
             ImGui_ImplSDLGPU3_NewFrame();
             ImGui_ImplSDL3_NewFrame();
             ImGui::NewFrame();
-            if (!themeApplied) { themeApplied = true; applyTheme(g_light); }  // after ini load
+            if (!themeApplied) { themeApplied = true; applyTheme(g_light); }  // after ini load (font + sizes pick up persisted scale via FontScaleMain/ScaleAllSizes)
 
             if (ImGui::BeginMainMenuBar()) {
                 if (ImGui::BeginMenu("App")) {
                     ImGui::MenuItem("Pause", "P", &paused);
                     if (ImGui::MenuItem("Light theme", nullptr, &g_light)) {
                         applyTheme(g_light); ImGui::MarkIniSettingsDirty();
+                    }
+                    // UI scale: type an exact value (Enter/blur to apply) or step with the buttons. No
+                    // slider — dragging it rescaled and re-baked the font atlas every frame, which
+                    // flickered. The box edits a scratch value and commits on Enter/blur so typing
+                    // "0.75" doesn't rescale per keystroke; when idle it mirrors the current value.
+                    ImGui::TextUnformatted("UI scale"); ImGui::SameLine();
+                    bool scaleChanged = false;
+                    static float scaleEdit = g_uiScale;
+                    ImGui::SetNextItemWidth(uiScaled(72));
+                    ImGui::InputFloat("##uiscalebox", &scaleEdit, 0.0f, 0.0f, "%.2f");
+                    if (ImGui::IsItemDeactivatedAfterEdit()) { g_uiScale = scaleEdit; scaleChanged = true; }
+                    else if (!ImGui::IsItemActive())         scaleEdit = g_uiScale;
+                    // After a step, the rescale reflows the menu and moves the button; warp the cursor
+                    // onto its new position next frame so it stays under the mouse for repeated clicks.
+                    static int warpScaleBtn = 0;   // 1 = '-', 2 = '+'
+                    ImGui::SameLine();
+                    bool minusClicked = ImGui::SmallButton("-##uiscale");
+                    if (warpScaleBtn == 1) { warpMouseToItemCenter(window); warpScaleBtn = 0; }
+                    if (minusClicked) { g_uiScale -= 0.05f; scaleChanged = true; warpScaleBtn = 1; }
+                    ImGui::SameLine();
+                    bool plusClicked = ImGui::SmallButton("+##uiscale");
+                    if (warpScaleBtn == 2) { warpMouseToItemCenter(window); warpScaleBtn = 0; }
+                    if (plusClicked) { g_uiScale += 0.05f; scaleChanged = true; warpScaleBtn = 2; }
+                    if (scaleChanged) {
+                        g_uiScale = std::clamp(g_uiScale, 0.5f, 2.0f);
+                        applyTheme(g_light);
+                        ImGui::MarkIniSettingsDirty();
                     }
                     if (ImGui::MenuItem("Quit", "Ctrl+Q")) done = true;
                     ImGui::EndMenu();
@@ -1824,7 +1865,7 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginMenu("Workspaces")) {
                     ImGui::TextDisabled("save the current view (per-stream settings,");
                     ImGui::TextDisabled("analysis windows, layout) under a name");
-                    ImGui::SetNextItemWidth(160);
+                    ImGui::SetNextItemWidth(uiScaled(160));
                     ImGui::InputTextWithHint("##wsname", "name", wsNameBuf, sizeof wsNameBuf);
                     ImGui::SameLine();
                     ImGui::BeginDisabled(wsNameBuf[0] == '\0');
@@ -2047,7 +2088,7 @@ int main(int argc, char** argv) {
             // ---- Two-column layout: fixed Streams sidebar + a dockspace -----
             // The plots live in a dockspace that fills the area right of the sidebar,
             // so they open as tabs and can be split/rearranged but never bury the rail.
-            const float sidebarW = 280.0f;
+            const float sidebarW = uiScaled(280.0f);
             ImGuiID dockId = 0, dockCenter = 0, dockBottom = 0;   // time-series center, analysis bottom
             {
                 ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + sidebarW, vp->WorkPos.y), ImGuiCond_Always);
@@ -2329,7 +2370,7 @@ int main(int argc, char** argv) {
                 ImGui::Text("%.1f FPS  \xc2\xb7  %.2f ms avg / %.2f ms max",
                             avg > 0 ? 1000.0f / avg : 0.0f, avg, fps.maxv());
                 ImGui::PlotLines("##ft", fps.ms, FrameStats::N, fps.idx, nullptr,
-                                 0.0f, std::max(33.0f, fps.maxv() * 1.1f), ImVec2(-1, 50));
+                                 0.0f, std::max(33.0f, fps.maxv() * 1.1f), ImVec2(-1, uiScaled(50)));
                 ImGui::TextDisabled("ui+draw %.2f ms \xc2\xb7 gpu+vsync %.2f ms", uiMs, gpuMs);
                 ImGui::Checkbox("VSync", &vsync);
                 ImGui::SameLine();
@@ -2396,7 +2437,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 ImGui::SetNextWindowDockID(dockCenter, ImGuiCond_FirstUseEver);  // time-series tab
-                ImGui::SetNextWindowSize(ImVec2(680, 420), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(680), uiScaled(420)), ImGuiCond_FirstUseEver);
                 bool open = true;                       // window X disconnects the stream
                 // Unique, STABLE window id even if two streams share a name (else ImGui
                 // ID conflict + merged windows). The visible title carries a transient
@@ -2431,7 +2472,7 @@ int main(int argc, char** argv) {
 
             // ---- FFT / PSD (View menu) ----------------------------------
             if (showSpectrum) {
-            ImGui::SetNextWindowSize(ImVec2(580, 440), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(uiScaled(580), uiScaled(440)), ImGuiCond_FirstUseEver);
             ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
             if (focusSpectrum) { ImGui::SetNextWindowFocus(); focusSpectrum = false; }
             ImGui::Begin("Spectrum", &showSpectrum);
@@ -2451,7 +2492,7 @@ int main(int argc, char** argv) {
                 HfStreamSource* src = sources[fftStream].get();
 
                 // ---- left config strip; the plot fills the right (like the time series) ----
-                ImGui::BeginChild("cfg", ImVec2(200, 0), ImGuiChildFlags_Borders);
+                ImGui::BeginChild("cfg", ImVec2(uiScaled(200), 0), ImGuiChildFlags_Borders);
                 ImGui::SetNextItemWidth(-1.0f);
                 if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                     for (int i = 0; i < (int)sources.size(); ++i)
@@ -2470,7 +2511,7 @@ int main(int argc, char** argv) {
                 const auto& labels = src->labels();
                 auto fpass = [&](int c) { return fftFilter.PassFilter(labels[c].c_str()); };
 
-                ImGui::SetNextItemWidth(80);
+                ImGui::SetNextItemWidth(uiScaled(80));
                 const char* szs[] = { "512", "1024", "2048", "4096" };
                 int szi = (fftN == 512) ? 0 : (fftN == 1024) ? 1 : (fftN == 2048) ? 2 : 3;
                 if (ImGui::Combo("N", &szi, szs, 4)) { fftN = 1 << (9 + szi); fftRefit = true; }
@@ -2627,7 +2668,7 @@ int main(int argc, char** argv) {
             for (auto& spp : spectros) {
                 Spectro& spectro = *spp;
                 LSL_ZONE("spectrogram win");
-                ImGui::SetNextWindowSize(ImVec2(620, 420), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(620), uiScaled(420)), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
                 if (spectro.focus) { ImGui::SetNextWindowFocus(); spectro.focus = false; }
                 char title[64];
@@ -2645,7 +2686,7 @@ int main(int argc, char** argv) {
                     bool reset = (spectro.uid != src->uid());
 
                     // ---- left config strip; the plot + colorbar fill the right ----
-                    ImGui::BeginChild("cfg", ImVec2(200, 0), ImGuiChildFlags_Borders);
+                    ImGui::BeginChild("cfg", ImVec2(uiScaled(200), 0), ImGuiChildFlags_Borders);
                     ImGui::SetNextItemWidth(-1.0f);
                     if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                         spectro.streamFilter.Draw("##sf", -1.0f);   // searchable
@@ -2673,20 +2714,20 @@ int main(int argc, char** argv) {
                         }
                         ImGui::EndCombo();
                     }
-                    ImGui::SetNextItemWidth(90);
+                    ImGui::SetNextItemWidth(uiScaled(90));
                     const char* nf[] = { "128", "256", "512", "1024" };
                     int ni = (spectro.nfft == 128) ? 0 : (spectro.nfft == 256) ? 1
                            : (spectro.nfft == 512) ? 2 : 3;
                     if (ImGui::Combo("NFFT", &ni, nf, 4)) { spectro.nfft = 1 << (7 + ni); reset = true; }
-                    ImGui::SetNextItemWidth(110);
+                    ImGui::SetNextItemWidth(uiScaled(110));
                     ImGui::SliderFloat("span (s)", &spectro.spanSec, 2.0f, 120.0f, "%.0f");
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     ImGui::DragFloatRange2("dB", &spectro.dbMin, &spectro.dbMax, 1.0f,
                                            -160.0f, 80.0f, "%.0f");
                     // Frequency range shown (Y-axis zoom). Vital when the sample rate is high but
                     // the signal is low-freq (48 kHz audio -> tones < 1 kHz); synced with mouse zoom.
                     const float ny = (float)(src->srate() * 0.5);
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::DragFloatRange2("Hz", &spectro.fMin, &spectro.fMax,
                                                std::max(0.5f, ny / 400.0f), 0.0f, ny, "%.0f"))
                         spectro.yDirty = true;
@@ -2808,7 +2849,7 @@ int main(int argc, char** argv) {
                         }
 
                         ImPlot::PushColormap(ImPlotColormap_Viridis);
-                        if (ImPlot::BeginPlot("##spectro", ImVec2(-70, -1))) {
+                        if (ImPlot::BeginPlot("##spectro", ImVec2(uiScaled(-70), -1))) {
                             ImPlot::SetupAxes("time (s)", "Hz");
                             ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
                             if (!paused)   // live: follow the scroll; paused: free to pan/zoom the frozen view
@@ -2837,7 +2878,7 @@ int main(int argc, char** argv) {
                             ImPlot::EndPlot();
                         }
                         ImGui::SameLine();
-                        ImPlot::ColormapScale("dB", spectro.dbMin, spectro.dbMax, ImVec2(60, -1));
+                        ImPlot::ColormapScale("dB", spectro.dbMin, spectro.dbMax, ImVec2(uiScaled(60), -1));
                         ImPlot::PopColormap();
                     }
                 }
@@ -2849,7 +2890,7 @@ int main(int argc, char** argv) {
             for (auto& epp : erps) {
                 Erp& erp = *epp;
                 LSL_ZONE("erp win");
-                ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(560), uiScaled(420)), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
                 if (erp.focus) { ImGui::SetNextWindowFocus(); erp.focus = false; }
                 char title[64];
@@ -2875,7 +2916,7 @@ int main(int argc, char** argv) {
                     // series / spectrum / spectrogram windows) ----
                     ImGui::BeginChild("cfg", ImVec2(230, 0), ImGuiChildFlags_Borders);
                     // data stream
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("stream", src->name().c_str())) {
                         erp.streamFilter.Draw("##sf", -1.0f);
                         for (int i = 0; i < (int)sources.size(); ++i) {
@@ -2891,7 +2932,7 @@ int main(int argc, char** argv) {
                     const auto& labels = src->labels();
                     // single-channel picker (disabled when averaging all channels)
                     ImGui::BeginDisabled(erp.allCh);
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     const char* chn = (erp.channel < (int)labels.size()) ? labels[erp.channel].c_str() : "ch";
                     if (ImGui::BeginCombo("channel", chn)) {
                         erp.chanFilter.Draw("##chf", -1.0f);
@@ -2906,11 +2947,11 @@ int main(int argc, char** argv) {
                     ImGui::EndDisabled();
                     if (ImGui::Checkbox("all channels", &erp.allCh)) reset = true;  // average every channel
                     if (erp.allCh) {
-                        ImGui::SetNextItemWidth(140);
+                        ImGui::SetNextItemWidth(uiScaled(140));
                         if (ImGui::SliderInt("max ch", &erp.maxCh, 1, std::max(1, src->channels()))) reset = true;
                     }
                     // trigger marker stream
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("trigger", mk->name().c_str())) {
                         erp.markerFilter.Draw("##mf", -1.0f);
                         for (int i = 0; i < (int)markerSources.size(); ++i) {
@@ -2926,9 +2967,9 @@ int main(int argc, char** argv) {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("only trigger on events whose text matches (blank = every event)");
 
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::SliderFloat("pre (ms)", &erp.preMs, 10.0f, 1000.0f, "%.0f")) reset = true;
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::SliderFloat("post (ms)", &erp.postMs, 50.0f, 2000.0f, "%.0f")) reset = true;
                     if (ImGui::Checkbox("baseline", &erp.baseline)) reset = true;
                     ImGui::SameLine();
@@ -2966,7 +3007,7 @@ int main(int argc, char** argv) {
                             // nchan x nbins row-major, so it feeds PlotHeatmap directly.
                             if (erp.nchan == 0 || erp.nbins == 0 || erp.count == 0) {
                                 ImGui::TextDisabled("waiting for epochs...");
-                            } else if (ImPlot::BeginPlot("##erpr", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
+                            } else if (ImPlot::BeginPlot("##erpr", ImVec2(uiScaled(-70), -1), ImPlotFlags_NoLegend)) {
                                 ImPlot::SetupAxes("time (ms)", nullptr,
                                                   ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
                                 ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, erpCond);
