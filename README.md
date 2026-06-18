@@ -44,7 +44,7 @@ zoomed views use the conditioned signal.
 
 ![ERP average with single-trial traces](docs/images/erp.png)
 
-- Epoch around events from a marker stream (with optional label matching, e.g. `target`) and average over trials, with the single-trial traces drawn under the average.
+- Epoch around events from a marker stream (with optional exact label matching — one label like `target`, or several separated by a spaced pipe ` | `, e.g. `start_a | start_b`) and average over trials, with the single-trial traces drawn under the average.
 - Single- or multi-channel, plus an erpimage (trials x time, or channels x time) view.
 
 ### Recording

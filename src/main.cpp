@@ -563,7 +563,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     if (o.cfgShown) {
     ImGui::BeginChild("cfg", ImVec2(kCfgWidth, 0), ImGuiChildFlags_Borders);
     if (ImGui::SmallButton("< hide")) o.cfgShown = false;   // hide to widen the plot
-    if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Display")) {
         ImGui::SetNextItemWidth(uiScaled(110));
         ImGui::SliderFloat("History (s)", &o.history, 1.0f, 60.0f, "%.0f");
         ImGui::Checkbox("Stacked montage", &o.stacked);
@@ -584,7 +584,9 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImGui::SliderFloat("Spacing", &o.spacing, 0.0f, 5000.0f, "%.0f")) o.overlayYFit = true;
         ImGui::EndDisabled();
         ImGui::SetNextItemWidth(uiScaled(110));
+        ImGui::BeginDisabled(o.raster);   // raster is a heatmap — no line traces to weight
         ImGui::SliderFloat("Line width", &o.lineWidth, 0.5f, 4.0f, "%.1f");
+        ImGui::EndDisabled();
         // Conditioning stages (re-reference -> high-pass -> notch -> low-pass) are each
         // INDEPENDENT — press any combination. The plot shows the conditioned signal
         // whenever ANY stage is on, and the raw signal when all are off (no master toggle).
@@ -643,7 +645,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             }
         }
     }
-    if (ImGui::CollapsingHeader("Channels", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Channels")) {
         // All/None act on the visible (filtered) set, so "Cz" + All selects all
         // Cz* channels; clear the filter and All selects everything.
         auto pass = [&](int c) { return o.chanFilter.PassFilter(labels[c].c_str()); };
@@ -1257,6 +1259,31 @@ static ImPlotColormap divergingPosRed() {
     return cm;
 }
 
+// ERP trigger-label match. The filter is a list of labels separated by " | " (a pipe with a space on
+// EACH side); an event matches if its marker text equals ANY of them EXACTLY (after trimming). A
+// blank filter matches every event. Requiring the surrounding spaces means a label may itself contain
+// a bare '|' (e.g. "L|R") without being split. Exact (not substring) so integer trigger codes don't
+// cross-match — a filter of "1" must not catch "10"/"100". e.g. "start_a | start_b".
+static bool erpLabelMatches(const char* filter, const std::string& text) {
+    bool blank = true;
+    for (const char* q = filter; *q; ++q) if (!std::isspace((unsigned char)*q)) { blank = false; break; }
+    if (blank) return true;
+    const char* a = filter;                                    // current segment start
+    for (const char* p = filter; ; ++p) {
+        const bool sep = (p[0] == ' ' && p[1] == '|' && p[2] == ' ');   // " | " delimiter
+        if (!sep && *p) continue;                              // mid-segment: keep scanning
+        const char* s = a;                                     // close segment [a, p), trimmed
+        const char* b = p;
+        while (s < b && std::isspace((unsigned char)*s)) ++s;
+        while (b > s && std::isspace((unsigned char)b[-1])) --b;
+        const std::size_t n = (std::size_t)(b - s);
+        if (n && text.size() == n && text.compare(0, n, s, n) == 0) return true;
+        if (!*p) break;
+        p += 2; a = p + 1;                                     // skip " | " (loop's ++p does the 3rd char)
+    }
+    return false;
+}
+
 static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
     // 1) ingest new trigger events (by stable seq) into the pending queue. The first
     // pass after a reset only SYNCS lastSeq (no backfill) so we accumulate from now on.
@@ -1265,7 +1292,7 @@ static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
         if (e.seqInit && ev.seq <= e.lastSeq) continue;
         e.lastSeq = std::max(e.lastSeq, ev.seq);
         if (firstPass) continue;
-        if (e.labelFilter.IsActive() && !e.labelFilter.PassFilter(ev.text.c_str())) continue;
+        if (!erpLabelMatches(e.labelFilter.InputBuf, ev.text)) continue;
         e.pending.push_back(ev.t);
     }
     e.seqInit = true;
@@ -2252,74 +2279,81 @@ int main(int argc, char** argv) {
             sectionHeader("Recording");
             {
                 int nConn = 0; for (auto& info : found) if (connected(info)) ++nConn;
-                if (!recorder.active()) {
-                    const float bw = ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2;
-                    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
-                    if (ImGui::InputTextWithHint("##recdir", "folder (blank = cwd)", g_recDir, sizeof(g_recDir)))
-                        ImGui::MarkIniSettingsDirty();
+                const bool rec = recorder.active();
+                // Path / field inputs stay in place while recording (disabled, not removed) so the
+                // constructed name and the Record/Stop button below never shift when recording toggles.
+                ImGui::BeginDisabled(rec);
+                const float bw = ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2;
+                ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
+                if (ImGui::InputTextWithHint("##recdir", "folder (blank = cwd)", g_recDir, sizeof(g_recDir)))
+                    ImGui::MarkIniSettingsDirty();
+                ImGui::SameLine();
+                if (ImGui::Button("Browse"))
+                    SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
+                                             g_recDir[0] ? g_recDir : nullptr, false);
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::InputTextWithHint("##recpath", "sub-{subject}/…/{modality}.xdf",
+                                             g_recTmpl, sizeof(g_recTmpl)))
+                    ImGui::MarkIniSettingsDirty();
+                if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                    const float fw = (ImGui::GetContentRegionAvail().x
+                                      - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
                     ImGui::SameLine();
-                    if (ImGui::Button("Browse"))
-                        SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
-                                                 g_recDir[0] ? g_recDir : nullptr, false);
-                    ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::InputTextWithHint("##recpath", "sub-{subject}/…/{modality}.xdf",
-                                                 g_recTmpl, sizeof(g_recTmpl)))
-                        ImGui::MarkIniSettingsDirty();
-                    if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
-                        const float fw = (ImGui::GetContentRegionAvail().x
-                                          - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##mod", "{modality}", recModality, sizeof(recModality));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##acq", "{acq} (optional)", recAcq, sizeof(recAcq));
-                        ImGui::TreePop();
-                    }
-                    // Preview path: recFullPath() does strftime + template substitution;
-                    // refresh it at ~4 Hz instead of every frame (it's just a label).
-                    static std::string recPreview;
-                    static double recPreviewAt = -1e18;
-                    if (dueEvery(recPreviewAt, 0.25)) recPreview = recFullPath();
-                    ImGui::TextDisabled("-> %s", recPreview.c_str());
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(recPreview.c_str());
-                    // Hold recording while a restored workspace is still missing streams, so a
-                    // session can't quietly start short a stream (recording = every connected
-                    // stream). Resolved by the streams connecting or dismissing the notice above.
-                    ImGui::BeginDisabled(nConn == 0 || wsMissing > 0);
-                    if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
-                    ImGui::EndDisabled();
-                    // Tooltip on the disabled button explaining how to proceed (disabled items
-                    // don't hover by default — AllowWhenDisabled re-enables it).
-                    if ((nConn == 0 || wsMissing > 0) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip(wsMissing > 0
-                            ? "Recording is held until your workspace's streams are present.\n"
-                              "Wait for the missing stream(s) to connect, or click Dismiss in the\n"
-                              "notice above to record without them."
-                            : "Connect at least one stream to record.");
-                    if (nConn == 0) {
-                        ImGui::TextDisabled("Connect a stream to record.");
-                    } else if (wsMissing > 0) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-                        ImGui::TextWrapped("recording held: %d workspace stream%s missing (connect them or dismiss above)",
-                                           wsMissing, wsMissing == 1 ? "" : "s");
-                        ImGui::PopStyleColor();
-                    } else {
-                        ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
-                    }
-                } else {
-                    if (ImGui::Button("Stop recording", ImVec2(-1, 0))) {
-                        recorder.stop(); spdlog::info("recording stopped ({:.1f}s, {:.1f} MB)",
-                                                      recorder.seconds(), recorder.bytes() / 1e6);
-                    }
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##mod", "{modality}", recModality, sizeof(recModality));
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##acq", "{acq} (optional)", recAcq, sizeof(recAcq));
+                    ImGui::TreePop();
+                }
+                ImGui::EndDisabled();
+
+                // Constructed name in a fixed slot: the live template preview when idle, the actual
+                // file being written while recording. Same widget/position either way (full path on hover).
+                static std::string recPreview;
+                static double recPreviewAt = -1e18;
+                if (!rec && dueEvery(recPreviewAt, 0.25)) recPreview = recFullPath();
+                const std::string shown = rec ? recorder.path() : recPreview;
+                ImGui::TextDisabled("-> %s", shown.c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", shown.c_str());
+
+                // Record / Stop: one button in a fixed position; only the label + action swap. While
+                // idle it's held until a stream is connected and no workspace stream is still missing
+                // (so a session can't quietly start short a stream — recording = every connected stream).
+                const bool blocked = !rec && (nConn == 0 || wsMissing > 0);
+                ImGui::BeginDisabled(blocked);
+                if (ImGui::Button(rec ? "Stop recording" : "Record", ImVec2(-1, 0))) {
+                    if (rec) { recorder.stop(); spdlog::info("recording stopped ({:.1f}s, {:.1f} MB)",
+                                                            recorder.seconds(), recorder.bytes() / 1e6); }
+                    else startRecording();
+                }
+                ImGui::EndDisabled();
+                // Disabled items don't hover by default — AllowWhenDisabled re-enables the tooltip.
+                if (blocked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(wsMissing > 0
+                        ? "Recording is held until your workspace's streams are present.\n"
+                          "Wait for the missing stream(s) to connect, or click Dismiss in the\n"
+                          "notice above to record without them."
+                        : "Connect at least one stream to record.");
+
+                // Status line (one slot): live REC stats while recording, else the connect/held hint.
+                if (rec)
                     ImGui::TextColored(ImVec4(1, 0.30f, 0.30f, 1),   // hard to miss while live
                                        "REC %.0fs \xc2\xb7 %d stream%s \xc2\xb7 %.2f MB",
                                        recorder.seconds(), recorder.streams(),
                                        recorder.streams() == 1 ? "" : "s", recorder.bytes() / 1e6);
-                }
+                else if (nConn == 0)
+                    ImGui::TextDisabled("Connect a stream to record.");
+                else if (wsMissing > 0) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                    ImGui::TextWrapped("recording held: %d workspace stream%s missing (connect them or dismiss above)",
+                                       wsMissing, wsMissing == 1 ? "" : "s");
+                    ImGui::PopStyleColor();
+                } else
+                    ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
                 const std::string rerr = recorder.error();
                 if (!rerr.empty()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "rec error: %s", rerr.c_str());
                 bool rc = remote.listening();
@@ -3041,9 +3075,15 @@ int main(int argc, char** argv) {
                         ImGui::EndCombo();
                     }
                     mk = markerSources[erp.markerIdx].get();
-                    if (erp.labelFilter.Draw("match", 140.0f)) reset = true;  // only events matching fire
+                    // Exact-match list of trigger labels, '|'-separated (see erpLabelMatches).
+                    ImGui::SetNextItemWidth(uiScaled(140));
+                    if (ImGui::InputTextWithHint("match", "e.g. start_a | start_b",
+                            erp.labelFilter.InputBuf, sizeof erp.labelFilter.InputBuf))
+                        reset = true;
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("only trigger on events whose text matches (blank = every event)");
+                        ImGui::SetTooltip("Align on events whose label exactly equals any of these,\n"
+                                          "separated by ' | ' (a pipe with a space each side) — e.g.\n"
+                                          "start_a | start_b. A label may contain a bare '|'. Blank = every event.");
 
                     ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::SliderFloat("pre (ms)", &erp.preMs, 10.0f, 1000.0f, "%.0f")) reset = true;
