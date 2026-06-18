@@ -27,6 +27,18 @@ if(pos EQUAL -1)
     "macOS < 14 still uses MSL source, not the macOS-14 metallib).")
 endif()
 
+# Anchor must be unique — REPLACE rewrites ALL occurrences, so a second (unrelated) use of the
+# condition elsewhere would be mangled. Check the remainder after the first match.
+string(LENGTH "${orig}" orig_len)
+math(EXPR after_pos "${pos} + ${orig_len}")
+string(SUBSTRING "${src}" ${after_pos} -1 rest)
+string(FIND "${rest}" "${orig}" pos2)
+if(NOT pos2 EQUAL -1)
+  message(FATAL_ERROR
+    "patch_imgui_msl: anchor occurs more than once in ${path}; REPLACE would rewrite an "
+    "unintended site. Dear ImGui changed — make the anchor specific and re-verify the patch.")
+endif()
+
 string(REPLACE "${orig}" "${repl}" src "${src}")
 file(WRITE "${path}" "${src}")
 message(STATUS "Patched imgui_impl_sdlgpu3.cpp: prefer MSL over metallib (macOS 11+ Metal support)")

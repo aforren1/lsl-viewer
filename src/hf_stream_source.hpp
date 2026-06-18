@@ -722,9 +722,12 @@ private:
                 if (ts == 0.0 || sample.empty()) continue;
                 lastData_.store(now, std::memory_order_relaxed);
 
-                std::string text = sample[0];                 // join multi-channel markers
+                // Join multi-channel markers with ", " — deliberately NOT " | ", which is the ERP
+                // label-filter's OR separator (erpLabelMatches); using it here would split a joined
+                // event's text and make multi-channel marker labels unfilterable.
+                std::string text = sample[0];
                 for (std::size_t c = 1; c < sample.size(); ++c)
-                    if (!sample[c].empty()) text += " | " + sample[c];
+                    if (!sample[c].empty()) text += ", " + sample[c];
 
                 std::lock_guard<std::mutex> lk(mtx_);
                 events_.push_back({ts + offset, std::move(text), total_});  // seq = ordinal

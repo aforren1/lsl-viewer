@@ -197,8 +197,11 @@ static std::string                 g_reclassifyKey;
 
 // Effective classification: the user's override if present, else the type/format default.
 static bool effMarker(lsl::stream_info& info) {
-    auto it = g_streamKind.find(streamKey(info));
-    return it != g_streamKind.end() ? it->second : isMarkerStream(info);
+    if (!g_streamKind.empty()) {   // common case has no overrides — skip building the lookup key
+        auto it = g_streamKind.find(streamKey(info));
+        if (it != g_streamKind.end()) return it->second;
+    }
+    return isMarkerStream(info);
 }
 
 // BIDS-ish filename templating: substitute {subject}/{session}/{task}/{run}/{acq}/{modality}
@@ -1268,6 +1271,7 @@ static bool erpLabelMatches(const char* filter, const std::string& text) {
     bool blank = true;
     for (const char* q = filter; *q; ++q) if (!std::isspace((unsigned char)*q)) { blank = false; break; }
     if (blank) return true;
+    bool anyLabel = false;                                     // any non-empty label segment seen?
     const char* a = filter;                                    // current segment start
     for (const char* p = filter; ; ++p) {
         const bool sep = (p[0] == ' ' && p[1] == '|' && p[2] == ' ');   // " | " delimiter
@@ -1277,11 +1281,11 @@ static bool erpLabelMatches(const char* filter, const std::string& text) {
         while (s < b && std::isspace((unsigned char)*s)) ++s;
         while (b > s && std::isspace((unsigned char)b[-1])) --b;
         const std::size_t n = (std::size_t)(b - s);
-        if (n && text.size() == n && text.compare(0, n, s, n) == 0) return true;
+        if (n) { anyLabel = true; if (text.size() == n && text.compare(0, n, s, n) == 0) return true; }
         if (!*p) break;
         p += 2; a = p + 1;                                     // skip " | " (loop's ++p does the 3rd char)
     }
-    return false;
+    return !anyLabel;   // only separators, no real labels -> behave like blank (match every event)
 }
 
 static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
@@ -1396,7 +1400,9 @@ static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBu
     buf->appendf("scale=%.3f\n", g_uiScale);
     buf->appendf("recdir=%s\n",  g_recDir);
     buf->appendf("rectmpl=%s\n", g_recTmpl);
-    for (const auto& [k, kind] : g_streamKind) buf->appendf("streamkind=%d %s\n", kind ? 1 : 0, k.c_str());
+    // skip an empty key: it would serialize as "streamkind=0 \n", which the "%d %511[^\n]" read can't
+    // round-trip (no chars before the newline). streamKey is never empty in practice (LSL uid is set).
+    for (const auto& [k, kind] : g_streamKind) if (!k.empty()) buf->appendf("streamkind=%d %s\n", kind ? 1 : 0, k.c_str());
     buf->append("\n");
 }
 // SDL folder-picker callback → sets the output directory.
@@ -2026,7 +2032,7 @@ int main(int argc, char** argv) {
                 }
             };
             // Apply a pending "treat as marker" / "treat as data" toggle (set last frame by the
-            // Info-panel button or the rail right-click): tear down the stream's current source and
+            // rail row's right-click menu): tear down the stream's current source and
             // rebuild it as the other type. Direct rebuild (not disconnect+connect) so it sidesteps
             // the dismissed / auto-reconnect machinery.
             if (!g_reclassifyKey.empty()) {
@@ -2035,6 +2041,12 @@ int main(int argc, char** argv) {
                         [&](const std::unique_ptr<HfStreamSource>& p){ return streamKeyOf(*p) == key; });
                     di != sources.end()) {                       // data -> marker
                     lsl::stream_info info = (*di)->info();
+                    // Keep analysis windows that were showing this stream bound to it by key, so
+                    // reverting the toggle re-binds them rather than leaving them on whatever stream
+                    // shifts into the vacated index.
+                    for (auto& sp : spectros) if (sp->streamIdx < (int)sources.size() && streamKeyOf(*sources[sp->streamIdx]) == key) sp->wantSid = key;
+                    for (auto& ep : erps)     if (ep->streamIdx < (int)sources.size() && streamKeyOf(*sources[ep->streamIdx]) == key) ep->wantSid = key;
+                    if (fftStream < (int)sources.size() && streamKeyOf(*sources[fftStream]) == key) fftWantSid = key;
                     edgeMap.erase(di->get()); pauseHead.erase(di->get()); dispOpts.erase(di->get());
                     (*di)->requestStop(); closing.push_back(std::move(*di)); sources.erase(di);
                     if (isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = true;
@@ -2045,6 +2057,8 @@ int main(int argc, char** argv) {
                         [&](const std::unique_ptr<MarkerSource>& p){ return streamKeyOf(*p) == key; });
                     mi != markerSources.end()) {                 // marker -> data
                     lsl::stream_info info = (*mi)->info();
+                    // Same: keep ERP windows' marker side bound to this stream by key across the flip.
+                    for (auto& ep : erps) if (ep->markerIdx < (int)markerSources.size() && streamKeyOf(*markerSources[ep->markerIdx]) == key) ep->wantMsid = key;
                     (*mi)->requestStop(); closingMrk.push_back(std::move(*mi)); markerSources.erase(mi);
                     if (!isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = false;
                     auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
@@ -2449,10 +2463,12 @@ int main(int argc, char** argv) {
                         if (!csrc) connectStream(info);                        // connect
                         else       ImGui::SetWindowFocus(info.name().c_str());  // already on: focus its plot
                     }
-                    // Irregular numeric stream (e.g. an int trigger arriving as a waveform): offer to
-                    // show it as event/marker overlays. Gated to irregular so a regular high-rate
-                    // stream can't accidentally become an event flood.
-                    if (csrc && info.nominal_srate() == 0.0 &&
+                    // Numeric stream the user wants as event/marker overlays. Offered for irregular
+                    // streams (e.g. an int trigger arriving as a waveform) — gated so a regular
+                    // high-rate stream can't accidentally become an event flood — OR for any stream
+                    // that's a marker by default (a "Markers"-typed stream they'd flipped to data),
+                    // so that flip is always reversible regardless of rate.
+                    if (csrc && (info.nominal_srate() == 0.0 || isMarkerStream(info)) &&
                         ImGui::BeginPopupContextItem("##data2mk")) {
                         if (ImGui::MenuItem("Treat as marker (show as events)"))
                             g_reclassifyKey = streamKey(info);
@@ -3026,7 +3042,7 @@ int main(int argc, char** argv) {
 
                     // ---- left config strip; the plot fills the right (matches the time
                     // series / spectrum / spectrogram windows) ----
-                    ImGui::BeginChild("cfg", ImVec2(230, 0), ImGuiChildFlags_Borders);
+                    ImGui::BeginChild("cfg", ImVec2(uiScaled(230), 0), ImGuiChildFlags_Borders);
                     // data stream
                     ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("stream", src->name().c_str())) {
