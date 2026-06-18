@@ -1943,6 +1943,18 @@ int main(int argc, char** argv) {
                 }
                 ImGui::EndMainMenuBar();
             }
+            // While recording, pulse a red border around the whole window so it's unmistakable at a
+            // glance (beyond the menu-bar [REC] readout). Drawn on the foreground list, over everything.
+            if (recorder.active()) {
+                ImGuiViewport* vp = ImGui::GetMainViewport();
+                const float pulse = 0.55f + 0.45f * (float)std::sin(recorder.seconds() * 3.2);
+                const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.18f, 0.18f, pulse));
+                const float th = uiScaled(3.0f), in = th * 0.5f;
+                ImGui::GetForegroundDrawList(vp)->AddRect(
+                    ImVec2(vp->Pos.x + in, vp->Pos.y + in),
+                    ImVec2(vp->Pos.x + vp->Size.x - in, vp->Pos.y + vp->Size.y - in),
+                    col, 0.0f, 0, th);
+            }
             if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Q)) done = true;
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_P)) paused = !paused;
 
