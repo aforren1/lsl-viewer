@@ -29,7 +29,9 @@
 #include "mock_streams.hpp"
 #include "recorder.hpp"
 #include "remote_control.hpp"
+#include <cctype>
 #include <ctime>
+#include <map>
 #include <optional>
 #include <set>
 #include "fft.hpp"
@@ -166,10 +168,14 @@ static bool sameStream(const Src& s, lsl::stream_info& info) {
     return !sid.empty() ? (s.sourceId() == sid) : (s.uid() == info.uid());
 }
 
-// Marker/event streams are string-typed; they get a MarkerSource (overlay), not a
-// waveform plot.
+// A stream is a marker/event stream *by default* if it carries string values OR declares its type as
+// "Marker"/"Markers" (case-insensitive) — many trigger boxes send integer codes under a "Markers"
+// type. The per-stream override (g_streamKind) can flip this either way; see effMarker().
 static bool isMarkerStream(lsl::stream_info& info) {
-    return info.channel_format() == lsl::cf_string;
+    if (info.channel_format() == lsl::cf_string) return true;
+    std::string t = info.type();
+    for (char& c : t) c = (char)std::tolower((unsigned char)c);
+    return t == "marker" || t == "markers";
 }
 
 // Stable key for "the user dismissed this stream" bookkeeping: source_id (globally
@@ -180,6 +186,19 @@ static std::string streamKey(lsl::stream_info& info) {
 template <class Src>
 static std::string streamKeyOf(const Src& s) {
     return !s.sourceId().empty() ? s.sourceId() : s.uid();
+}
+
+// Per-stream override of the marker-vs-data classification (keyed by stream key). Present = the user
+// explicitly chose (true = marker, false = data); absent = follow the isMarkerStream() default.
+// Persisted in imgui.ini; set by the rail's right-click menus. g_reclassifyKey is the pending toggle
+// (a stream key) that the connect loop applies next frame by reconnecting the stream as that type.
+static std::map<std::string, bool> g_streamKind;
+static std::string                 g_reclassifyKey;
+
+// Effective classification: the user's override if present, else the type/format default.
+static bool effMarker(lsl::stream_info& info) {
+    auto it = g_streamKind.find(streamKey(info));
+    return it != g_streamKind.end() ? it->second : isMarkerStream(info);
 }
 
 // BIDS-ish filename templating: substitute {subject}/{session}/{task}/{run}/{acq}/{modality}
@@ -1342,6 +1361,7 @@ static void SettingsReadLine(ImGuiContext*, ImGuiSettingsHandler*, void*, const 
     else if (std::sscanf(line, "scale=%f", &fv) == 1)       g_uiScale = std::clamp(fv, 0.5f, 2.0f);
     else if (std::sscanf(line, "recdir=%511[^\n]", b) == 1) std::snprintf(g_recDir,  sizeof(g_recDir),  "%s", b);
     else if (std::sscanf(line, "rectmpl=%511[^\n]", b) == 1) { std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", b); toNativeSeparators(g_recTmpl); }
+    else if (std::sscanf(line, "streamkind=%d %511[^\n]", &v, b) == 2) g_streamKind[b] = (v != 0);
 }
 static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBuffer* buf) {
     buf->appendf("[%s][State]\n", h->TypeName);
@@ -1349,6 +1369,7 @@ static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBu
     buf->appendf("scale=%.3f\n", g_uiScale);
     buf->appendf("recdir=%s\n",  g_recDir);
     buf->appendf("rectmpl=%s\n", g_recTmpl);
+    for (const auto& [k, kind] : g_streamKind) buf->appendf("streamkind=%d %s\n", kind ? 1 : 0, k.c_str());
     buf->append("\n");
 }
 // SDL folder-picker callback → sets the output directory.
@@ -1945,7 +1966,7 @@ int main(int argc, char** argv) {
             };
             auto connectStream = [&](lsl::stream_info& info) {
                 dismissed.erase(streamKey(info));
-                if (isMarkerStream(info)) {
+                if (effMarker(info)) {
                     auto m = std::make_unique<MarkerSource>(info); m->start();
                     markerSources.push_back(std::move(m));
                 } else {
@@ -1965,6 +1986,33 @@ int main(int argc, char** argv) {
                     (*it)->requestStop(); closing.push_back(std::move(*it)); sources.erase(it);
                 }
             };
+            // Apply a pending "treat as marker" / "treat as data" toggle (set last frame by the
+            // Info-panel button or the rail right-click): tear down the stream's current source and
+            // rebuild it as the other type. Direct rebuild (not disconnect+connect) so it sidesteps
+            // the dismissed / auto-reconnect machinery.
+            if (!g_reclassifyKey.empty()) {
+                const std::string key = g_reclassifyKey; g_reclassifyKey.clear();
+                if (auto di = std::find_if(sources.begin(), sources.end(),
+                        [&](const std::unique_ptr<HfStreamSource>& p){ return streamKeyOf(*p) == key; });
+                    di != sources.end()) {                       // data -> marker
+                    lsl::stream_info info = (*di)->info();
+                    edgeMap.erase(di->get()); pauseHead.erase(di->get()); dispOpts.erase(di->get());
+                    (*di)->requestStop(); closing.push_back(std::move(*di)); sources.erase(di);
+                    if (isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = true;
+                    auto m = std::make_unique<MarkerSource>(info); m->start();
+                    markerSources.push_back(std::move(m));
+                    ImGui::MarkIniSettingsDirty();
+                } else if (auto mi = std::find_if(markerSources.begin(), markerSources.end(),
+                        [&](const std::unique_ptr<MarkerSource>& p){ return streamKeyOf(*p) == key; });
+                    mi != markerSources.end()) {                 // marker -> data
+                    lsl::stream_info info = (*mi)->info();
+                    (*mi)->requestStop(); closingMrk.push_back(std::move(*mi)); markerSources.erase(mi);
+                    if (!isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = false;
+                    auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
+                    sources.push_back(std::move(s));
+                    ImGui::MarkIniSettingsDirty();
+                }
+            }
             if (autoConnect)
                 for (auto& info : found)
                     if (!dismissed.count(streamKey(info)) && !connected(info))
@@ -2287,7 +2335,7 @@ int main(int argc, char** argv) {
                 ImGui::PushID(info.uid().c_str());
                 const float rowH = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
                 char label[256];
-                if (isMarkerStream(info)) {
+                if (effMarker(info)) {
                     // Marker/event stream: connects to a MarkerSource that overlays
                     // event lines on the time-series plots (no waveform window).
                     MarkerSource* m = nullptr;
@@ -2318,6 +2366,14 @@ int main(int argc, char** argv) {
                         if (!m) connectStream(info);            // connect
                         else    disconnectKey(streamKey(info)); // disconnect (no window to close)
                     }
+                    // A numeric stream shown as markers (declared a "Markers" type, or reclassified)
+                    // can go back to a waveform via right-click. Native string markers can't be data.
+                    if (m && info.channel_format() != lsl::cf_string &&
+                        ImGui::BeginPopupContextItem("##mk2data")) {
+                        if (ImGui::MenuItem("Treat as data stream"))
+                            g_reclassifyKey = streamKey(info);
+                        ImGui::EndPopup();
+                    }
                 } else {
                     HfStreamSource* csrc = nullptr;
                     for (auto& s : sources)
@@ -2346,6 +2402,15 @@ int main(int argc, char** argv) {
                     if (clicked) {
                         if (!csrc) connectStream(info);                        // connect
                         else       ImGui::SetWindowFocus(info.name().c_str());  // already on: focus its plot
+                    }
+                    // Irregular numeric stream (e.g. an int trigger arriving as a waveform): offer to
+                    // show it as event/marker overlays. Gated to irregular so a regular high-rate
+                    // stream can't accidentally become an event flood.
+                    if (csrc && info.nominal_srate() == 0.0 &&
+                        ImGui::BeginPopupContextItem("##data2mk")) {
+                        if (ImGui::MenuItem("Treat as marker (show as events)"))
+                            g_reclassifyKey = streamKey(info);
+                        ImGui::EndPopup();
                     }
                 }
                 ImGui::Separator();

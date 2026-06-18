@@ -32,6 +32,9 @@ something concrete to lock onto:
                                  pauses -> exercises the irregular-numeric path.
   markers     1 ch   string IRREGULAR  infrequent (~1/s) event labels.
   fastmarkers 1 ch   string IRREGULAR  frequent (~30/s) trigger codes.
+  trigger     1 ch   int32  IRREGULAR  trigger codes (1/2/4/8/16, ~2/s); type
+                                 "Markers" so it shows as events by default
+                                 (right-click its rail row to treat as data).
   drift       5 ch   @ 250 Hz   float  per-channel sub-Hz drift (0.05-1 Hz) over a
                                  big DC offset + a shared 10 Hz tone -> empirically
                                  test the high-pass across its 0.5 Hz cutoff.
@@ -62,7 +65,7 @@ import threading
 import time
 
 import numpy as np
-from pylsl import StreamInfo, StreamOutlet, local_clock, cf_float32, cf_string, IRREGULAR_RATE
+from pylsl import StreamInfo, StreamOutlet, local_clock, cf_float32, cf_int32, cf_string, IRREGULAR_RATE
 
 # 10-20 montage labels, extended/cycled to whatever channel count is requested.
 _MONTAGE = [
@@ -380,7 +383,7 @@ def build_streams(selected, args, stop, host_suffix):
     # device timebases (worst case). The recorder must capture these timestamps faithfully. (On a
     # single host this only shifts the recorded VALUES — there's no real clock to time-correct — so
     # it exercises faithful capture, not cross-machine sync.) 0 by default = the reference clock.
-    _keys = ["eeg", "accel", "sine", "markers", "chirp", "hd", "drift", "audio", "fastmarkers"]
+    _keys = ["eeg", "accel", "sine", "markers", "chirp", "hd", "drift", "audio", "fastmarkers", "trigger"]
     def _step(name):
         return (_keys.index(name) - len(_keys) // 2) if name in _keys else 0
     def sk(name):
@@ -462,6 +465,19 @@ def build_streams(selected, args, stop, host_suffix):
         spawn(run_markers, out, stop, rng, labels, 30.0, sk("fastmarkers"), dr("fastmarkers"))
         started.append("fastmarkers  1ch @ irregular  string (~30/s)")
 
+    if "trigger" in selected:
+        # Triggers sent as an irregular INT stream (common with hardware/parallel-port boxes).
+        # run_markers pushes random.choice(codes); on a cf_int32 outlet each is sent as an int.
+        # type "Markers" makes the viewer show it as events by default; right-click the rail row
+        # to "Treat as data stream" if you want the raw waveform instead.
+        codes = [1, 2, 4, 8, 16]
+        info = StreamInfo(f"MockNumericTrigger{host_suffix}", "Markers", 1, IRREGULAR_RATE,
+                          cf_int32, "mock-trigger")
+        add_channels(info, ["trigger"], "", "misc")
+        out = StreamOutlet(info)
+        spawn(run_markers, out, stop, rng, codes, 2.0, sk("trigger"), dr("trigger"))
+        started.append("trigger      1ch @ irregular  int32  (codes 1/2/4/8/16, ~2/s)")
+
     if "drift" in selected:
         sr = 250
         freqs = [0.05, 0.1, 0.2, 0.4, 1.0]
@@ -494,7 +510,7 @@ def build_streams(selected, args, stop, host_suffix):
 
 
 ALL = ["eeg", "highdensity", "chirp", "sine", "accel", "flaky", "mouse",
-       "markers", "fastmarkers", "evoked", "drift", "audio"]
+       "markers", "fastmarkers", "trigger", "evoked", "drift", "audio"]
 
 
 def main():

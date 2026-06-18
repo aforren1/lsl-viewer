@@ -128,6 +128,7 @@ public:
     const std::string& type()     const { return type_; }
     const std::string& uid()      const { return uid_; }
     const std::string& sourceId() const { return sourceId_; }  // globally-unique, reconnect-stable
+    const lsl::stream_info& info() const { return info_; }      // for reclassify (rebuild as a MarkerSource)
     int    channels() const { return channels_; }
     double srate()    const { return srate_; }
     double dt()       const { return dt_; }
@@ -652,6 +653,7 @@ public:
     const std::string& type()     const { return type_; }
     const std::string& uid()      const { return uid_; }
     const std::string& sourceId() const { return sourceId_; }
+    const lsl::stream_info& info() const { return info_; }      // for reclassify (rebuild as an HfStreamSource)
     int                channels() const { return channels_; }
 
     std::size_t count() const { std::lock_guard<std::mutex> lk(mtx_); return total_; }
