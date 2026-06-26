@@ -226,7 +226,9 @@ private:
         } else if (v == "selected") {
             reply(fd, st_->selectedText + "\n");
         } else if (v == "select") {                 // connect/disconnect (recording = connected set)
-            if (arg == "all") {
+            if (st_->recording) {                    // set is locked while recording (matches the UI)
+                reply(fd, "error: currently recording -- stop the recording before changing streams\n");
+            } else if (arg == "all") {
                 st_->setSelection = std::vector<std::string>{"*"};
                 reply(fd, "ok: connecting all\n");
             } else if (arg == "none") {

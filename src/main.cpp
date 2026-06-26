@@ -2066,15 +2066,18 @@ int main(int argc, char** argv) {
                     ImGui::MarkIniSettingsDirty();
                 }
             }
-            if (autoConnect)
+            // Auto-connect is suppressed while recording: the recorded set is fixed at Start, so a
+            // newly-appearing stream must not quietly join the display (it wouldn't be recorded).
+            if (autoConnect && !recorder.active())
                 for (auto& info : found)
                     if (!dismissed.count(streamKey(info)) && !connected(info))
                         connectStream(info);
 
             // Built-in demo: while it's emitting, auto-connect its own streams (source_id
             // "mock-*") so one click both publishes and shows them — but still honor a manual
-            // disconnect (dismissed), so a row's X stays closed without fighting it.
-            if (mockStreams.running())
+            // disconnect (dismissed), so a row's X stays closed without fighting it. Also frozen
+            // while recording (same fixed-set reason as above).
+            if (mockStreams.running() && !recorder.active())
                 for (auto& info : found)
                     if (info.source_id().rfind("mock-", 0) == 0 &&
                         !dismissed.count(streamKey(info)) && !connected(info))
@@ -2171,15 +2174,17 @@ int main(int argc, char** argv) {
                 // "*" = connect all discovered, empty = disconnect all, else make the
                 // connected set exactly the given keys.
                 if (rcState.setSelection) {
-                    const auto& sel = *rcState.setSelection;
-                    const bool all = (sel.size() == 1 && sel[0] == "*");
-                    const std::set<std::string> want(sel.begin(), sel.end());
-                    for (auto& info : found) {
-                        const std::string key = streamKey(info);
-                        const bool shouldConn = all || want.count(key) != 0;
-                        const bool isConn = connected(info);
-                        if (shouldConn && !isConn)      connectStream(info);
-                        else if (!shouldConn && isConn) disconnectKey(key);
+                    if (!recorder.active()) {   // ignore a select that raced an in-progress recording
+                        const auto& sel = *rcState.setSelection;
+                        const bool all = (sel.size() == 1 && sel[0] == "*");
+                        const std::set<std::string> want(sel.begin(), sel.end());
+                        for (auto& info : found) {
+                            const std::string key = streamKey(info);
+                            const bool shouldConn = all || want.count(key) != 0;
+                            const bool isConn = connected(info);
+                            if (shouldConn && !isConn)      connectStream(info);
+                            else if (!shouldConn && isConn) disconnectKey(key);
+                        }
                     }
                     rcState.setSelection.reset();
                 }
@@ -2415,14 +2420,15 @@ int main(int argc, char** argv) {
                     const bool clicked = ImGui::Selectable(label, false, 0, ImVec2(0, rowH));
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered()) {
+                        const char* act = recorder.active() ? "stop recording to change streams"
+                                                            : (m ? "click to disconnect" : "click to connect");
                         if (m) ImGui::SetTooltip("%s  (host: %s)\n%zu events total \xc2\xb7 overlay on"
-                                                 " the time-series plots (toggle per plot)"
-                                                 "\nclick to disconnect",
-                                                 info.uid().c_str(), info.hostname().c_str(), m->count());
-                        else   ImGui::SetTooltip("%s  (host: %s)\nclick to connect",
-                                                 info.uid().c_str(), info.hostname().c_str());
+                                                 " the time-series plots (toggle per plot)\n%s",
+                                                 info.uid().c_str(), info.hostname().c_str(), m->count(), act);
+                        else   ImGui::SetTooltip("%s  (host: %s)\n%s",
+                                                 info.uid().c_str(), info.hostname().c_str(), act);
                     }
-                    if (clicked) {
+                    if (clicked && !recorder.active()) {   // stream set is locked while recording
                         if (!m) connectStream(info);            // connect
                         else    disconnectKey(streamKey(info)); // disconnect (no window to close)
                     }
@@ -2456,12 +2462,13 @@ int main(int argc, char** argv) {
                     const bool clicked = ImGui::Selectable(label, false, 0, ImVec2(0, rowH));
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s  (host: %s)\nclick to %s",
+                        ImGui::SetTooltip("%s  (host: %s)\n%s",
                                           info.uid().c_str(), info.hostname().c_str(),
-                                          csrc ? "focus" : "connect");
+                                          (!csrc && recorder.active()) ? "stop recording to change streams"
+                                                                       : (csrc ? "click to focus" : "click to connect"));
                     if (clicked) {
-                        if (!csrc) connectStream(info);                        // connect
-                        else       ImGui::SetWindowFocus(info.name().c_str());  // already on: focus its plot
+                        if (!csrc) { if (!recorder.active()) connectStream(info); }  // connect (locked while recording)
+                        else       ImGui::SetWindowFocus(info.name().c_str());       // focus its plot (always allowed)
                     }
                     // Numeric stream the user wants as event/marker overlays. Offered for irregular
                     // streams (e.g. an int trigger arriving as a waveform) — gated so a regular
@@ -2584,7 +2591,9 @@ int main(int argc, char** argv) {
                     }
                 }
                 title += "###" + id;
-                ImGui::Begin(title.c_str(), &open);
+                // While recording, hide the close (X): closing the window disconnects the stream, and
+                // the connected set is locked for the duration of the recording.
+                ImGui::Begin(title.c_str(), recorder.active() ? nullptr : &open);
                 drawStream(*s, o, edge, /*followX=*/(!paused || justPaused), headFreeze,
                            markerViews, scratch);
                 ImGui::End();
