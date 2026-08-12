@@ -45,6 +45,41 @@ public:
         }
     }
 
+    // The resolved bin span [first, end) of a read request, captured from ONE closed_
+    // snapshot. The span is identical for every channel in a frame (it depends only on the
+    // request, not the channel), so a multi-channel plot resolves it once, builds the shared
+    // time axis once (binTimes), and reads per-channel min/max into it (binValues).
+    struct Span { std::uint64_t first = 0, end = 0; int n = 0; };
+
+    Span span(std::size_t bins, std::uint64_t endBin = 0) const {
+        const std::uint64_t closed   = closed_.load(std::memory_order_acquire);
+        const std::uint64_t end      = (endBin == 0 || endBin > closed) ? closed : endBin;
+        const std::uint64_t resident = std::min<std::uint64_t>(closed, capB_ - 1); // guard slot
+        const std::uint64_t oldest   = closed - resident;            // oldest still in buffer
+        const std::uint64_t avail    = (end > oldest) ? end - oldest : 0;
+        const std::uint64_t take     = std::min<std::uint64_t>(bins, avail);
+        return { end - take, end, (int)take };
+    }
+
+    // Fill the (channel-independent) bin time axis for a span. dt = 1/srate; t0 = time (s)
+    // of sample 0. x must hold >= s.n doubles.
+    void binTimes(const Span& s, double dt, double t0, double* x) const {
+        int n = 0;
+        for (std::uint64_t k = s.first; k < s.end; ++k)
+            x[n++] = t0 + dt * ((double)k * B_ + B_ * 0.5);   // double: absolute LSL time
+    }
+
+    // Fill one channel's min/max for a span. mn/mx must each hold >= s.n doubles.
+    void binValues(const Span& s, int c, double* mn, double* mx) const {
+        int n = 0;
+        for (std::uint64_t k = s.first; k < s.end; ++k) {
+            const std::size_t slot = (std::size_t)(k % capB_) * C_ + c;
+            mn[n] = mn_[slot];
+            mx[n] = mx_[slot];
+            ++n;
+        }
+    }
+
     // READER. `bins` closed bins for channel c ending at `endBin` (absolute bin
     // index, exclusive; 0 = the newest), ready for PlotShaded. x/mn/mx must each
     // hold >= bins floats. dt = 1/srate; t0 = time (s) of sample 0. Returns the
@@ -52,22 +87,10 @@ public:
     // a paused view anchored instead of following new data.
     int read(int c, std::size_t bins, double dt, double t0,
              double* x, double* mn, double* mx, std::uint64_t endBin = 0) const {
-        const std::uint64_t closed   = closed_.load(std::memory_order_acquire);
-        const std::uint64_t end      = (endBin == 0 || endBin > closed) ? closed : endBin;
-        const std::uint64_t resident = std::min<std::uint64_t>(closed, capB_ - 1); // guard slot
-        const std::uint64_t oldest   = closed - resident;            // oldest still in buffer
-        const std::uint64_t avail    = (end > oldest) ? end - oldest : 0;
-        const std::uint64_t take     = std::min<std::uint64_t>(bins, avail);
-        const std::uint64_t first    = end - take;
-        int n = 0;
-        for (std::uint64_t k = first; k < end; ++k) {
-            const std::size_t slot = (std::size_t)(k % capB_) * C_ + c;
-            x[n]  = t0 + dt * ((double)k * B_ + B_ * 0.5);   // double: absolute LSL time
-            mn[n] = mn_[slot];
-            mx[n] = mx_[slot];
-            ++n;
-        }
-        return n;
+        const Span s = span(bins, endBin);
+        binTimes(s, dt, t0, x);
+        binValues(s, c, mn, mx);
+        return s.n;
     }
 
     // Copy another summary's committed-bin state (for the pause snapshot — read() only needs

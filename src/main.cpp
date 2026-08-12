@@ -130,30 +130,47 @@ static double pcSeconds(Uint64 a, Uint64 b) {
     return (double)(b - a) / (double)SDL_GetPerformanceFrequency();
 }
 
-// Is this connected source the same stream as `info`? Prefer source_id (globally
-// unique and stable across reconnects) so a reconnected stream — which gets a new
-// uid — isn't treated as a brand-new stream and double-connected. Templated so it
-// works for both HfStreamSource and MarkerSource (both expose sourceId()/uid()).
-template <class Src>
-static bool sameStream(const Src& s, lsl::stream_info& info) {
-    const std::string sid = info.source_id();
-    return !sid.empty() ? (s.sourceId() == sid) : (s.uid() == info.uid());
-}
-
-// Marker/event streams are string-typed; they get a MarkerSource (overlay), not a
-// waveform plot.
-static bool isMarkerStream(lsl::stream_info& info) {
-    return info.channel_format() == lsl::cf_string;
-}
-
 // Stable key for "the user dismissed this stream" bookkeeping: source_id (globally
-// unique) when set, else uid. Works for a stream_info or any connected source.
-static std::string streamKey(lsl::stream_info& info) {
-    return !info.source_id().empty() ? info.source_id() : info.uid();
-}
+// unique, stable across reconnects) when set, else uid. Works for any connected source;
+// the resolved-stream equivalent is cached in FoundInfo::key below.
 template <class Src>
 static std::string streamKeyOf(const Src& s) {
     return !s.sourceId().empty() ? s.sourceId() : s.uid();
+}
+
+// Cached, per-refresh view of a resolved stream. The liblsl stream_info accessors
+// (source_id/uid/name/type/...) allocate cross-DLL strings on every call; the resolved set
+// only changes at the ~4 Hz discovery refresh, but the rail, autoconnect, and record code
+// read this metadata every frame. Compute it once per refresh and read the cache in the loop.
+struct FoundInfo {
+    lsl::stream_info info;         // live handle (needed to open an inlet on connect)
+    std::string key;               // streamKey: source_id or uid
+    std::string sourceId, uid;
+    std::string name, type, hostname;
+    int    channels = 0;
+    double srate    = 0.0;
+    bool   marker   = false;       // string-typed -> MarkerSource, not a waveform plot
+};
+static FoundInfo makeFound(lsl::stream_info info) {
+    FoundInfo f;
+    f.sourceId = info.source_id();
+    f.uid      = info.uid();
+    f.key      = !f.sourceId.empty() ? f.sourceId : f.uid;
+    f.name     = info.name();
+    f.type     = info.type();
+    f.hostname = info.hostname();
+    f.channels = info.channel_count();
+    f.srate    = info.nominal_srate();
+    f.marker   = info.channel_format() == lsl::cf_string;
+    f.info     = std::move(info);
+    return f;
+}
+// Is this connected source the same resolved stream? Prefer source_id (globally unique,
+// stable across reconnects) so a reconnected stream (new uid) isn't double-connected; fall
+// back to uid. Reads the cached FoundInfo fields, so no per-frame stream_info accessors.
+template <class Src>
+static bool sameStream(const Src& s, const FoundInfo& f) {
+    return !f.sourceId.empty() ? (s.sourceId() == f.sourceId) : (s.uid() == f.uid);
 }
 
 // BIDS-ish filename templating: substitute {subject}/{session}/{task}/{run}/{acq}/{modality}
@@ -905,16 +922,26 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             const bool   useEnv = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
             const float  inv    = (o.gainUv > 0.0f) ? 1.0f / o.gainUv : 0.0f;
             const std::size_t bins = envelopeBins();
+            // Envelope path: the bin span and its time axis are the same for every channel, and
+            // applyGaps (a gap-mutex lock + O(n) walk) would otherwise run per channel. Resolve
+            // the span + build the shared x + apply gaps ONCE here, then per channel read only
+            // its min/max (binValues). Raw path does the analogous hoist inside fillRaw.
+            MinMaxSummary::Span espan;
+            if (useEnv) {
+                espan = summ.span(bins, endBin);
+                sc.xShared.resize(std::max(espan.n, 0));
+                summ.binTimes(espan, dt, t0, sc.xShared.data());
+                if (espan.n > 0) s.applyGaps(sc.xShared.data(), espan.n);
+            }
             for (int j = 0; j < show; ++j) {
                 const int   c    = sc.visIdx[j];
                 const float lane = (float)(show - 1 - j);
                 const float g    = gain[c] * inv;
                 if (useEnv) {
                     LSL_ZONE("envelope");
-                    sc.x.resize(bins); sc.mn.resize(bins); sc.mx.resize(bins);
-                    const int n = summ.read(c, bins, dt, t0, sc.x.data(), sc.mn.data(),
-                                            sc.mx.data(), endBin);
-                    s.applyGaps(sc.x.data(), n);
+                    const int n = espan.n;
+                    sc.mn.resize(n); sc.mx.resize(n);
+                    summ.binValues(espan, c, sc.mn.data(), sc.mx.data());
                     if (o.autoGainReq && n > 0) {                // measure amplitude only on request
                         sc.ampScratch.resize(n);
                         for (int i = 0; i < n; ++i) sc.ampScratch[i] = 0.5f * (float)(sc.mx[i] - sc.mn[i]);
@@ -927,7 +954,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                         sc.mx[i] = lane + sc.mx[i] * g;
                     }
                     char id[12]; std::snprintf(id, sizeof(id), "##b%d", c);
-                    ImPlot::PlotShaded(id, sc.x.data(), sc.mn.data(), sc.mx.data(), n, bandSpec(c));
+                    ImPlot::PlotShaded(id, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, bandSpec(c));
                 } else {
                     LSL_ZONE("raw");
                     const int n = fillRaw(c, sc.x, sc.y);
@@ -988,6 +1015,15 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         const double visSamples = ImPlot::GetPlotLimits().X.Size() * rate;
         const bool   useEnv = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
         const std::size_t bins = envelopeBins();
+        // Hoist the shared envelope span + time axis + applyGaps out of the per-channel loop
+        // (same as the stacked branch above).
+        MinMaxSummary::Span espan;
+        if (useEnv) {
+            espan = summ.span(bins, endBin);
+            sc.xShared.resize(std::max(espan.n, 0));
+            summ.binTimes(espan, dt, t0, sc.xShared.data());
+            if (espan.n > 0) s.applyGaps(sc.xShared.data(), espan.n);
+        }
 
         for (int j = 0; j < show; ++j) {
             const int   c     = sc.visIdx[j];
@@ -995,12 +1031,11 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             const char* label = labels[c].c_str();
             if (useEnv) {
                 LSL_ZONE("envelope");
-                sc.x.resize(bins); sc.mn.resize(bins); sc.mx.resize(bins);
-                const int n = summ.read(c, bins, dt, t0, sc.x.data(), sc.mn.data(),
-                                        sc.mx.data(), endBin);
-                s.applyGaps(sc.x.data(), n);
+                const int n = espan.n;
+                sc.mn.resize(n); sc.mx.resize(n);
+                summ.binValues(espan, c, sc.mn.data(), sc.mx.data());
                 if (yoff != 0.0f) for (int i = 0; i < n; ++i) { sc.mn[i] += yoff; sc.mx[i] += yoff; }
-                ImPlot::PlotShaded(label, sc.x.data(), sc.mn.data(), sc.mx.data(), n, bandSpec(c));
+                ImPlot::PlotShaded(label, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, bandSpec(c));
             } else {
                 LSL_ZONE("raw");
                 const int n = fillRaw(c, sc.x, sc.y);
@@ -1902,39 +1937,41 @@ int main(int argc, char** argv) {
             const ImGuiViewport* vp = ImGui::GetMainViewport();
             // discovery.snapshot() deep-copies every resolved stream_info (XML included);
             // the set changes slowly, so refresh at ~4 Hz and reuse the cache otherwise.
-            static std::vector<lsl::stream_info> found;
+            static std::vector<FoundInfo> found;
             static double lastDiscovery = -1e18;
             if (dueEvery(lastDiscovery, 0.25)) {
-                found = discovery.snapshot();
-                found.erase(std::remove_if(found.begin(), found.end(),   // hide our own RC beacon
-                    [](lsl::stream_info& i) { return i.source_id().rfind("lsl-viewer-rc", 0) == 0; }),
-                    found.end());
+                auto snap = discovery.snapshot();
+                found.clear();
+                found.reserve(snap.size());
+                for (auto& i : snap)
+                    if (i.source_id().rfind("lsl-viewer-rc", 0) != 0)   // hide our own RC beacon
+                        found.push_back(makeFound(std::move(i)));
             }
             // Connect / disconnect a stream — ONE implementation, shared by autoconnect,
             // the row-click handler, the window-close (X), and the remote `select` command.
-            auto connected = [&](lsl::stream_info& info) {
-                for (auto& s : sources)       if (sameStream(*s, info)) return true;
-                for (auto& m : markerSources) if (sameStream(*m, info)) return true;
+            auto connected = [&](const FoundInfo& fi) {
+                for (auto& s : sources)       if (sameStream(*s, fi)) return true;
+                for (auto& m : markerSources) if (sameStream(*m, fi)) return true;
                 return false;
             };
-            auto connectStream = [&](lsl::stream_info& info) {
-                dismissed.erase(streamKey(info));
-                if (isMarkerStream(info)) {
-                    auto m = std::make_unique<MarkerSource>(info); m->start();
+            auto connectStream = [&](const FoundInfo& fi) {
+                dismissed.erase(fi.key);
+                if (fi.marker) {
+                    auto m = std::make_unique<MarkerSource>(fi.info); m->start();
                     markerSources.push_back(std::move(m));
                 } else {
                     // A numeric stream must have >=1 channel: the interleaved ring divides by
                     // the channel count (0 -> divide-by-zero crash). Refuse and mark dismissed
                     // so autoconnect doesn't retry it every frame.
-                    if (info.channel_count() < 1) {
-                        spdlog::warn("ignoring stream '{}': {} channels", info.name(), info.channel_count());
-                        dismissed.insert(streamKey(info));
+                    if (fi.channels < 1) {
+                        spdlog::warn("ignoring stream '{}': {} channels", fi.name, fi.channels);
+                        dismissed.insert(fi.key);
                         return;
                     }
                     const auto t = std::chrono::steady_clock::now();
-                    auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
+                    auto s = std::make_unique<HfStreamSource>(fi.info, 10.0); s->start();
                     sources.push_back(std::move(s));
-                    spdlog::debug("connect '{}' {:.2f} ms", info.name(),
+                    spdlog::debug("connect '{}' {:.2f} ms", fi.name,
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count());
                 }
             };
@@ -1948,27 +1985,26 @@ int main(int argc, char** argv) {
                 }
             };
             if (autoConnect)
-                for (auto& info : found)
-                    if (!dismissed.count(streamKey(info)) && !connected(info))
-                        connectStream(info);
+                for (auto& fi : found)
+                    if (!dismissed.count(fi.key) && !connected(fi))
+                        connectStream(fi);
 
             // Built-in demo: while it's emitting, auto-connect its own streams (source_id
             // "mock-*") so one click both publishes and shows them — but still honor a manual
             // disconnect (dismissed), so a row's X stays closed without fighting it.
             if (mockStreams.running())
-                for (auto& info : found)
-                    if (info.source_id().rfind("mock-", 0) == 0 &&
-                        !dismissed.count(streamKey(info)) && !connected(info))
-                        connectStream(info);
+                for (auto& fi : found)
+                    if (fi.sourceId.rfind("mock-", 0) == 0 &&
+                        !dismissed.count(fi.key) && !connected(fi))
+                        connectStream(fi);
 
             // Workspace restore: connect each required stream the FIRST time it appears (once,
             // so a later manual disconnect isn't fought). connectStream() clears `dismissed`.
             if (!wsRequired.empty())
-                for (auto& info : found) {
-                    const std::string k = streamKey(info);
+                for (auto& fi : found) {
                     for (auto& req : wsRequired)
-                        if (req.first == k && !wsConnectedOnce.count(k) && !connected(info)) {
-                            connectStream(info); wsConnectedOnce.insert(k);
+                        if (req.first == fi.key && !wsConnectedOnce.count(fi.key) && !connected(fi)) {
+                            connectStream(fi); wsConnectedOnce.insert(fi.key);
                         }
                 }
 
@@ -1997,7 +2033,7 @@ int main(int argc, char** argv) {
             // window or a marker overlay) — "what you're viewing is what you record".
             auto startRecording = [&]() {
                 std::vector<lsl::stream_info> rec;
-                for (auto& info : found) if (connected(info)) rec.push_back(info);
+                for (auto& fi : found) if (connected(fi)) rec.push_back(fi.info);
                 const std::string path = recFullPath();
                 if (recorder.start(path, rec))
                     spdlog::info("recording {} stream(s) -> {}", rec.size(), path);
@@ -2013,14 +2049,13 @@ int main(int argc, char** argv) {
                 static double lastPublish = -1e18;
                 if (dueEvery(lastPublish, 0.25)) {
                     std::string s;
-                    for (auto& info : found) {
+                    for (auto& fi : found) {
                         char ln[320];
-                        const double sr = info.nominal_srate();
                         std::snprintf(ln, sizeof(ln), "%s | %s | %s | %dch | %s%s\n",
-                                      streamKey(info).c_str(), info.name().c_str(), info.type().c_str(),
-                                      info.channel_count(),
-                                      sr > 0 ? std::to_string((int)sr).c_str() : "irregular",
-                                      connected(info) ? "  [rec]" : "");
+                                      fi.key.c_str(), fi.name.c_str(), fi.type.c_str(),
+                                      fi.channels,
+                                      fi.srate > 0 ? std::to_string((int)fi.srate).c_str() : "irregular",
+                                      connected(fi) ? "  [rec]" : "");
                         s += ln;
                     }
                     rcState.streamsText = s;
@@ -2037,7 +2072,7 @@ int main(int argc, char** argv) {
                                        ? recorder.path() : std::string();
                     rcState.selectedText = [&]{
                         std::string j;
-                        for (auto& info : found) if (connected(info)) j += streamKey(info) + " ";
+                        for (auto& fi : found) if (connected(fi)) j += fi.key + " ";
                         return j.empty() ? std::string("none") : j;
                     }();
                 }
@@ -2060,12 +2095,11 @@ int main(int argc, char** argv) {
                     const auto& sel = *rcState.setSelection;
                     const bool all = (sel.size() == 1 && sel[0] == "*");
                     const std::set<std::string> want(sel.begin(), sel.end());
-                    for (auto& info : found) {
-                        const std::string key = streamKey(info);
-                        const bool shouldConn = all || want.count(key) != 0;
-                        const bool isConn = connected(info);
-                        if (shouldConn && !isConn)      connectStream(info);
-                        else if (!shouldConn && isConn) disconnectKey(key);
+                    for (auto& fi : found) {
+                        const bool shouldConn = all || want.count(fi.key) != 0;
+                        const bool isConn = connected(fi);
+                        if (shouldConn && !isConn)      connectStream(fi);
+                        else if (!shouldConn && isConn) disconnectKey(fi.key);
                     }
                     rcState.setSelection.reset();
                 }
@@ -2184,7 +2218,7 @@ int main(int argc, char** argv) {
                     std::snprintf(g_recDir, sizeof(g_recDir), "%s", g_folderPicked.c_str());
                     ImGui::MarkIniSettingsDirty();
                 }
-                int nConn = 0; for (auto& info : found) if (connected(info)) ++nConn;
+                int nConn = 0; for (auto& fi : found) if (connected(fi)) ++nConn;
                 if (!recorder.active()) {
                     const float bw = ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2;
                     ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
@@ -2276,25 +2310,25 @@ int main(int argc, char** argv) {
             }
             sectionHeader("Streams");
 
-            for (auto& info : found) {
-                ImGui::PushID(info.uid().c_str());
+            for (auto& fi : found) {
+                ImGui::PushID(fi.uid.c_str());
                 const float rowH = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
                 char label[256];
-                if (isMarkerStream(info)) {
+                if (fi.marker) {
                     // Marker/event stream: connects to a MarkerSource that overlays
                     // event lines on the time-series plots (no waveform window).
                     MarkerSource* m = nullptr;
                     for (auto& ms : markerSources)
-                        if (sameStream(*ms, info)) { m = ms.get(); break; }
+                        if (sameStream(*ms, fi)) { m = ms.get(); break; }
                     // NOTE: end with "###r" so the per-frame rate text doesn't change the
                     // Selectable's ID (which would break click press/release tracking —
                     // this was why marker rows couldn't be clicked to disconnect).
                     if (m) std::snprintf(label, sizeof(label),
                                          "[on] %s\n     markers \xc2\xb7 %.1f/s###r",
-                                         info.name().c_str(), m->rate());
+                                         fi.name.c_str(), m->rate());
                     else   std::snprintf(label, sizeof(label),
                                          "%s\n     markers \xc2\xb7 string events###r",
-                                         info.name().c_str());
+                                         fi.name.c_str());
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         m ? ImVec4(0.85f, 0.8f, 0.45f, 1) : ImGui::GetStyleColorVec4(ImGuiCol_Text));
                     const bool clicked = ImGui::Selectable(label, false, 0, ImVec2(0, rowH));
@@ -2303,29 +2337,29 @@ int main(int argc, char** argv) {
                         if (m) ImGui::SetTooltip("%s  (host: %s)\n%zu events total \xc2\xb7 overlay on"
                                                  " the time-series plots (toggle per plot)"
                                                  "\nclick to disconnect",
-                                                 info.uid().c_str(), info.hostname().c_str(), m->count());
+                                                 fi.uid.c_str(), fi.hostname.c_str(), m->count());
                         else   ImGui::SetTooltip("%s  (host: %s)\nclick to connect",
-                                                 info.uid().c_str(), info.hostname().c_str());
+                                                 fi.uid.c_str(), fi.hostname.c_str());
                     }
                     if (clicked) {
-                        if (!m) connectStream(info);            // connect
-                        else    disconnectKey(streamKey(info)); // disconnect (no window to close)
+                        if (!m) connectStream(fi);            // connect
+                        else    disconnectKey(fi.key);        // disconnect (no window to close)
                     }
                 } else {
                     HfStreamSource* csrc = nullptr;
                     for (auto& s : sources)
-                        if (sameStream(*s, info)) { csrc = s.get(); break; }
+                        if (sameStream(*s, fi)) { csrc = s.get(); break; }
                     const bool  stale = csrc && csrc->staleSeconds() > 1.0;
                     const char* tag   = !csrc ? "" : (stale ? "[no data] " : "[on] ");
                     // Whole entry is clickable: connect (or focus its plot if connected).
                     char rate[24];
-                    if (info.nominal_srate() > 0.0)
-                        std::snprintf(rate, sizeof(rate), "@ %.0f Hz", info.nominal_srate());
+                    if (fi.srate > 0.0)
+                        std::snprintf(rate, sizeof(rate), "@ %.0f Hz", fi.srate);
                     else
                         std::snprintf(rate, sizeof(rate), "irregular");   // resampled on connect
                     std::snprintf(label, sizeof(label), "%s%s\n     %s \xc2\xb7 %dch \xc2\xb7 %s###r",
-                                  tag, info.name().c_str(), info.type().c_str(),
-                                  info.channel_count(), rate);
+                                  tag, fi.name.c_str(), fi.type.c_str(),
+                                  fi.channels, rate);
                     const ImVec4 tc = !csrc ? ImGui::GetStyleColorVec4(ImGuiCol_Text)
                                       : (stale ? ImVec4(1.0f, 0.7f, 0.2f, 1)
                                                : ImVec4(0.40f, 0.85f, 0.45f, 1));
@@ -2334,11 +2368,11 @@ int main(int argc, char** argv) {
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s  (host: %s)\nclick to %s",
-                                          info.uid().c_str(), info.hostname().c_str(),
+                                          fi.uid.c_str(), fi.hostname.c_str(),
                                           csrc ? "focus" : "connect");
                     if (clicked) {
-                        if (!csrc) connectStream(info);                        // connect
-                        else       ImGui::SetWindowFocus(info.name().c_str());  // already on: focus its plot
+                        if (!csrc) connectStream(fi);                        // connect
+                        else       ImGui::SetWindowFocus(fi.name.c_str());   // already on: focus its plot
                     }
                 }
                 ImGui::Separator();
