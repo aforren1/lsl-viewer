@@ -58,7 +58,7 @@ zoomed views use the conditioned signal.
 
 ## Remote control
 
-With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client drives recording over TCP with newline-terminated commands; replies are human-readable lines. The commands:
+With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client drives recording over TCP with newline-terminated commands; replies are human-readable lines. The port binds loopback (127.0.0.1) only by default; there is no authentication, so set `LSL_RC_BIND=all` to expose it on the LAN (trusted networks only). The commands:
 
 | command | effect |
 |---|---|
@@ -68,7 +68,7 @@ With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), 
 | `set <subject\|session\|task\|run\|acq\|modality> <value>` | fill a filename-template field |
 | `filename <path>` | set the output path/template directly |
 | `start [path]` · `stop` | begin / end recording |
-| `get [path]` | stream a finished recording back to the client: a header line `OK <bytes> <name>` then `<bytes>` of raw XDF |
+| `get` | stream the last finished recording back to the client: a header line `OK <bytes> <name>` then `<bytes>` of raw XDF |
 | `status` | recording? + file / seconds / MB / streams |
 | `help` · `quit` | list commands / close the connection |
 
@@ -123,7 +123,7 @@ The control endpoint is also advertised over LSL (type `ViewerControl`); resolve
 
 ## Quick start
 
-Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.23 (on Linux, also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
+Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.22 (on Linux, also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

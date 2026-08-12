@@ -48,13 +48,6 @@ Stop with Ctrl+C.
 
 Requires: pylsl, numpy.
 """
-# /// script
-# requires-python = ">=3.9"
-# dependencies = [
-#     "pylsl",
-#     "numpy",
-# ]
-# ///
 
 import argparse
 import random
@@ -280,7 +273,7 @@ def make_accel_gen(srate, rng):
 
 
 # ---- irregular streams -----------------------------------------------------
-def run_mouse(outlet, stop, rng):
+def run_mouse(outlet, stop, rng, skew=0.0):
     x, y = 960.0, 540.0
     while not stop.is_set():
         # Jittered inter-sample interval, with occasional long idle pauses.
@@ -292,7 +285,7 @@ def run_mouse(outlet, stop, rng):
             break
         x = float(np.clip(x + rng.normal(0, 25), 0, 1920))
         y = float(np.clip(y + rng.normal(0, 25), 0, 1080))
-        outlet.push_sample([x, y], local_clock())
+        outlet.push_sample([x, y], local_clock() + skew)
 
 
 def run_markers(outlet, stop, rng, labels, rate_hz, skew=0.0):
@@ -374,12 +367,15 @@ def build_streams(selected, args, stop, host_suffix):
 
     # Per-stream timestamp skew (s) when --clock-skew is given, so streams sit on
     # distinct apparent clocks (the recorder's time-correction chunks realign them).
-    _order = ["eeg", "accel", "sine", "markers", "chirp", "hd", "mouse"]
+    # Every skew-able stream must appear here (drift and hd were missing, so their skew
+    # silently resolved to 0), and the index is used directly so each stream gets a distinct
+    # nonzero offset (eeg = 0 is the reference the others are measured against).
+    _order = ["eeg", "accel", "sine", "markers", "chirp", "hd", "drift", "mouse"]
     def sk(name):
         base = getattr(args, "clock_skew", 0.0) or 0.0
-        if base == 0.0:
+        if base == 0.0 or name not in _order:
             return 0.0
-        return round((_order.index(name) - 2 if name in _order else 0) * base, 4)
+        return round(_order.index(name) * base, 4)
 
     if "eeg" in selected:
         C, sr = args.eeg_channels, args.eeg_rate
@@ -397,7 +393,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockHighDensity{host_suffix}", "EEG", C, sr, cf_float32, "mock-hd")
         add_channels(info, [f"ch{i}" for i in range(C)], "microvolts", "EEG")
         out = StreamOutlet(info, chunk_size=int(sr * 0.01), max_buffered=360)
-        spawn(run_regular, "hd", out, sr, make_highdensity_gen(C, sr, rng), stop)
+        spawn(run_regular, "hd", out, sr, make_highdensity_gen(C, sr, rng), stop, 0.02, sk("hd"))
         started.append(f"highdensity  {C}ch @ {sr:g} Hz  float")
 
     if "chirp" in selected:
@@ -405,7 +401,7 @@ def build_streams(selected, args, stop, host_suffix):
         info = StreamInfo(f"MockChirp{host_suffix}", "Signal", 1, sr, cf_float32, "mock-chirp")
         add_channels(info, ["chirp"], "au", "misc")
         out = StreamOutlet(info)
-        spawn(run_regular, "chirp", out, sr, make_chirp_gen(sr, 1.0, 120.0, 8.0), stop)
+        spawn(run_regular, "chirp", out, sr, make_chirp_gen(sr, 1.0, 120.0, 8.0), stop, 0.02, sk("chirp"))
         started.append(f"chirp        1ch @ {sr} Hz  float  (1->120 Hz sweep)")
 
     if "sine" in selected:
@@ -429,7 +425,7 @@ def build_streams(selected, args, stop, host_suffix):
                           cf_float32, "mock-mouse")
         add_channels(info, ["mouse_x", "mouse_y"], "pixels", "Position")
         out = StreamOutlet(info)
-        spawn(run_mouse, out, stop, rng)
+        spawn(run_mouse, out, stop, rng, sk("mouse"))
         started.append("mouse        2ch @ irregular  float")
 
     if "flaky" in selected:

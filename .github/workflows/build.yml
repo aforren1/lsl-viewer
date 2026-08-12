@@ -56,6 +56,16 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release -DLSL_TESTS=ON &&
           cmake --build build-test --config Release --parallel
 
+      # Compile check for the Tracy-profiler build path (LSL_TRACY=ON), so a change that
+      # breaks the profiler.hpp Tracy branch / TracyClient link is caught in CI rather than
+      # only when someone profiles. One platform is enough to catch the guarded code.
+      - name: Build (Tracy profiler compile check)
+        if: runner.os == 'Linux'
+        run: >
+          cmake -S . -B build-tracy -G "${{ matrix.gen }}"
+          -DCMAKE_BUILD_TYPE=Release -DLSL_TRACY=ON &&
+          cmake --build build-tracy --config Release --parallel
+
       # Shippable artifact: a static Release build (LTO on) — SDL3 + liblsl folded into the
       # executable, so each binary is self-contained (no SDL3/lsl libs to ship alongside).
       - name: Build (release, static)
@@ -101,7 +111,10 @@ jobs:
       # the per-user locations. The portable .zip above is the no-install alternative.
       - name: Build Windows installer
         if: matrix.name == 'windows'
-        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\lsl-viewer.iss'
+        # Single-source the installer version from CMake's version.txt (project(... VERSION)).
+        run: |
+          $v = (Get-Content build/version.txt).Trim()
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$v" packaging\lsl-viewer.iss
 
       - name: Attest installer provenance
         if: matrix.name == 'windows' && github.event_name == 'push' && github.event.repository.visibility == 'public'
@@ -133,7 +146,7 @@ jobs:
           APP="LSL Viewer.app"                       # binary is static; only system frameworks remain
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp build/lsl_viewer "$APP/Contents/MacOS/"
-          cp packaging/Info.plist "$APP/Contents/"
+          cp build/Info.plist "$APP/Contents/"      # configured from ${PROJECT_VERSION}
           cp lsl_viewer.icns "$APP/Contents/Resources/"
           mkdir dmgroot
           cp -R "$APP" dmgroot/

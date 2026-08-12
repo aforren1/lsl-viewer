@@ -74,9 +74,14 @@ public:
     // these). The open accumulators are irrelevant to readers, so they're left as-is.
     void snapshotFrom(const MinMaxSummary& src) {
         C_ = src.C_; B_ = src.B_; capB_ = src.capB_;
+        // Load closed_ BEFORE copying mn_/mx_ (acquire pairs with commit()'s release): every
+        // bin below closed_ was fully written before it was published, so the copy captures it.
+        // Copying first and loading closed_ after can claim a bin whose copied slot still holds
+        // lapped data from capB_ bins ago, giving the paused envelope a stale right-edge bin.
+        const std::uint64_t closed = src.closed_.load(std::memory_order_acquire);
         mn_ = src.mn_; mx_ = src.mx_;
         binAbs_ = src.binAbs_;
-        closed_.store(src.closed_.load(std::memory_order_acquire), std::memory_order_release);
+        closed_.store(closed, std::memory_order_release);
     }
 
 private:

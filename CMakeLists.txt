@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
-project(lsl_viewer CXX)
+# Single source of truth for the version. Consumed by the Windows .rc (exe VERSIONINFO)
+# and available as ${PROJECT_VERSION} for packaging. Keep the .iss / Info.plist in step
+# (CI passes ${PROJECT_VERSION} to the installer).
+project(lsl_viewer VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,13 +32,20 @@ if(LSL_STATIC)
   endif()
 endif()
 
+# Version single-sourcing for packaging: the macOS bundle plist gets ${PROJECT_VERSION}
+# substituted, and version.txt lets the Windows installer step (CI) read the same value
+# without duplicating it. Keeps the exe, .app, and installer versions in step.
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/packaging/Info.plist.in
+               ${CMAKE_CURRENT_BINARY_DIR}/Info.plist @ONLY)
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/version.txt "${PROJECT_VERSION}")
+
 include(FetchContent)
 
 # --- SDL3 -------------------------------------------------------------------
-# Pin GIT_TAG to the latest SDL3 stable release (3.2.x line).
+# Pin GIT_TAG to a tagged SDL3 stable release (3.4.x line).
 FetchContent_Declare(SDL3
   GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-  GIT_TAG        release-3.4.10     # latest stable 3.4.x
+  GIT_TAG        release-3.4.10     # pinned stable 3.4.x
   GIT_SHALLOW    TRUE
 )
 # Trim SDL to the subsystems the viewer actually uses: video + SDL_GPU (Vulkan/D3D12)
@@ -182,9 +192,13 @@ add_executable(lsl_viewer src/main.cpp)
 target_include_directories(lsl_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lsl_viewer PRIVATE ui SDL3::SDL3 lsl spdlog::spdlog kissfft::kissfft)
 if(WIN32)
-  # Application icon: CMake compiles the .rc (rc.exe / windres) and links it in, so the
-  # exe carries its icon for the taskbar / Explorer / shortcuts. Path-relative to the .rc.
-  target_sources(lsl_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/packaging/lsl-viewer.rc)
+  # Application icon + version: CMake configures the .rc (ICON path + VERSIONINFO from
+  # ${PROJECT_VERSION}), compiles it (rc.exe / windres) and links it in, so the exe carries
+  # its icon and reports a version in Explorer / "Apps & features".
+  set(LSL_VIEWER_ICON "${CMAKE_CURRENT_SOURCE_DIR}/packaging/lsl-viewer.ico")  # forward slashes: rc accepts them
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/packaging/lsl-viewer.rc.in
+                 ${CMAKE_CURRENT_BINARY_DIR}/lsl-viewer.rc @ONLY)
+  target_sources(lsl_viewer PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/lsl-viewer.rc)
   # VirtualAlloc2 / MapViewOfFile3 (magic_ring_buffer.hpp) live in onecore.lib;
   # ws2_32 = Winsock for the remote-control TCP server (remote_control.hpp).
   target_link_libraries(lsl_viewer PRIVATE onecore ws2_32)

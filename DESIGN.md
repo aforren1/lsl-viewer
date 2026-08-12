@@ -2,20 +2,26 @@
 
 Cross-platform desktop app for visualising Lab Streaming Layer streams in real time.
 Stack: **SDL3 + SDL_GPU · Dear ImGui (docking) · ImPlot · liblsl C++ API**.
-Target: Windows / macOS (incl. Apple Silicon) / Linux. C++17.
+Target: Windows / macOS (incl. Apple Silicon) / Linux. C++20.
+
+> This is the original design brief. The architecture, ring-buffer, decimation, and
+> invariant sections below still describe the shipping code. The feature checklist near the
+> end has since been fully implemented; it is kept as a record of the original plan. For the
+> current file layout see [docs/building.md](docs/building.md); the source of truth is the code.
 
 ---
 
 ## Files in this repo
 
-| File | Status | Notes |
-|------|--------|-------|
-| `CMakeLists.txt` | working skeleton | FetchContent: SDL3, liblsl, imgui (docking), implot |
-| `main.cpp` | working skeleton | SDL3/GPU loop + basic stream browser + old plot path |
-| `lsl_source.hpp` | superseded (keep for Discovery) | Per-sample StreamSource + simple StreamBuffer — too slow for HF |
-| `magic_ring_buffer.hpp` | complete | Cross-platform mirrored ring + InterleavedRing SPSC |
-| `minmax_summary.hpp` | complete | Incremental absolute-indexed min/max for shimmer-free decimation |
-| `decimate.hpp` | superseded | Window-relative decimator — shimmers on scroll, replaced by MinMaxSummary |
+The signal path lives in single-header modules under `src/` (each documented in
+[docs/building.md](docs/building.md)). The load-bearing ones for this brief:
+
+| File | Notes |
+|------|-------|
+| `src/hf_stream_source.hpp` | High-frequency producer: `InterleavedRing` + `MinMaxSummary`, `pull_chunk_multiplexed` |
+| `src/magic_ring_buffer.hpp` | Cross-platform mirrored ring + `InterleavedRing` SPSC |
+| `src/minmax_summary.hpp` | Incremental absolute-indexed min/max for shimmer-free decimation |
+| `src/main.cpp` | SDL3/GPU loop, stream browser, all plot paths (time series / spectrum / spectrogram / ERP) |
 
 ---
 
@@ -135,62 +141,26 @@ SDL_SubmitGPUCommandBuffer
 
 ---
 
-## What still needs to be built
+## Original feature plan (implemented)
 
-### High-priority / core
+The items below were the original build-out plan. All have shipped; they are retained as a
+record of intent and to point at where each lives in the code. Verify against the source
+before treating any detail as current.
 
-- [ ] **New `HfStreamSource`** — replace the per-sample `StreamSource` in
-  `lsl_source.hpp` with a producer that uses `InterleavedRing` + `MinMaxSummary`
-  and pulls via `pull_chunk_multiplexed`. Wire `Discovery` (keep as-is) into it.
-- [ ] **Update `main.cpp` display path** — replace the old `StreamBuffer`/`PlotLine`
-  plot with `MinMaxSummary::read()` + `ImPlot::PlotShaded` for the envelope.
-  Keep `InterleavedRing::recent()` + raw `PlotLine` for the zoomed-in path
-  (when samples-per-pixel ≤ B).
-- [ ] **Time axis anchor** — map absolute sample index to wall-clock seconds using
-  the `(sample_index, lsl_local_timestamp)` anchor + `time_correction()` offset.
-- [ ] **Channel names** — parse `stream_info.desc()` XML for per-channel labels;
-  fall back to `ch0 … chN`.
+- **`HfStreamSource`** (`src/hf_stream_source.hpp`) — the `InterleavedRing` + `MinMaxSummary`
+  producer pulling via `pull_chunk_multiplexed`; the time-axis anchor and `time_correction()`
+  refresh live here, and channel labels come from `stream_info.desc()`.
+- **Display paths** (`src/main.cpp`) — `MinMaxSummary::read()` + `PlotShaded` envelope with a
+  raw `PlotLine` zoomed-in path, plus the marker overlay, heatmap/raster view, per-channel
+  gains, spectrum, spectrogram, and ERP views.
+- **Marker / irregular streams** — detected via `cf_string` / `nominal_srate() == 0`, with a
+  separate marker path (`MarkerSource`) and a sample-and-hold path for irregular numeric streams.
+- **FFT / spectrogram** — KissFFT (`src/fft.hpp`), rate-limited recompute, STFT spectrogram.
+- **Build / platform** — pinned `GIT_TAG`s (SDL3 `release-3.4.x`, liblsl tagged) and a
+  ubuntu / macos / windows CI matrix.
 
-### Marker / irregular streams
-
-- [ ] Detect `nominal_srate() == 0` or `channel_format() == cf_string`.
-- [ ] Small timestamp ring for irregular numeric streams.
-- [ ] String marker ring (separate from float ring).
-- [ ] Render markers as `ImPlot::PlotInfLines` / annotations overlaid on signal plots.
-
-### 304-channel visualisation
-
-- [ ] **Heatmap / raster view** — channels on Y, time on X, amplitude as colour.
-  `ImPlot::PlotHeatmap` for moderate resolution, or a scrolling `SDL_GPUTexture`
-  updated column-by-column (ring) for full rate. Primary view for dense arrays.
-- [ ] Focus-channel selection — user picks a subset (e.g. 8–16) for full
-  min/max trace view stacked with per-channel vertical offset.
-- [ ] Stack/offset toggle: add `c * offset_uV` to the envelope y for EEG-style display.
-
-### Supplementary analysis
-
-- [ ] **FFT plot** — per selected channel, `ring.recent()` → Hann window → real FFT
-  → `PlotLine` of magnitude spectrum. Library: **pffft** (SIMD, BSD, tiny) or
-  **KissFFT** (simpler API). Run on a dedicated analysis thread; publish results
-  via a small double-buffer.
-- [ ] **Spectrogram** — STFT feeding a scrolling texture (one new column per hop).
-  Upload via SDL_GPU `SDL_UploadToGPUTexture` or `ImPlot::PlotHeatmap` for
-  single-channel focus. Hann window, 50% overlap.
-
-### Min/max pyramid (zoom)
-
-- [ ] Add a second summary level at `4B` samples/bin (and optionally `16B`) so
-  zooming out further still gives ~1 bin/pixel without re-scanning the raw ring.
-  `MinMaxSummary::read()` already uses absolute bin indices; adding levels is
-  additive.
-
-### Build / platform
-
-- [ ] Pin `GIT_TAG` values in `CMakeLists.txt` to current stable releases (SDL3
-  `release-3.2.x`, liblsl latest tag).
-- [ ] Test `MagicRingBuffer` on Windows (onecore.lib link, teardown path).
-- [ ] Test on Apple Silicon (16 KB page, lcm sizing).
-- [ ] Add a CI matrix: ubuntu / macos / windows.
+Not yet built: the multi-level min/max pyramid (only one `B` level exists; a scrolling view
+still translates bins without re-scanning, so this is a zoom-range refinement, not a gap).
 
 ---
 

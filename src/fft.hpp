@@ -42,11 +42,14 @@ public:
     // Writes bins() power values into out.
     void compute(const float* src, int stride, std::vector<float>& out) {
         if (!cfg_) return;
+        // Gather the strided channel into contiguous in_ once, accumulating the mean in the
+        // same pass; then detrend+window contiguously. The strided read (a cache line per
+        // sample at stride = channel count) dominates, so doing it once instead of twice
+        // halves the memory traffic.
         double mean = 0.0;
-        for (int i = 0; i < N_; ++i) mean += src[(std::size_t)i * stride];
-        mean /= N_;
-        for (int i = 0; i < N_; ++i)
-            in_[i] = (float)(src[(std::size_t)i * stride] - mean) * win_[i];
+        for (int i = 0; i < N_; ++i) { const float v = src[(std::size_t)i * stride]; in_[i] = v; mean += v; }
+        const float m = (float)(mean / N_);
+        for (int i = 0; i < N_; ++i) in_[i] = (in_[i] - m) * win_[i];
         kiss_fftr(cfg_, in_.data(), spec_.data());     // unnormalized, same convention as before
         out.resize(bins());
         const float norm = 2.0f / (fs_ * winPow_);     // Welch one-sided

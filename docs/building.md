@@ -28,7 +28,7 @@ on Windows (More info → Run anyway).
 
 All third-party libraries (SDL3, liblsl, Dear ImGui, ImPlot, spdlog, KissFFT, and
 optionally Tracy / the ImGui Test Engine) are pulled in by CMake via `FetchContent` — so
-besides a C++20 compiler and CMake ≥ 3.23, the only system packages are SDL3's display
+besides a C++20 compiler and CMake ≥ 3.22, the only system packages are SDL3's display
 backends: on **Linux** install the X11 + Wayland dev headers (`libx11-dev libxext-dev
 libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxkbcommon-dev libwayland-dev
 wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl1-mesa-dev` …; SDL build-errors if
@@ -131,7 +131,7 @@ compiler supports IPO.
 
 The sources are portable (SDL_GPU uses the native D3D12 backend); only the build
 artifacts are platform-specific. Copy the **source** (not `build*/` or `.venv/`)
-to a native Windows path, install Visual Studio 2022 + CMake ≥ 3.23, then run the
+to a native Windows path, install Visual Studio 2022 + CMake ≥ 3.22, then run the
 same `cmake` configure/build (drop the Linux-only `-DSDL_X11=OFF`). `run.sh` and
 the Wayland environment are not needed — just launch `lsl_viewer.exe`.
 

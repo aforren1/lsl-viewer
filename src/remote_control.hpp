@@ -10,9 +10,14 @@
 //   filename <path>           set the output .xdf path
 //   start [path]              begin recording (optional path)
 //   stop                      stop recording
-//   get [path]                stream a finished recording to the client: a header line
-//                             "OK <bytes> <filename>" then <bytes> of raw file data
+//   get                       stream the last completed recording to the client: a header
+//                             line "OK <bytes> <filename>" then <bytes> of raw file data
 //   quit                      close the connection
+//
+// Security: `get` only serves the viewer's own last completed recording, never a
+// client-supplied path, so it is not an arbitrary-file read. The listener binds
+// loopback (127.0.0.1) by default; pass bindAll=true (LSL_RC_BIND=all) to expose it
+// on the network. There is no authentication, so only open it up on a trusted LAN.
 //
 // Discovery: while running we also publish an LSL outlet (name "LSLViewerControl",
 // type "ViewerControl"); a client resolves it, takes the host from info.hostname() and
@@ -95,7 +100,7 @@ public:
     int  port()      const { return port_; }
     std::string error() const { std::lock_guard<std::mutex> lk(emtx_); return error_; }
 
-    bool start(int port, RemoteState* state) {
+    bool start(int port, RemoteState* state, bool bindAll = false) {
         if (up_) return true;
 #if defined(_WIN32)
         static RcWsaInit s_wsa;   // process-lifetime Winsock init on first start()
@@ -108,7 +113,8 @@ public:
         ::setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_ANY);   // reachable on the network (lab tool)
+        // Loopback by default (no auth); bindAll exposes it on the network for lab use.
+        addr.sin_addr.s_addr = htonl(bindAll ? INADDR_ANY : INADDR_LOOPBACK);
         addr.sin_port = htons((uint16_t)port);
         if (::bind(listenfd_, (sockaddr*)&addr, sizeof(addr)) != 0) {
             setError("bind() failed (port in use?)"); rc_close(listenfd_); listenfd_ = RC_INVALID; return false;
@@ -139,6 +145,10 @@ public:
         announce_.reset();
         if (listenfd_ != RC_INVALID) { ::shutdown(listenfd_, RC_SHUT_RDWR); rc_close(listenfd_); listenfd_ = RC_INVALID; }
         th_.request_stop();
+        // Unblock a serve thread parked in recv() on an idle client, else join() hangs
+        // until that client happens to send or disconnect.
+        const rc_socket_t c = clientfd_.load(std::memory_order_acquire);
+        if (c != RC_INVALID) ::shutdown(c, RC_SHUT_RDWR);
         if (th_.joinable()) th_.join();
     }
 
@@ -148,7 +158,14 @@ private:
     void serve(stop_token stoke) {
         while (!stoke.stop_requested() && up_) {
             rc_socket_t fd = ::accept(listenfd_, nullptr, nullptr);
-            if (fd == RC_INVALID) break;                    // listenfd closed on stop()
+            if (fd == RC_INVALID) {
+                // stop() closed the listen socket -> exit; a transient accept error
+                // (client RST before accept, e.g. a port scanner) must not kill the
+                // server, so keep listening.
+                if (stoke.stop_requested() || !up_) break;
+                continue;
+            }
+            clientfd_.store(fd, std::memory_order_release);
             ::send(fd, kHello, (int)(sizeof(kHello) - 1), 0);
             std::string buf;
             char tmp[1024];
@@ -157,6 +174,9 @@ private:
                 const int n = (int)::recv(fd, tmp, (int)sizeof(tmp), 0);
                 if (n <= 0) break;
                 buf.append(tmp, (std::size_t)n);
+                // Cap the unterminated-line buffer so a client that never sends '\n'
+                // (garbage/binary traffic) can't grow it without bound.
+                if (buf.size() > kMaxLine) { reply(fd, "error: line too long\n"); break; }
                 std::size_t nl;
                 while ((nl = buf.find('\n')) != std::string::npos) {
                     std::string line = buf.substr(0, nl);
@@ -165,6 +185,7 @@ private:
                     if (!dispatch(fd, line)) { open = false; break; }
                 }
             }
+            clientfd_.store(RC_INVALID, std::memory_order_release);
             rc_close(fd);
         }
     }
@@ -179,15 +200,17 @@ private:
 
     void reply(rc_socket_t fd, const std::string& s) { ::send(fd, s.data(), (int)s.size(), 0); }
 
-    // Stream the last completed recording (or a given path) to the client: a header line
+    // Stream the last completed recording to the client: a header line
     // "OK <bytes> <filename>\n" followed by exactly <bytes> of raw file data. Blocking, on the
     // server thread (not the recording/UI thread); only the state mutex is held, briefly, to
     // read the path. The client reads the header, then reads <bytes> and saves them.
-    void sendFile(rc_socket_t fd, const std::string& arg) {
+    // The path is always the viewer's own lastFile, never client-supplied, so this cannot
+    // read an arbitrary file off the host.
+    void sendFile(rc_socket_t fd) {
         std::string path; bool recording;
         { std::lock_guard<std::mutex> lk(st_->mtx);
           recording = st_->recording;
-          path      = arg.empty() ? st_->lastFile : arg; }
+          path      = st_->lastFile; }
         if (recording)    { reply(fd, "error: stop the recording before `get`\n"); return; }
         if (path.empty()) { reply(fd, "error: no completed recording yet\n"); return; }
         std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -212,13 +235,13 @@ private:
     bool dispatch(rc_socket_t fd, const std::string& line) {
         if (line.empty()) return true;
         std::string arg, v = verb(line, arg);
-        if (v == "get") { sendFile(fd, arg); return true; }   // binary transfer; locks only briefly
+        if (v == "get") { sendFile(fd); return true; }   // binary transfer; locks only briefly
         std::lock_guard<std::mutex> lk(st_->mtx);
         if (v == "help") {
             reply(fd, "commands: help status streams selected select filename set start stop get quit\n"
                       "  filename <template>   e.g. sub-{subject}_task-{task}_run-{run}_eeg.xdf\n"
                       "  set <field> <value>   subject|session|task|run  (also {datetime}/{date}/{time})\n"
-                      "  get [path]            stream a finished recording: 'OK <bytes> <name>' + raw data\n");
+                      "  get                   stream the last recording: 'OK <bytes> <name>' + raw data\n");
         } else if (v == "status") {
             reply(fd, st_->statusText + "\n");
         } else if (v == "streams") {
@@ -290,7 +313,9 @@ private:
     }
 
     static constexpr char kHello[] = "lsl-viewer remote control. type `help`.\n";
+    static constexpr std::size_t kMaxLine = 64 * 1024;   // reject an unterminated line past this
     rc_socket_t       listenfd_ = RC_INVALID;
+    std::atomic<rc_socket_t> clientfd_{RC_INVALID};   // active client, so stop() can unblock recv()
     jthread      th_;
     RemoteState*      st_ = nullptr;
     int               port_ = 0;
