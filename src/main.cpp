@@ -725,9 +725,14 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::BeginDisabled(!o.overlayMarkers);
         for (const auto& mv : markerViews) {
             bool on = o.markerOn.count(mv.id) ? o.markerOn[mv.id] : true;  // default on
+            // Scope by the stream's stable id: the label is the (user-chosen) stream name, which
+            // can collide with this section's own widgets — e.g. a stream literally named
+            // "Markers" would share the "Markers" header's ID — or with another same-named stream.
+            ImGui::PushID(mv.id.c_str());
             ImGui::PushStyleColor(ImGuiCol_Text, mv.col);
             if (ImGui::Checkbox(mv.name.c_str(), &on)) o.markerOn[mv.id] = on;
             ImGui::PopStyleColor();
+            ImGui::PopID();
         }
         ImGui::EndDisabled();
     }
