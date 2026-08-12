@@ -51,13 +51,6 @@ Stop with Ctrl+C.
 
 Requires: pylsl, numpy.
 """
-# /// script
-# requires-python = ">=3.9"
-# dependencies = [
-#     "pylsl",
-#     "numpy",
-# ]
-# ///
 
 import argparse
 import random
@@ -284,7 +277,7 @@ def make_accel_gen(srate, rng):
 
 
 # ---- irregular streams -----------------------------------------------------
-def run_mouse(outlet, stop, rng):
+def run_mouse(outlet, stop, rng, skew=0.0):
     x, y = 960.0, 540.0
     while not stop.is_set():
         # Jittered inter-sample interval, with occasional long idle pauses.
@@ -296,7 +289,7 @@ def run_mouse(outlet, stop, rng):
             break
         x = float(np.clip(x + rng.normal(0, 25), 0, 1920))
         y = float(np.clip(y + rng.normal(0, 25), 0, 1080))
-        outlet.push_sample([x, y], local_clock())
+        outlet.push_sample([x, y], local_clock() + skew)
 
 
 def run_markers(outlet, stop, rng, labels, rate_hz, skew=0.0, drift=0.0):
@@ -441,7 +434,7 @@ def build_streams(selected, args, stop, host_suffix):
                           cf_float32, "mock-mouse")
         add_channels(info, ["mouse_x", "mouse_y"], "pixels", "Position")
         out = StreamOutlet(info)
-        spawn(run_mouse, out, stop, rng)
+        spawn(run_mouse, out, stop, rng, sk("mouse"))
         started.append("mouse        2ch @ irregular  float")
 
     if "flaky" in selected:

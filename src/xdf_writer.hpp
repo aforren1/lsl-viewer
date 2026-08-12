@@ -94,10 +94,15 @@ public:
         f_.write(reinterpret_cast<const char*>(uuid), 16);
     }
 
+    // collection_time is local_clock() at the measurement; offset is inlet.time_correction()
+    // (local = remote + offset). The XDF ClockOffset CollectionTime field must be in the
+    // stream's own clock domain so pyxdf evaluates the fit at the sample timestamps, so store
+    // collection_time - offset (matching LabRecorder's xdfwriter). Storing raw local time
+    // desynchronizes any recording from a host whose LSL clock differs from ours.
     void clock_offset(streamid_t id, double collection_time, double offset) {
         lock l(m_);
         chunk_header(tag::clockoffset, 2 * sizeof(double), &id);
-        le(f_, collection_time); le(f_, offset);
+        le(f_, collection_time - offset); le(f_, offset);
     }
 
     // One Samples chunk: nsamp samples of nchan values of type T, with timestamps.
@@ -121,7 +126,14 @@ public:
         f_.write(b.data(), static_cast<std::streamsize>(b.size()));
     }
 
-    std::uint64_t bytes() { lock l(m_); return static_cast<std::uint64_t>(f_.tellp()); }
+    // tellp() returns -1 once the stream is in a fail state (e.g. disk full); report 0 rather
+    // than letting it cast to 2^64-1 and show an absurd byte count.
+    std::uint64_t bytes() {
+        lock l(m_);
+        const auto p = f_.tellp();
+        return p < 0 ? 0 : static_cast<std::uint64_t>(p);
+    }
+    bool ok() { lock l(m_); return static_cast<bool>(f_); }
 
 private:
     using lock = std::lock_guard<std::mutex>;

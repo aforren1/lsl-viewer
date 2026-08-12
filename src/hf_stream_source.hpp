@@ -197,6 +197,20 @@ public:
         for (auto& g : gaps_) if (g.first <= oldT) off += g.second;
         return oldT + off;
     }
+    // Inverse of realTime: map a real (wall-clock) time back to the index-derived
+    // "old-frame" time, subtracting every dropout that precedes it. Needed to turn a
+    // marker's real timestamp into a sample index (idx = (oldFrameTime(T) - t0) / dt).
+    // A T landing inside a dropout interval maps to the resumption boundary.
+    double oldFrameTime(double realT) const {
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        double off = gapBase_;
+        for (auto& g : gaps_) {
+            // Real-time position of this gap's far edge = g.first + off + g.second.
+            if (realT >= g.first + off + g.second) off += g.second;
+            else break;
+        }
+        return realT - off;
+    }
     // In-place old-frame -> real time for a monotonically increasing array.
     void applyGaps(double* x, int n) const {
         std::lock_guard<std::mutex> lk(gapMtx_);
@@ -332,13 +346,23 @@ private:
         try {
             lsl::stream_inlet inlet(info_, /*max_buflen*/ 360, /*max_chunklen*/ 0,
                                     /*recover*/ true);
-            inlet.open_stream();
+            // open_stream()'s default timeout is infinite and it is only cancelable between
+            // blocking calls, so a stream that vanished between resolve and connect would make
+            // this worker unjoinable (hanging shutdown). Poll with a finite timeout instead.
+            while (!st.stop_requested()) {
+                try { inlet.open_stream(1.0); break; }
+                catch (const lsl::timeout_error&) { /* keep retrying, but stay cancelable */ }
+            }
+            if (st.stop_requested()) { inlet.close_stream(); return; }
 
             // Full info (with desc()) only becomes available after the inlet
             // connects; the resolve result often lacks the channel descriptions.
             try { parseLabels(inlet.info(2.0)); } catch (...) { /* keep defaults */ }
 
-            double offset = inlet.time_correction(2.0);   // remote -> local clock
+            // A transient timeout on the initial correction must NOT kill the worker (the
+            // periodic refresh below recovers it); wrap it like that refresh does.
+            double offset = 0.0;
+            try { offset = inlet.time_correction(2.0); } catch (const std::exception&) { /* 0 until refresh */ }
             clockOffset_.store(offset, std::memory_order_relaxed);
             double lastCorr = lsl::local_clock();
 
@@ -435,7 +459,12 @@ private:
         try {
             lsl::stream_inlet inlet(info_, /*max_buflen*/ 360, /*max_chunklen*/ 0,
                                     /*recover*/ true);
-            inlet.open_stream();
+            // Finite-timeout poll so a vanished stream can't hang shutdown (see run()).
+            while (!st.stop_requested()) {
+                try { inlet.open_stream(1.0); break; }
+                catch (const lsl::timeout_error&) { /* keep retrying, stay cancelable */ }
+            }
+            if (st.stop_requested()) { inlet.close_stream(); return; }
             try { parseLabels(inlet.info(2.0)); } catch (...) { /* keep defaults */ }
             double offset = 0.0;
             try { offset = inlet.time_correction(2.0); } catch (...) {}
@@ -657,6 +686,7 @@ public:
     int                channels() const { return channels_; }
 
     std::size_t count() const { std::lock_guard<std::mutex> lk(mtx_); return total_; }
+    double firstTime() const { std::lock_guard<std::mutex> lk(mtx_); return firstT_; }  // 1st event seen (relative-time zero)
 
     // Events with display-time >= tmin (events_ is time-ordered). Bounds the per-frame
     // copy for long recordings — callers pass the oldest visible time.
@@ -683,6 +713,19 @@ public:
         return cached_;
     }
 
+    // The last up to `n` events, cached (rebuilt only when a new event arrives). For the
+    // standalone marker-event log, which wants a fixed line count regardless of rate, unlike
+    // cachedEvents()'s 64 s window. Main-thread only.
+    const std::vector<Event>& tailCached(std::size_t n) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (total_ != tailSeen_ || tailN_ != n) {
+            tailSeen_ = total_; tailN_ = n;
+            const std::size_t start = events_.size() > n ? events_.size() - n : 0;
+            tail_.assign(events_.begin() + start, events_.end());
+        }
+        return tail_;
+    }
+
     // Recent rate (events/s over the last `window` s) — more useful than a raw count
     // for a long session; 0 once events stop arriving.
     double rate(double window = 5.0) const {
@@ -705,8 +748,16 @@ private:
         try {
             lsl::stream_inlet inlet(info_, /*max_buflen*/ 360, /*max_chunklen*/ 0,
                                     /*recover*/ true);
-            inlet.open_stream();
-            double offset   = inlet.time_correction(2.0);   // remote -> local clock
+            // Finite-timeout poll so a vanished marker stream can't hang shutdown (see
+            // HfStreamSource::run()).
+            while (!st.stop_requested()) {
+                try { inlet.open_stream(1.0); break; }
+                catch (const lsl::timeout_error&) { /* keep retrying, stay cancelable */ }
+            }
+            if (st.stop_requested()) { inlet.close_stream(); return; }
+            // A transient timeout on the initial correction must not kill the worker.
+            double offset = 0.0;
+            try { offset = inlet.time_correction(2.0); } catch (const std::exception&) { /* 0 until refresh */ }
             double lastCorr = lsl::local_clock();
             std::vector<std::string> sample;
 
@@ -730,6 +781,7 @@ private:
                     if (!sample[c].empty()) text += ", " + sample[c];
 
                 std::lock_guard<std::mutex> lk(mtx_);
+                if (total_ == 0) firstT_ = ts + offset;   // stable zero for relative-time display
                 events_.push_back({ts + offset, std::move(text), total_});  // seq = ordinal
                 ++total_;
                 if (events_.size() > kMaxEvents)              // keep memory bounded
@@ -751,7 +803,10 @@ private:
     std::vector<Event>  events_;
     std::vector<Event>  cached_;         // render-thread snapshot (see cachedEvents)
     std::size_t         cachedSeen_ = (std::size_t)-1;  // total_ when cached_ was built
+    std::vector<Event>  tail_;           // render-thread snapshot (see tailCached)
+    std::size_t         tailSeen_ = (std::size_t)-1, tailN_ = 0;  // total_/n when tail_ was built
     std::size_t         total_ = 0;     // lifetime count (events_ is pruned)
+    double              firstT_ = 0.0;  // display time of the first event ever seen (relative-time zero)
     std::string         error_;
     std::atomic<double> lastData_{0.0};
     jthread        worker_;

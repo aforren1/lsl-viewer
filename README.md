@@ -21,6 +21,7 @@ I used AI (Claude Opus 4.8) to help me develop this tool. Special thanks to the 
 - A raster/heatmap mode for high channel counts (32–256+), where individual line traces become too thin to read.
 - Pause to inspect a frozen window.
 - Dropouts are drawn as gaps on the real timeline rather than concatenating across the missing span.
+- Marker/event streams overlay as labeled event lines on the time series; a standalone **Marker events** log (View menu) also lists them as a scrolling `time  value` feed, so events are visible even with no continuous stream running.
 
 ### Signal conditioning
 
@@ -56,24 +57,24 @@ zoomed views use the conditioned signal.
 ### Other
 
 - Docking layout: a Streams rail on the left; plots and analysis windows are tabs you arrange.
-- Saved workspaces: store the current view (per-stream filters/channels/gains, the open analysis windows, the dock layout) and reload it later. On load it reconnects the streams the workspace referenced (matched by `source_id`) and lists any that aren't on the network; recording is held until they connect or the notice is dismissed.
+- Saved workspaces: store the current view (per-stream filters/channels/gains, the open analysis windows, the dock layout) and reload it later. On load it reconnects the streams the workspace referenced (matched by source id + name) and lists any that aren't on the network; recording is held until they connect or the notice is dismissed.
 - Per-stream info: type, source id, channels, sensor positions, and live measured-rate / clock-offset / dropout counters.
 - TCP remote control for recording (see below).
 - Light / dark theme; layout persisted between sessions.
 
 ## Remote control
 
-With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client drives recording over TCP with newline-terminated commands; replies are human-readable lines. The commands:
+With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client drives recording over TCP with newline-terminated commands; replies are human-readable lines. The port binds loopback (127.0.0.1) only by default; there is no authentication, so to reach it from another machine turn on **Allow LAN access** in the Recording panel (or set `LSL_RC_BIND=all`) — trusted networks only. The commands:
 
 | command | effect |
 |---|---|
 | `streams` | list resolvable streams, one per line: `key \| name \| type \| Nch \| rate` |
 | `selected` | the keys currently connected (= what gets recorded) |
-| `select all\|none\|<k1,k2,…>` | choose which streams to connect/record (`key` = `source_id`); rejected while recording (the set is locked until `stop`) |
+| `select all\|none\|<k1,k2,…>` | choose which streams to connect/record (each `key` is the identifier shown by `streams`); rejected while recording (the set is locked until `stop`) |
 | `set <subject\|session\|task\|run\|acq\|modality> <value>` | fill a filename-template field |
 | `filename <path>` | set the output path/template directly |
 | `start [path]` · `stop` | begin / end recording |
-| `get [path]` | stream a finished recording back to the client: a header line `OK <bytes> <name>` then `<bytes>` of raw XDF |
+| `get` | stream the last finished recording back to the client: a header line `OK <bytes> <name>` then `<bytes>` of raw XDF |
 | `status` | recording? + file / seconds / MB / streams |
 | `help` · `quit` | list commands / close the connection |
 
@@ -93,7 +94,7 @@ with socket.create_connection(("localhost", 22345)) as rc:
     #   mock-evoked-markers | MockEvokedMarkers | Markers |  1ch | 0
     #   mock-audio          | MockAudio         | Audio   |  2ch | 48000
 
-    # record only the EEG + its markers (keys are the source_ids from `streams`)
+    # record only the EEG + its markers (keys come from the `streams` list)
     cmd(rc, "select mock-eeg,mock-evoked-markers")
     print(cmd(rc, "selected"))                 # -> mock-eeg mock-evoked-markers
 
@@ -140,7 +141,7 @@ The viewer renders through **SDL_GPU** (SDL3's GPU abstraction), so it needs a G
 
 ## Quick start
 
-Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.23 (on Linux, also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
+Dependencies are fetched by CMake; you need a C++20 compiler and CMake ≥ 3.22 (on Linux, also SDL3's display-backend headers; see [docs/building.md](docs/building.md)).
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

@@ -209,17 +209,21 @@ public:
 
     // Copy another ring's full state into this one (for the pause snapshot: a frozen view that
     // survives the live ring overwriting the same span). Same byte size -> same capacity, so
-    // absolute indices resolve identically; the head is copied too. Reading the live ring while
-    // the producer writes its newest samples can tear at the head, but the displayed window ends
-    // at that head, so any torn tail is off-screen — no lock needed (as elsewhere here).
+    // absolute indices resolve identically. Load the source head BEFORE the copy: the acquire
+    // makes every sample below it visible, so the memcpy captures them. Copying first and
+    // loading head after (the reverse) lets the producer advance head past slots the copy
+    // already passed and just overwrote, putting lap-old data at the snapshot's newest edge —
+    // exactly the samples a paused view reads. Any tear now lands above the frozen head (the
+    // oldest, off-screen region), so no lock is needed (as elsewhere here).
     void snapshotFrom(const InterleavedRing& src) {
         if (channels_ != src.channels_ || mem_.bytes() != src.mem_.bytes()) {
             channels_ = src.channels_;
             mem_.allocate(src.mem_.bytes());
             cap_samples_ = mem_.bytes() / ((std::size_t)channels_ * sizeof(float));
         }
+        const std::uint64_t h = src.head_.load(std::memory_order_acquire);
         std::memcpy(mem_.data(), src.mem_.data(), src.mem_.bytes());
-        head_.store(src.head_.load(std::memory_order_acquire), std::memory_order_release);
+        head_.store(h, std::memory_order_release);
     }
 
 private:

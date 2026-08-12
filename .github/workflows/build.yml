@@ -49,20 +49,43 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
-      # Compile check incl. the UI test suite + Test Engine (LSL_TESTS=ON, no LTO so the
+      # The release version's single specification point: the git tag. Computed once here and
+      # fed to CMake (-DLSL_VIEWER_VERSION below), which stamps the exe VERSIONINFO, the macOS plist,
+      # and version.txt (the installer reads it) so all three always agree. Non-tag builds
+      # (branch pushes / PRs) get an obvious 0.0.0.
+      - name: Determine version
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"                      # tag vX.Y.Z -> X.Y.Z
+          case "$ver" in [0-9]*) ;; *) ver=0.0.0 ;; esac  # non-tag build -> 0.0.0
+          echo "APP_VERSION=$ver" >> "$GITHUB_ENV"
+
+      # Compile check incl. the UI test suite + Test Engine (LSL_VIEWER_TESTS=ON, no LTO so the
       # link stays fast). The tests themselves need a GPU to run, so CI only builds them.
       - name: Build (with tests)
         run: >
           cmake -S . -B build-test -G "${{ matrix.gen }}"
-          -DCMAKE_BUILD_TYPE=Release -DLSL_TESTS=ON &&
+          -DCMAKE_BUILD_TYPE=Release -DLSL_VIEWER_TESTS=ON &&
           cmake --build build-test --config Release --parallel
+
+      # Compile check for the Tracy-profiler build path (LSL_VIEWER_TRACY=ON), so a change that
+      # breaks the profiler.hpp Tracy branch / TracyClient link is caught in CI rather than
+      # only when someone profiles. One platform is enough to catch the guarded code.
+      - name: Build (Tracy profiler compile check)
+        if: runner.os == 'Linux'
+        run: >
+          cmake -S . -B build-tracy -G "${{ matrix.gen }}"
+          -DCMAKE_BUILD_TYPE=Release -DLSL_VIEWER_TRACY=ON &&
+          cmake --build build-tracy --config Release --parallel
 
       # Shippable artifact: a static Release build (LTO on) — SDL3 + liblsl folded into the
       # executable, so each binary is self-contained (no SDL3/lsl libs to ship alongside).
       - name: Build (release, static)
+        # Quote -DLSL_VIEWER_VERSION so PowerShell (the Windows runner's shell) keeps the dotted value
+        # intact instead of stripping it to the major component.
         run: >
           cmake -S . -B build -G "${{ matrix.gen }}"
-          -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON &&
+          -DCMAKE_BUILD_TYPE=Release -DLSL_VIEWER_STATIC=ON "-DLSL_VIEWER_VERSION=${{ env.APP_VERSION }}" &&
           cmake --build build --config Release --parallel
 
       - name: Strip binaries (Unix)
@@ -102,10 +125,12 @@ jobs:
       # the per-user locations. The portable .zip above is the no-install alternative.
       - name: Build Windows installer
         if: matrix.name == 'windows'
+        # The installer version comes from build/version.txt, which CMake wrote from
+        # ${PROJECT_VERSION} = the tag (see the "Determine version" step + -DLSL_VIEWER_VERSION). So the
+        # installer, exe VERSIONINFO, and macOS plist all resolve to the same git tag.
         run: |
-          $ver = '${{ github.ref_name }}' -replace '^v', ''     # tag vX.Y.Z -> X.Y.Z
-          if ($ver -notmatch '^\d') { $ver = '0.0.0' }          # non-tag (branch) build -> obvious 0.0.0
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$ver" packaging\lsl-viewer.iss
+          $v = (Get-Content build/version.txt).Trim()
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$v" packaging\lsl-viewer.iss
 
       - name: Attest installer provenance
         if: matrix.name == 'windows' && github.event_name == 'push' && github.event.repository.visibility == 'public'
@@ -137,11 +162,10 @@ jobs:
           APP="LSL Viewer.app"                       # binary is static; only system frameworks remain
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp build/lsl_viewer "$APP/Contents/MacOS/"
-          cp packaging/Info.plist "$APP/Contents/"
+          # build/Info.plist is already configured with the tag version (CMake -DLSL_VIEWER_VERSION),
+          # so no PlistBuddy override is needed - one specification point (the tag).
+          cp build/Info.plist "$APP/Contents/"
           cp lsl_viewer.icns "$APP/Contents/Resources/"
-          ver="${GITHUB_REF_NAME#v}"; [[ "$ver" =~ ^[0-9] ]] || ver="0.0.0"   # tag vX.Y.Z -> X.Y.Z, else obvious 0.0.0
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $ver" \
-                                  -c "Set :CFBundleShortVersionString $ver" "$APP/Contents/Info.plist"
           mkdir dmgroot
           cp -R "$APP" dmgroot/
           ln -s /Applications dmgroot/Applications     # drag-to-install target
@@ -195,7 +219,7 @@ jobs:
 
       - name: Build (release, static, X11 + Wayland)
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLSL_VIEWER_STATIC=ON
           cmake --build build --parallel
 
       - name: Assemble AppDir
@@ -262,7 +286,7 @@ jobs:
       - name: Build (fully static, CLI only)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DLSL_CLI_ONLY=ON -DLSL_STATIC=ON \
+            -DLSL_CLI_ONLY=ON -DLSL_VIEWER_STATIC=ON \
             -DCMAKE_C_COMPILER="$PWD/z/zcc"   -DCMAKE_CXX_COMPILER="$PWD/z/zxx" \
             -DCMAKE_AR="$PWD/z/zar"           -DCMAKE_RANLIB="$PWD/z/zranlib" \
             -DCMAKE_C_COMPILER_AR="$PWD/z/zar"        -DCMAKE_CXX_COMPILER_AR="$PWD/z/zar" \

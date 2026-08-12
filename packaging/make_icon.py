@@ -6,6 +6,10 @@
 # dependencies = ["numpy"]
 # ///
 import subprocess, numpy as np
+from pathlib import Path
+
+HERE = Path(__file__).parent           # resolve output next to this script, not the CWD
+OUT  = HERE / "lsl-viewer.png"
 
 N = 256
 img = np.zeros((N, N, 4), np.float32)
@@ -48,5 +52,5 @@ for k, h in enumerate(heights):
 
 out = (np.clip(img, 0, 1)*255).astype(np.uint8).tobytes()
 subprocess.run(["ffmpeg","-v","error","-y","-f","rawvideo","-pix_fmt","rgba",
-                "-s",f"{N}x{N}","-i","-","packaging/lsl-viewer.png"], input=out, check=True)
-print("wrote packaging/lsl-viewer.png")
+                "-s",f"{N}x{N}","-i","-",str(OUT)], input=out, check=True)
+print(f"wrote {OUT}")

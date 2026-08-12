@@ -27,10 +27,14 @@ replies + the resulting `RemoteState`. Building with tests on runs the genuine
 Winsock path:
 
 ```powershell
-cmake -S . -B build-test -DCMAKE_BUILD_TYPE=Release -DLSL_TESTS=ON
-cmake --build build-test
-.\build-test\lsl_viewer.exe --tests remote
+cmake -S . -B build-test -DLSL_VIEWER_TESTS=ON
+cmake --build build-test --config Release
+.\build-test\Release\lsl_viewer.exe --tests remote
 ```
+
+(The default Windows generator is Visual Studio, a multi-config generator: it ignores
+`-DCMAKE_BUILD_TYPE` and picks the config at build time via `--config`, so the exe lands
+in a per-config subfolder.)
 
 Pass = `[tests] 1/1 passed`. (Drop the `remote` filter to run the whole suite.)
 This needs no streams, no GUI interaction, and no external client — if it passes,
@@ -55,8 +59,19 @@ $env:LSL_RC_PORT = "22345"
 ```
 
 (Equivalently: launch normally and tick **Remote control** in the Streams rail.)
-The first launch triggers a **Windows Firewall** dialog — allow access on private
-networks so a client elsewhere on the LAN can reach it (loopback works regardless).
+
+The server binds **loopback (127.0.0.1) only by default** — there is no authentication, so
+it is not exposed on the network unless you ask for it. To let a client elsewhere on the LAN
+reach it, tick **Allow LAN access** in the Recording panel (it re-binds the running server),
+or set `LSL_RC_BIND=all` before launching:
+
+```powershell
+$env:LSL_RC_PORT = "22345"; $env:LSL_RC_BIND = "all"
+.\build\lsl_viewer.exe
+```
+
+Either way the first exposure triggers a **Windows Firewall** dialog — allow access on private
+networks. For the loopback client below you do not need it.
 
 Have at least one stream on the network (from a machine with Python + the venv):
 
@@ -103,8 +118,10 @@ $c.Close()
       `streams` **and** appears as a plot in the viewer window (connection IS the
       record selector now — recording captures all connected streams)
 - [ ] `select all` / `select none` connect / disconnect everything
-- [ ] `start` then `stop` produces a `.xdf` (default `recording_{datetime}.xdf` in the
-      working dir); `status` shows `recording=true` with growing `bytes` while active
+- [ ] `start` then `stop` produces a `.xdf` (default is the BIDS template
+      `sub-{subject}/ses-{session}/{modality}/..._{modality}.xdf` under
+      `~/Documents/lsl-recordings`; `status` shows the resolved path); `status` shows
+      `recording=true` with growing `bytes` while active
 - [ ] the written file opens in pyxdf (`python -c "import pyxdf; print(len(pyxdf.load_xdf('...')[0]))"`)
 - [ ] **Stop is instant** — the "Stop recording" button (or `stop`) returns without a
       visible UI freeze (the worker joins happen on a background closer thread)

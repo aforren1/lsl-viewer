@@ -225,7 +225,10 @@ inline void MockStreams::run() {
         if (now >= nextStim) {
             const bool target = chance(0.4);
             evMarkOut.push_sample(std::vector<std::string>{ target ? "target" : "standard" }, now);
-            onsets.push_back({ evN, target });
+            // Anchor the response to the grid sample matching the marker's `now` timestamp, not
+            // the stale evN (last iteration's sample count, up to one loop period behind), else
+            // the mock P100/P300 land 0-16 ms early and jitter per trial.
+            onsets.push_back({ (long long)std::llround((now - start) * EV_SR), target });
             nextStim = now + uni(0.6f, 1.0f);
         }
         if (long long want = (long long)((now - start) * EV_SR); want > evN) {

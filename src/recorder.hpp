@@ -114,7 +114,14 @@ private:
         xdf::Writer& w = *wr;            // own ref; outlives a deferred close
         try {
             lsl::stream_inlet inlet(info, /*max_buflen*/ 360, /*max_chunklen*/ 0, /*recover*/ true);
-            inlet.open_stream();
+            // Finite-timeout poll: open_stream()'s default infinite timeout would leave this
+            // recording worker stuck if the stream vanished, hanging the next start()'s
+            // closer_.join() (which runs on the UI thread) and app exit.
+            while (!st.stop_requested()) {
+                try { inlet.open_stream(1.0); break; }
+                catch (const lsl::timeout_error&) { /* keep retrying, stay cancelable */ }
+            }
+            if (st.stop_requested()) return;
             lsl::stream_info full = inlet.info(5.0);     // full XML (with desc) after connect
             w.stream_header(id, full.as_xml());
             const int nchan = full.channel_count();
