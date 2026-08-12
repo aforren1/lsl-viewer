@@ -1,8 +1,18 @@
 cmake_minimum_required(VERSION 3.22)
-# Single source of truth for the version. Consumed by the Windows .rc (exe VERSIONINFO)
-# and available as ${PROJECT_VERSION} for packaging. Keep the .iss / Info.plist in step
-# (CI passes ${PROJECT_VERSION} to the installer).
-project(lsl_viewer VERSION 0.1.0 LANGUAGES CXX)
+# Minimum macOS version. MUST be set before project() so it propagates to compiler detection + every
+# FetchContent subproject (SDL3 included). Without it, a binary built on a newer CI runner inherits
+# that runner's floor and won't launch on older macOS ("requires a newer version"). Ignored off Apple.
+# 11.0 is the real floor: the CI arch is arm64 (which didn't exist before macOS 11), AND C++17
+# std::filesystem is weak-linked / unavailable below 10.15 (recorder.hpp's path() needs it). SDL_GPU's
+# Metal backend is fine well below both, so it's not the binding constraint despite the name.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
+
+# Version single-specification point: the git release tag. CI derives it from the tag and passes
+# -DLSL_VERSION=X.Y.Z; a plain dev build stays 0.0.0. It flows to the exe VERSIONINFO (.rc), the
+# macOS bundle plist, and the Windows installer (all configured from ${PROJECT_VERSION}), so the
+# three never disagree.
+set(LSL_VERSION "0.0.0" CACHE STRING "Release version (CI passes the git tag)")
+project(lsl_viewer VERSION ${LSL_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +26,11 @@ endif()
 option(LSL_TRACY "Enable the Tracy frame profiler" OFF)
 option(LSL_TESTS "Build with the Dear ImGui Test Engine and UI tests" OFF)
 option(LSL_STATIC "Static-link SDL3 + liblsl (+ static MSVC CRT) into one self-contained binary" OFF)
+# CLI-only skips every GUI dependency (SDL3/ImGui/ImPlot/KissFFT) and builds just the headless
+# xdf_record. Combined with LSL_STATIC + -static it yields a fully-static recorder (no glibc/GPU
+# deps) — e.g. under musl/Alpine — that runs on any Linux. The viewer needs the GPU/display stack
+# and can't be fully static, so it's excluded here.
+option(LSL_CLI_ONLY "Build only the headless xdf_record CLI (no GUI deps)" OFF)
 
 # Static linking: fold SDL3 and liblsl into the executable so distribution is a
 # single file (no SDL3.dll/lsl.dll alongside; on Windows also no VC++ redist).
@@ -61,9 +76,11 @@ set(SDL_HAPTIC   OFF CACHE BOOL "" FORCE)
 set(SDL_HIDAPI   OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR   OFF CACHE BOOL "" FORCE)
 set(SDL_POWER    OFF CACHE BOOL "" FORCE)
-# The viewer never synthesizes input or warps the mouse globally, so it doesn't need the
-# X11 XTest extension. Turning it off drops the libXtst build dependency on Linux. (The
-# other X11 extensions SDL checks are kept; they cover normal windowing.)
+# The viewer warps the cursor only *within* its own window (the UI-scale steppers, via
+# SDL_WarpMouseInWindow) and never synthesizes input or warps globally, so it doesn't need the X11
+# XTest extension: SDL's X11_WarpMouse falls back to core XWarpPointer when XTest is compiled out.
+# Turning it off drops the libXtst build dependency on Linux. (Other X11 extensions SDL checks are
+# kept; they cover normal windowing.)
 set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
 
 # --- liblsl -----------------------------------------------------------------
@@ -80,6 +97,9 @@ FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
   GIT_TAG        docking
   GIT_SHALLOW    TRUE
+  # Force the SDL_GPU backend to use MSL source instead of its macOS-14-only .metallib, so the
+  # viewer renders on macOS 11–13. See cmake/patch_imgui_msl.cmake for the full why.
+  PATCH_COMMAND  ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_imgui_msl.cmake
 )
 
 # --- ImPlot -----------------------------------------------------------------
@@ -131,7 +151,11 @@ if(LSL_TESTS)
   )
 endif()
 
-FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog kissfft)
+if(LSL_CLI_ONLY)
+  FetchContent_MakeAvailable(liblsl spdlog)              # xdf_record only needs these
+else()
+  FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog kissfft)
+endif()
 if(LSL_TRACY)
   FetchContent_MakeAvailable(tracy)
 endif()
@@ -139,13 +163,17 @@ if(LSL_TESTS)
   FetchContent_MakeAvailable(imgui_test_engine)
 endif()
 
+if(NOT LSL_CLI_ONLY)
 # Build imgui core + SDL3/SDL_GPU backends + implot as one static lib.
 add_library(ui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-  ${imgui_SOURCE_DIR}/imgui_demo.cpp
+  # imgui_demo.cpp deliberately omitted: nothing calls ShowDemoWindow/ShowStyleEditor/etc.
+  # (the Debug > Metrics window is ShowMetricsWindow, which lives in imgui.cpp). This doesn't
+  # change the binary (the linker already drops the unreferenced object from the static archive,
+  # and LTO eliminates it in shipping builds) — it just removes a ~5k-line TU from every build.
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp
   ${implot_SOURCE_DIR}/implot.cpp
@@ -211,8 +239,10 @@ if(WIN32)
       COMMAND_EXPAND_LISTS)
   endif()
 endif()
+endif()  # NOT LSL_CLI_ONLY
 
-# Headless XDF recorder CLI (no GUI deps) — same Recorder/xdf_writer as the viewer.
+# Headless XDF recorder CLI (no GUI deps) — same Recorder/xdf_writer as the viewer. Always built;
+# the only target in an LSL_CLI_ONLY configure.
 add_executable(xdf_record tools/xdf_record.cpp)
 target_include_directories(xdf_record PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(xdf_record PRIVATE lsl spdlog::spdlog)
@@ -223,12 +253,12 @@ if(WIN32 AND NOT LSL_STATIC)
     COMMAND_EXPAND_LISTS)
 endif()
 
-if(LSL_TRACY)
+if(LSL_TRACY AND NOT LSL_CLI_ONLY)
   target_compile_definitions(lsl_viewer PRIVATE LSL_TRACY)
   target_link_libraries(lsl_viewer PRIVATE Tracy::TracyClient)
 endif()
 
-if(LSL_TESTS)
+if(LSL_TESTS AND NOT LSL_CLI_ONLY)
   target_sources(lsl_viewer PRIVATE tests/ui_tests.cpp)
   target_compile_definitions(lsl_viewer PRIVATE LSL_TESTS)
   target_link_libraries(lsl_viewer PRIVATE imgui_te)
@@ -236,12 +266,12 @@ if(LSL_TESTS)
 endif()
 
 # Link-time optimization for shipping builds — trims unreferenced library code
-# (measured ~45% smaller binary, mostly LTO dropping unused ImGui/ImPlot incl.
-# imgui_demo). Negligible runtime gain (the app is GPU-bound and the hot CPU code
+# (measured ~45% smaller binary, mostly LTO dropping unused ImGui/ImPlot; imgui_demo
+# is already omitted from the build above). Negligible runtime gain (the app is GPU-bound and the hot CPU code
 # is already header-only/single-TU). Enabled for Release, but NOT for the test
 # build (LSL_TESTS = the iteration loop) nor the default RelWithDebInfo dev build,
 # so iterative links stay fast.
-if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT LSL_TESTS)
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT LSL_TESTS AND NOT LSL_CLI_ONLY)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg LANGUAGES CXX)  # project is CXX-only
   if(_ipo_ok)

@@ -29,7 +29,9 @@
 #include "mock_streams.hpp"
 #include "recorder.hpp"
 #include "remote_control.hpp"
+#include <cctype>
 #include <ctime>
+#include <map>
 #include <optional>
 #include <set>
 #include "fft.hpp"
@@ -130,6 +132,45 @@ static double pcSeconds(Uint64 a, Uint64 b) {
     return (double)(b - a) / (double)SDL_GetPerformanceFrequency();
 }
 
+// ImPlot tick formatter for the absolute-time (LSL clock) x-axis. LSL timestamps run large
+// (lsl_local_clock is uptime-based — easily 1e5+ on a machine that's been up a while, and macOS
+// starts higher than a fresh Linux boot), which ImPlot's default "%g" renders as "1.2e5". Force
+// fixed-point and trim trailing zeros so a 0.5 s grid reads "523456.5", not "523456.500" or "5.2e5".
+static int fmtTimeAxis(double value, char* buff, int size, void*) {
+    int n = snprintf(buff, size, "%.3f", value);
+    if (n <= 0 || n >= size) return n;
+    bool hasDot = false;
+    for (int i = 0; i < n; ++i) if (buff[i] == '.') { hasDot = true; break; }
+    if (hasDot) {
+        while (n > 0 && buff[n - 1] == '0') buff[--n] = '\0';
+        if (n > 0 && buff[n - 1] == '.') buff[--n] = '\0';
+    }
+    return n;
+}
+
+// Warp the OS cursor to the center of the last-submitted ImGui item. Used to keep a stepper button
+// under the mouse after a UI-scale change reflows the menu and moves the button, so it stays
+// clickable for repeated steps. ImGui and SDL3 window coords are both logical points (no DPI
+// conversion); this app is single-window (no multi-viewports) so the main-viewport origin is (0,0).
+// (On macOS the warp may be ignored due to cursor-position handling — harmless: the cursor just
+// doesn't follow, same as not having the feature.)
+static void warpMouseToItemCenter(SDL_Window* window) {
+    const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    const ImVec2 vp = ImGui::GetMainViewport()->Pos;
+    SDL_WarpMouseInWindow(window, 0.5f * (mn.x + mx.x) - vp.x, 0.5f * (mn.y + mx.y) - vp.y);
+}
+
+// A stream is a marker/event stream *by default* if it carries string values OR declares its type as
+// "Marker"/"Markers" (case-insensitive) — many trigger boxes send integer codes under a "Markers"
+// type. The per-stream override (g_streamKind) can flip this either way; see effMarker(). Called once
+// per discovery refresh from makeFound (its result is cached in FoundInfo::marker).
+static bool isMarkerStream(lsl::stream_info& info) {
+    if (info.channel_format() == lsl::cf_string) return true;
+    std::string t = info.type();
+    for (char& c : t) c = (char)std::tolower((unsigned char)c);
+    return t == "marker" || t == "markers";
+}
+
 // Stable key for "the user dismissed this stream" bookkeeping: source_id (globally
 // unique, stable across reconnects) when set, else uid. Works for any connected source;
 // the resolved-stream equivalent is cached in FoundInfo::key below.
@@ -137,6 +178,13 @@ template <class Src>
 static std::string streamKeyOf(const Src& s) {
     return !s.sourceId().empty() ? s.sourceId() : s.uid();
 }
+
+// Per-stream override of the marker-vs-data classification (keyed by stream key). Present = the user
+// explicitly chose (true = marker, false = data); absent = follow the isMarkerStream() default.
+// Persisted in imgui.ini; set by the rail's right-click menus. g_reclassifyKey is the pending toggle
+// (a stream key) that the connect loop applies next frame by reconnecting the stream as that type.
+static std::map<std::string, bool> g_streamKind;
+static std::string                 g_reclassifyKey;
 
 // Cached, per-refresh view of a resolved stream. The liblsl stream_info accessors
 // (source_id/uid/name/type/...) allocate cross-DLL strings on every call; the resolved set
@@ -149,21 +197,29 @@ struct FoundInfo {
     std::string name, type, hostname;
     int    channels = 0;
     double srate    = 0.0;
-    bool   marker   = false;       // string-typed -> MarkerSource, not a waveform plot
+    bool   marker       = false;   // type/format default (isMarkerStream); the user override is effMarker()
+    bool   stringMarker = false;   // native string stream (cf_string): can't be reclassified as data
 };
 static FoundInfo makeFound(lsl::stream_info info) {
     FoundInfo f;
-    f.sourceId = info.source_id();
-    f.uid      = info.uid();
-    f.key      = !f.sourceId.empty() ? f.sourceId : f.uid;
-    f.name     = info.name();
-    f.type     = info.type();
-    f.hostname = info.hostname();
-    f.channels = info.channel_count();
-    f.srate    = info.nominal_srate();
-    f.marker   = info.channel_format() == lsl::cf_string;
-    f.info     = std::move(info);
+    f.sourceId     = info.source_id();
+    f.uid          = info.uid();
+    f.key          = !f.sourceId.empty() ? f.sourceId : f.uid;
+    f.name         = info.name();
+    f.type         = info.type();
+    f.hostname     = info.hostname();
+    f.channels     = info.channel_count();
+    f.srate        = info.nominal_srate();
+    f.stringMarker = info.channel_format() == lsl::cf_string;
+    f.marker       = isMarkerStream(info);   // string-typed OR a "Markers"-typed numeric trigger box
+    f.info         = std::move(info);
     return f;
+}
+// Effective classification: the user's per-stream override if present, else the cached default.
+// Reads FoundInfo::marker + g_streamKind, so no per-frame stream_info accessors.
+static bool effMarker(const FoundInfo& f) {
+    auto it = g_streamKind.find(f.key);
+    return it != g_streamKind.end() ? it->second : f.marker;
 }
 // Is this connected source the same resolved stream? Prefer source_id (globally unique,
 // stable across reconnects) so a reconnected stream (new uid) isn't double-connected; fall
@@ -485,7 +541,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                        std::uint64_t headFreeze,
                        const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
     LSL_ZONE("drawStream");
-    constexpr float kCfgWidth = 230.0f;
+    const float kCfgWidth = uiScaled(230.0f);
     // Above this many visible line points (samples-in-view x channels) the stacked/overlay
     // views fall back to the min/max envelope; below it they draw the raw trace (which looks
     // better but costs a point per sample). ~200k keeps even a 32 ch x 10 s @ 500 Hz montage
@@ -538,8 +594,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     if (o.cfgShown) {
     ImGui::BeginChild("cfg", ImVec2(kCfgWidth, 0), ImGuiChildFlags_Borders);
     if (ImGui::SmallButton("< hide")) o.cfgShown = false;   // hide to widen the plot
-    if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::SetNextItemWidth(110);
+    if (ImGui::CollapsingHeader("Display")) {
+        ImGui::SetNextItemWidth(uiScaled(110));
         ImGui::SliderFloat("History (s)", &o.history, 1.0f, 60.0f, "%.0f");
         ImGui::Checkbox("Stacked montage", &o.stacked);
         ImGui::BeginDisabled(!o.stacked);          // raster is a stacked-montage render style
@@ -549,17 +605,19 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                               "instead of N line lanes — far cheaper at high channel counts");
         ImGui::EndDisabled();
         ImGui::BeginDisabled(!o.stacked);          // lane gain: stacked montage only
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         ImGui::SliderFloat("Gain/lane", &o.gainUv, 5.0f, 2000.0f, "%.0f",
                            ImGuiSliderFlags_Logarithmic);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("per-lane gain (%s)", streamUnit);
         ImGui::EndDisabled();
         ImGui::BeginDisabled(o.stacked);           // channel spacing: overlay only
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         if (ImGui::SliderFloat("Spacing", &o.spacing, 0.0f, 5000.0f, "%.0f")) o.overlayYFit = true;
         ImGui::EndDisabled();
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
+        ImGui::BeginDisabled(o.raster);   // raster is a heatmap — no line traces to weight
         ImGui::SliderFloat("Line width", &o.lineWidth, 0.5f, 4.0f, "%.1f");
+        ImGui::EndDisabled();
         // Conditioning stages (re-reference -> high-pass -> notch -> low-pass) are each
         // INDEPENDENT — press any combination. The plot shows the conditioned signal
         // whenever ANY stage is on, and the raw signal when all are off (no master toggle).
@@ -567,7 +625,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImGui::Checkbox("High-pass", &o.highpass)) { s.setHighpass(o.highpass); o.overlayYFit = true; }
         ImGui::SameLine();
         ImGui::BeginDisabled(!o.highpass);
-        ImGui::SetNextItemWidth(90);
+        ImGui::SetNextItemWidth(uiScaled(90));
         if (ImGui::SliderFloat("##hpcut", &o.hpHz, 0.1f, 5.0f, "%.2f Hz",
                                ImGuiSliderFlags_Logarithmic))
             s.setHighpassHz(o.hpHz);
@@ -578,7 +636,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip("band-reject the mains line frequency (50/60 Hz) and its hum");
         ImGui::SameLine();
         ImGui::BeginDisabled(!o.notch);
-        ImGui::SetNextItemWidth(60);
+        ImGui::SetNextItemWidth(uiScaled(60));
         if (ImGui::SliderFloat("##notchhz", &o.notchHz, 45.0f, 65.0f, "%.0f Hz")) s.setNotchHz(o.notchHz);
         ImGui::SameLine();
         const bool is50 = o.notchHz < 55.0f;
@@ -593,20 +651,20 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip("smooth / anti-EMG: attenuate everything above the cutoff");
         ImGui::SameLine();
         ImGui::BeginDisabled(!o.lowpass);
-        ImGui::SetNextItemWidth(90);
+        ImGui::SetNextItemWidth(uiScaled(90));
         if (ImGui::SliderFloat("##lphz", &o.lpHz, 5.0f, 120.0f, "%.0f Hz",
                                ImGuiSliderFlags_Logarithmic)) s.setLowpassHz(o.lpHz);
         ImGui::EndDisabled();
         // Re-reference montage — the FIRST stage of the conditioned chain (reference ->
         // high-pass -> notch -> low-pass), so it lives with the filter controls.
         const char* refModes[] = { "None", "Avg (CAR)", "Channel" };
-        ImGui::SetNextItemWidth(110);
+        ImGui::SetNextItemWidth(uiScaled(110));
         if (ImGui::Combo("Reference", &o.refMode, refModes, 3)) { s.setReference(o.refMode); o.overlayYFit = true; }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("re-reference the montage: subtract the common average (CAR,\n"
                               "over the EEG channels only) or a chosen channel from every channel");
         if (o.refMode == 2) {
-            ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+            ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
             if (o.refChan >= C) o.refChan = 0;
             const char* rc = (o.refChan < (int)labels.size()) ? labels[o.refChan].c_str() : "ch";
             if (ImGui::BeginCombo("##refch", rc)) {
@@ -618,7 +676,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             }
         }
     }
-    if (ImGui::CollapsingHeader("Channels", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Channels")) {
         // All/None act on the visible (filtered) set, so "Cz" + All selects all
         // Cz* channels; clear the filter and All selects everything.
         auto pass = [&](int c) { return o.chanFilter.PassFilter(labels[c].c_str()); };
@@ -633,7 +691,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip(filtering ? "deselect channels matching the filter"
                                         : "deselect all channels");
         o.chanFilter.Draw("filter", 140.0f);       // own line; e.g. "Cz" or "Cz,Pz" or "-EOG"
-        ImGui::BeginChild("chsel", ImVec2(0, 120), ImGuiChildFlags_Borders);
+        ImGui::BeginChild("chsel", ImVec2(0, uiScaled(120)), ImGuiChildFlags_Borders);
         for (int c = 0; c < C; ++c) {
             if (!pass(c)) continue;
             bool on = o.visible[c] != 0;
@@ -652,7 +710,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         for (int j = 0; j < show; ++j) {
             const int c = sc.visIdx[j];
             ImGui::PushID(c);
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(uiScaled(120));
             ImGui::DragFloat(labels[c].c_str(), &gain[c], 0.01f, 0.01f, 100.0f, "%.2fx",
                              ImGuiSliderFlags_Logarithmic);
             ImGui::PopID();
@@ -821,9 +879,10 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     // line traces are too short to read. Only applies to the stacked layout (there's no
     // meaningful overlay heatmap), so overlay mode below ignores it. Reuses the envelope.
     if (o.stacked && o.raster) {
-        if (ImPlot::BeginPlot("##plot", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
+        if (ImPlot::BeginPlot("##plot", ImVec2(uiScaled(-70), -1), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+            ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
             if (followX)
                 ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)show, ImPlotCond_Always);
@@ -889,6 +948,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+            ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
             if (followX)
                 ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, -0.6, (double)show - 0.4, ImPlotCond_Always);
@@ -1005,6 +1065,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         // FREE so the mouse can zoom/pan the amplitude axis (double-click re-fits).
         const ImPlotAxisFlags yf = o.overlayYFit ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
         ImPlot::SetupAxes("time (s)", streamUnit, ImPlotAxisFlags_None, yf);
+        ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
         o.overlayYFit = false;
         if (followX)
             ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
@@ -1279,6 +1340,31 @@ static ImPlotColormap divergingPosRed() {
     return cm;
 }
 
+// ERP trigger-label match. The filter is a list of labels separated by " | " (a pipe with a space on
+// EACH side); an event matches if its marker text equals ANY of them EXACTLY (after trimming). A
+// blank filter matches every event. Requiring the surrounding spaces means a label may itself contain
+// a bare '|' (e.g. "L|R") without being split. Exact (not substring) so integer trigger codes don't
+// cross-match — a filter of "1" must not catch "10"/"100". e.g. "start_a | start_b".
+static bool erpLabelMatches(const char* filter, const std::string& text) {
+    bool blank = true;
+    for (const char* q = filter; *q; ++q) if (!std::isspace((unsigned char)*q)) { blank = false; break; }
+    if (blank) return true;
+    const char* a = filter;                                    // current segment start
+    for (const char* p = filter; ; ++p) {
+        const bool sep = (p[0] == ' ' && p[1] == '|' && p[2] == ' ');   // " | " delimiter
+        if (!sep && *p) continue;                              // mid-segment: keep scanning
+        const char* s = a;                                     // close segment [a, p), trimmed
+        const char* b = p;
+        while (s < b && std::isspace((unsigned char)*s)) ++s;
+        while (b > s && std::isspace((unsigned char)b[-1])) --b;
+        const std::size_t n = (std::size_t)(b - s);
+        if (n && text.size() == n && text.compare(0, n, s, n) == 0) return true;
+        if (!*p) break;
+        p += 2; a = p + 1;                                     // skip " | " (loop's ++p does the 3rd char)
+    }
+    return false;
+}
+
 static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
     // 1) ingest new trigger events (by stable seq) into the pending queue. The first
     // pass after a reset only SYNCS lastSeq (no backfill) so we accumulate from now on.
@@ -1287,7 +1373,7 @@ static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
         if (e.seqInit && ev.seq <= e.lastSeq) continue;
         e.lastSeq = std::max(e.lastSeq, ev.seq);
         if (firstPass) continue;
-        if (e.labelFilter.IsActive() && !e.labelFilter.PassFilter(ev.text.c_str())) continue;
+        if (!erpLabelMatches(e.labelFilter.InputBuf, ev.text)) continue;
         e.pending.push_back(ev.t);
     }
     e.seqInit = true;
@@ -1370,21 +1456,33 @@ static char g_recDir[512]  = "";                          // output directory ("
 static char g_recTmpl[512] =
     "sub-{subject}/ses-{session}/{modality}/sub-{subject}_ses-{session}_task-{task}_run-{run}_{modality}.xdf";
 
+// Rewrite '/' to the OS-native separator ('\' on Windows, no-op on POSIX) so the recording-name
+// field reads naturally per platform. '/' is still accepted everywhere (recFullPath make_preferred's
+// the resolved path regardless); this is purely what the user sees in the template / default.
+static void toNativeSeparators(char* s) {
+    const char nat = (char)std::filesystem::path::preferred_separator;
+    for (; *s; ++s) if (*s == '/') *s = nat;
+}
+
 static void* SettingsReadOpen(ImGuiContext*, ImGuiSettingsHandler*, const char*) { return (void*)1; }
 static void SettingsReadLine(ImGuiContext*, ImGuiSettingsHandler*, void*, const char* line) {
-    int v;
-    // Prefix match (not sscanf %[^\n]) so a deliberately cleared value round-trips: %[
-    // matches zero characters as a failure, leaving an empty saved dir/template unrestored
-    // and the default silently re-applied.
+    int v; float fv; char b[512];
+    // recdir/rectmpl use a prefix match (not sscanf %[^\n]) so a deliberately cleared value
+    // round-trips: %[ matches zero characters as a failure, which would leave an empty saved
+    // dir/template unrestored and silently re-apply the default.
     if      (std::sscanf(line, "light=%d", &v) == 1)   g_light = (v != 0);
+    else if (std::sscanf(line, "scale=%f", &fv) == 1)  g_uiScale = std::clamp(fv, 0.5f, 2.0f);
     else if (std::strncmp(line, "recdir=", 7) == 0)    std::snprintf(g_recDir,  sizeof(g_recDir),  "%s", line + 7);
-    else if (std::strncmp(line, "rectmpl=", 8) == 0)   std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", line + 8);
+    else if (std::strncmp(line, "rectmpl=", 8) == 0)   { std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", line + 8); toNativeSeparators(g_recTmpl); }
+    else if (std::sscanf(line, "streamkind=%d %511[^\n]", &v, b) == 2) g_streamKind[b] = (v != 0);
 }
 static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBuffer* buf) {
     buf->appendf("[%s][State]\n", h->TypeName);
     buf->appendf("light=%d\n",   g_light ? 1 : 0);
+    buf->appendf("scale=%.3f\n", g_uiScale);
     buf->appendf("recdir=%s\n",  g_recDir);
     buf->appendf("rectmpl=%s\n", g_recTmpl);
+    for (const auto& [k, kind] : g_streamKind) buf->appendf("streamkind=%d %s\n", kind ? 1 : 0, k.c_str());
     buf->append("\n");
 }
 // SDL folder-picker result. The callback runs on SDL's dialog thread (a separate thread
@@ -1436,9 +1534,15 @@ int main(int argc, char** argv) {
     SDL_Window* window = SDL_CreateWindow("LSL Stream Viewer", winW, winH, wflags);
     if (!window) { spdlog::critical("SDL_CreateWindow: {}", SDL_GetError()); return 1; }
 
+    // We want the ImGui backend to use MSL on Metal (not its macOS-14-only .metallib, built for
+    // MSL 3.1) so the viewer runs on macOS 11+. NB: these flags alone don't achieve that — SDL's
+    // Metal backend ignores the requested formats and always advertises MSL|METALLIB, and the ImGui
+    // backend then prefers the metallib (pipeline fails on macOS 13: "language version 3.1
+    // incompatible with this OS" → draw asserts "Graphics pipeline not found"). The real steer is
+    // cmake/patch_imgui_msl.cmake, which patches the backend to prefer MSL; we request MSL here to
+    // match that intent. (Metal-only concern; SPIRV drives Vulkan, DXIL drives D3D12.)
     SDL_GPUDevice* gpu = SDL_CreateGPUDevice(
-        SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL |
-        SDL_GPU_SHADERFORMAT_MSL  | SDL_GPU_SHADERFORMAT_METALLIB,
+        SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_DXIL | SDL_GPU_SHADERFORMAT_MSL,
         gpuDebug, nullptr);
     if (!gpu) { spdlog::critical("SDL_CreateGPUDevice: {}", SDL_GetError()); return 1; }
 
@@ -1482,7 +1586,7 @@ int main(int argc, char** argv) {
         if (!prefBase.empty()) { iniPath = prefBase + "imgui.ini"; io.IniFilename = iniPath.c_str(); }
     }
 
-    loadEmbeddedFont(io, window);   // embedded Roboto, HiDPI-crisp (see theme.hpp)
+    loadEmbeddedFont(io);   // embedded Roboto, HiDPI-crisp (see theme.hpp)
     // Persist theme + recording path in imgui.ini (handler must be added before the
     // ini is auto-loaded on the first NewFrame).
     g_light = (std::getenv("LSL_LIGHT") != nullptr);   // env default; ini overrides on load
@@ -1499,6 +1603,7 @@ int main(int argc, char** argv) {
     // overrides it; clearing the field in the UI falls back to the working directory.
     if (g_recDir[0] == '\0' && !recDefault.empty())
         std::snprintf(g_recDir, sizeof g_recDir, "%s", recDefault.c_str());
+    toNativeSeparators(g_recTmpl);   // native separators in the default template (ini overrides keep their own)
     applyTheme(g_light);
     bool themeApplied = false;   // re-applied once after the ini loads (first NewFrame)
 
@@ -1519,32 +1624,40 @@ int main(int argc, char** argv) {
     //     normal (non-inverting) cursor, so it shows fine.
     //   - Repros identically in the upstream SDL_GPU and Win32+D3D12 examples; D3D11 is unaffected;
     //     unfocused windows fall back to DWM software composition so the I-beam reappears.
-    // SDL_GPU uses D3D12 on Windows, so we hit it. Fix: a custom ARGB (non-inverting) I-beam, which
-    // the overlay can draw. Hardware cursor, not io.MouseDrawCursor (the software cursor worked but
-    // perturbed frame timing).
+    // The fix is a custom ARGB (non-inverting) I-beam the overlay CAN draw — a hardware cursor,
+    // not io.MouseDrawCursor (the software cursor worked but perturbed frame timing). It's only
+    // built when the GPU backend is actually D3D12: SDL_GPU can also run Vulkan on Windows (and
+    // Vulkan/Metal elsewhere), none of which hit the overlay bug — there the native I-beam is fine.
     SDL_Cursor* iBeamCursor = nullptr;
-    {
-        const int W = 9, H = 16, cx = W / 2;  // ~matches the stock Windows I-beam at 100% DPI
-        // The white "ink" of an I-beam: top/bottom serifs + a 1px vertical stem, inset 1px so the
-        // outline has room on every edge. Outline = any transparent pixel touching ink, in black.
+    if (const char* drv = SDL_GetGPUDeviceDriver(gpu); drv && std::strcmp(drv, "direct3d12") == 0) {
+        // Base 9x16 shape (~the stock Windows I-beam at 100% DPI), then nearest-neighbor upscaled
+        // by the integer display scale so it isn't tiny on a HiDPI monitor. The white "ink" is the
+        // top/bottom serifs + a 1px stem, inset 1px so the 1px black outline has room every edge.
+        constexpr int BW = 9, BH = 16, cx = BW / 2;
         auto ink = [=](int x, int y) {
-            if (x < 1 || x >= W - 1 || y < 1 || y >= H - 1) return false;
-            if (y <= 2 || y >= H - 3) return (x >= cx - 2 && x <= cx + 2);  // serifs
-            return (x == cx);                                              // stem
+            if (x < 1 || x >= BW - 1 || y < 1 || y >= BH - 1) return false;
+            if (y <= 2 || y >= BH - 3) return (x >= cx - 2 && x <= cx + 2);  // serifs
+            return (x == cx);                                               // stem
         };
+        Uint32 base[BH][BW];
+        for (int y = 0; y < BH; ++y)
+            for (int x = 0; x < BW; ++x) {
+                Uint32 c = 0x00000000u;                 // transparent
+                if (ink(x, y)) c = 0xFFFFFFFFu;         // white core
+                else for (int dy = -1; dy <= 1 && !c; ++dy)
+                    for (int dx = -1; dx <= 1 && !c; ++dx)
+                        if (ink(x + dx, y + dy)) c = 0xFF000000u;  // black outline
+                base[y][x] = c;
+            }
+        const int scale = std::max(1, (int)std::lround(SDL_GetWindowDisplayScale(window)));
+        const int W = BW * scale, H = BH * scale;
         if (SDL_Surface* s = SDL_CreateSurface(W, H, SDL_PIXELFORMAT_RGBA32)) {
             Uint32* px = static_cast<Uint32*>(s->pixels);
             const int pitch = s->pitch / 4;
             for (int y = 0; y < H; ++y)
-                for (int x = 0; x < W; ++x) {
-                    Uint32 c = 0x00000000u;                 // transparent
-                    if (ink(x, y)) c = 0xFFFFFFFFu;         // white core
-                    else for (int dy = -1; dy <= 1 && !c; ++dy)
-                        for (int dx = -1; dx <= 1 && !c; ++dx)
-                            if (ink(x + dx, y + dy)) c = 0xFF000000u;  // black outline
-                    px[y * pitch + x] = c;
-                }
-            iBeamCursor = SDL_CreateColorCursor(s, cx, H / 2);  // hotspot at the stem center
+                for (int x = 0; x < W; ++x)
+                    px[y * pitch + x] = base[y / scale][x / scale];   // crisp integer upscale
+            iBeamCursor = SDL_CreateColorCursor(s, cx * scale, (BH / 2) * scale);  // hotspot at the stem center
             SDL_DestroySurface(s);
         }
     }
@@ -1847,13 +1960,51 @@ int main(int argc, char** argv) {
             ImGui_ImplSDLGPU3_NewFrame();
             ImGui_ImplSDL3_NewFrame();
             ImGui::NewFrame();
-            if (!themeApplied) { themeApplied = true; applyTheme(g_light); }  // after ini load
+            if (!themeApplied) { themeApplied = true; applyTheme(g_light); }  // after ini load (font + sizes pick up persisted scale via FontScaleMain/ScaleAllSizes)
 
             if (ImGui::BeginMainMenuBar()) {
                 if (ImGui::BeginMenu("App")) {
                     ImGui::MenuItem("Pause", "P", &paused);
+                    // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
+                    // (auto-connected below) so a newcomer can explore every view with no external source.
+                    const bool demo = mockStreams.running();
+                    if (ImGui::MenuItem("Emit demo streams", nullptr, demo)) {
+                        if (demo) { mockStreams.stop();  spdlog::info("demo streams stopped"); }
+                        else      { mockStreams.start(); spdlog::info("demo streams started"); }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->40 Hz chirp, a 48 kHz stereo\n"
+                                          "tone, and an evoked-response stream with markers.");
+                    ImGui::Separator();
                     if (ImGui::MenuItem("Light theme", nullptr, &g_light)) {
                         applyTheme(g_light); ImGui::MarkIniSettingsDirty();
+                    }
+                    // UI scale: type an exact value (Enter/blur to apply) or step with the buttons. No
+                    // slider — dragging it rescaled and re-baked the font atlas every frame, which
+                    // flickered. The box edits a scratch value and commits on Enter/blur so typing
+                    // "0.75" doesn't rescale per keystroke; when idle it mirrors the current value.
+                    ImGui::TextUnformatted("UI scale"); ImGui::SameLine();
+                    bool scaleChanged = false;
+                    static float scaleEdit = g_uiScale;
+                    ImGui::SetNextItemWidth(uiScaled(72));
+                    ImGui::InputFloat("##uiscalebox", &scaleEdit, 0.0f, 0.0f, "%.2f");
+                    if (ImGui::IsItemDeactivatedAfterEdit()) { g_uiScale = scaleEdit; scaleChanged = true; }
+                    else if (!ImGui::IsItemActive())         scaleEdit = g_uiScale;
+                    // After a step, the rescale reflows the menu and moves the button; warp the cursor
+                    // onto its new position next frame so it stays under the mouse for repeated clicks.
+                    static int warpScaleBtn = 0;   // 1 = '-', 2 = '+'
+                    ImGui::SameLine();
+                    bool minusClicked = ImGui::SmallButton("-##uiscale");
+                    if (warpScaleBtn == 1) { warpMouseToItemCenter(window); warpScaleBtn = 0; }
+                    if (minusClicked) { g_uiScale -= 0.05f; scaleChanged = true; warpScaleBtn = 1; }
+                    ImGui::SameLine();
+                    bool plusClicked = ImGui::SmallButton("+##uiscale");
+                    if (warpScaleBtn == 2) { warpMouseToItemCenter(window); warpScaleBtn = 0; }
+                    if (plusClicked) { g_uiScale += 0.05f; scaleChanged = true; warpScaleBtn = 2; }
+                    if (scaleChanged) {
+                        g_uiScale = std::clamp(g_uiScale, 0.5f, 2.0f);
+                        applyTheme(g_light);
+                        ImGui::MarkIniSettingsDirty();
                     }
                     if (ImGui::MenuItem("Quit", "Ctrl+Q")) done = true;
                     ImGui::EndMenu();
@@ -1875,7 +2026,7 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginMenu("Workspaces")) {
                     ImGui::TextDisabled("save the current view (per-stream settings,");
                     ImGui::TextDisabled("analysis windows, layout) under a name");
-                    ImGui::SetNextItemWidth(160);
+                    ImGui::SetNextItemWidth(uiScaled(160));
                     ImGui::InputTextWithHint("##wsname", "name", wsNameBuf, sizeof wsNameBuf);
                     ImGui::SameLine();
                     ImGui::BeginDisabled(wsNameBuf[0] == '\0');
@@ -1906,16 +2057,6 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginMenu("Debug")) {
                     ImGui::MenuItem("Performance", nullptr, &showPerf);   // a section in the Streams rail
                     if (ImGui::MenuItem("Metrics (ImGui)", nullptr, showMetrics)) { showMetrics = true; focusMetrics = true; wantBottom = true; }
-                    // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
-                    // (auto-connected below), so every view can be explored with no external source.
-                    const bool demo = mockStreams.running();
-                    if (ImGui::MenuItem("Emit demo streams", nullptr, demo)) {
-                        if (demo) { mockStreams.stop();  spdlog::info("demo streams stopped"); }
-                        else      { mockStreams.start(); spdlog::info("demo streams started"); }
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->120 Hz chirp, a 48 kHz stereo\n"
-                                          "tone, and an evoked-response stream with markers.");
                     ImGui::Separator();
                     ImGui::TextDisabled("GPU backend: %s", SDL_GetGPUDeviceDriver(gpu));
                     ImGui::EndMenu();
@@ -1930,6 +2071,18 @@ int main(int argc, char** argv) {
                                        "%s", rb);
                 }
                 ImGui::EndMainMenuBar();
+            }
+            // While recording, pulse a red border around the whole window so it's unmistakable at a
+            // glance (beyond the menu-bar [REC] readout). Drawn on the foreground list, over everything.
+            if (recorder.active()) {
+                ImGuiViewport* vp = ImGui::GetMainViewport();
+                const float pulse = 0.55f + 0.45f * (float)std::sin(recorder.seconds() * 3.2);
+                const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.18f, 0.18f, pulse));
+                const float th = uiScaled(3.0f), in = th * 0.5f;
+                ImGui::GetForegroundDrawList(vp)->AddRect(
+                    ImVec2(vp->Pos.x + in, vp->Pos.y + in),
+                    ImVec2(vp->Pos.x + vp->Size.x - in, vp->Pos.y + vp->Size.y - in),
+                    col, 0.0f, 0, th);
             }
             if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Q)) done = true;
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_P)) paused = !paused;
@@ -1956,7 +2109,7 @@ int main(int argc, char** argv) {
             };
             auto connectStream = [&](const FoundInfo& fi) {
                 dismissed.erase(fi.key);
-                if (fi.marker) {
+                if (effMarker(fi)) {
                     auto m = std::make_unique<MarkerSource>(fi.info); m->start();
                     markerSources.push_back(std::move(m));
                 } else {
@@ -1984,6 +2137,33 @@ int main(int argc, char** argv) {
                     (*it)->requestStop(); closing.push_back(std::move(*it)); sources.erase(it);
                 }
             };
+            // Apply a pending "treat as marker" / "treat as data" toggle (set last frame by the
+            // Info-panel button or the rail right-click): tear down the stream's current source and
+            // rebuild it as the other type. Direct rebuild (not disconnect+connect) so it sidesteps
+            // the dismissed / auto-reconnect machinery.
+            if (!g_reclassifyKey.empty()) {
+                const std::string key = g_reclassifyKey; g_reclassifyKey.clear();
+                if (auto di = std::find_if(sources.begin(), sources.end(),
+                        [&](const std::unique_ptr<HfStreamSource>& p){ return streamKeyOf(*p) == key; });
+                    di != sources.end()) {                       // data -> marker
+                    lsl::stream_info info = (*di)->info();
+                    edgeMap.erase(di->get()); pauseHead.erase(di->get()); dispOpts.erase(di->get());
+                    (*di)->requestStop(); closing.push_back(std::move(*di)); sources.erase(di);
+                    if (isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = true;
+                    auto m = std::make_unique<MarkerSource>(info); m->start();
+                    markerSources.push_back(std::move(m));
+                    ImGui::MarkIniSettingsDirty();
+                } else if (auto mi = std::find_if(markerSources.begin(), markerSources.end(),
+                        [&](const std::unique_ptr<MarkerSource>& p){ return streamKeyOf(*p) == key; });
+                    mi != markerSources.end()) {                 // marker -> data
+                    lsl::stream_info info = (*mi)->info();
+                    (*mi)->requestStop(); closingMrk.push_back(std::move(*mi)); markerSources.erase(mi);
+                    if (!isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = false;
+                    auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
+                    sources.push_back(std::move(s));
+                    ImGui::MarkIniSettingsDirty();
+                }
+            }
             if (autoConnect)
                 for (auto& fi : found)
                     if (!dismissed.count(fi.key) && !connected(fi))
@@ -2110,7 +2290,7 @@ int main(int argc, char** argv) {
             // ---- Two-column layout: fixed Streams sidebar + a dockspace -----
             // The plots live in a dockspace that fills the area right of the sidebar,
             // so they open as tabs and can be split/rearranged but never bury the rail.
-            const float sidebarW = 280.0f;
+            const float sidebarW = uiScaled(280.0f);
             ImGuiID dockId = 0, dockCenter = 0, dockBottom = 0;   // time-series center, analysis bottom
             {
                 ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + sidebarW, vp->WorkPos.y), ImGuiCond_Always);
@@ -2219,74 +2399,81 @@ int main(int argc, char** argv) {
                     ImGui::MarkIniSettingsDirty();
                 }
                 int nConn = 0; for (auto& fi : found) if (connected(fi)) ++nConn;
-                if (!recorder.active()) {
-                    const float bw = ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2;
-                    ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
-                    if (ImGui::InputTextWithHint("##recdir", "folder (blank = cwd)", g_recDir, sizeof(g_recDir)))
-                        ImGui::MarkIniSettingsDirty();
+                const bool rec = recorder.active();
+                // Path / field inputs stay in place while recording (disabled, not removed) so the
+                // constructed name and the Record/Stop button below never shift when recording toggles.
+                ImGui::BeginDisabled(rec);
+                const float bw = ImGui::CalcTextSize("Browse").x + ImGui::GetStyle().FramePadding.x * 2;
+                ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
+                if (ImGui::InputTextWithHint("##recdir", "folder (blank = cwd)", g_recDir, sizeof(g_recDir)))
+                    ImGui::MarkIniSettingsDirty();
+                ImGui::SameLine();
+                if (ImGui::Button("Browse"))
+                    SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
+                                             g_recDir[0] ? g_recDir : nullptr, false);
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::InputTextWithHint("##recpath", "sub-{subject}/…/{modality}.xdf",
+                                             g_recTmpl, sizeof(g_recTmpl)))
+                    ImGui::MarkIniSettingsDirty();
+                if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                    const float fw = (ImGui::GetContentRegionAvail().x
+                                      - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
                     ImGui::SameLine();
-                    if (ImGui::Button("Browse"))
-                        SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
-                                                 g_recDir[0] ? g_recDir : nullptr, false);
-                    ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::InputTextWithHint("##recpath", "sub-{subject}/…/{modality}.xdf",
-                                                 g_recTmpl, sizeof(g_recTmpl)))
-                        ImGui::MarkIniSettingsDirty();
-                    if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
-                        const float fw = (ImGui::GetContentRegionAvail().x
-                                          - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##mod", "{modality}", recModality, sizeof(recModality));
-                        ImGui::SameLine();
-                        ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##acq", "{acq} (optional)", recAcq, sizeof(recAcq));
-                        ImGui::TreePop();
-                    }
-                    // Preview path: recFullPath() does strftime + template substitution;
-                    // refresh it at ~4 Hz instead of every frame (it's just a label).
-                    static std::string recPreview;
-                    static double recPreviewAt = -1e18;
-                    if (dueEvery(recPreviewAt, 0.25)) recPreview = recFullPath();
-                    ImGui::TextDisabled("-> %s", recPreview.c_str());
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", recPreview.c_str());
-                    // Hold recording while a restored workspace is still missing streams, so a
-                    // session can't quietly start short a stream (recording = every connected
-                    // stream). Resolved by the streams connecting or dismissing the notice above.
-                    ImGui::BeginDisabled(nConn == 0 || wsMissing > 0);
-                    if (ImGui::Button("Record", ImVec2(-1, 0))) startRecording();
-                    ImGui::EndDisabled();
-                    // Tooltip on the disabled button explaining how to proceed (disabled items
-                    // don't hover by default — AllowWhenDisabled re-enables it).
-                    if ((nConn == 0 || wsMissing > 0) && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip(wsMissing > 0
-                            ? "Recording is held until your workspace's streams are present.\n"
-                              "Wait for the missing stream(s) to connect, or click Dismiss in the\n"
-                              "notice above to record without them."
-                            : "Connect at least one stream to record.");
-                    if (nConn == 0) {
-                        ImGui::TextDisabled("Connect a stream to record.");
-                    } else if (wsMissing > 0) {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-                        ImGui::TextWrapped("recording held: %d workspace stream%s missing (connect them or dismiss above)",
-                                           wsMissing, wsMissing == 1 ? "" : "s");
-                        ImGui::PopStyleColor();
-                    } else {
-                        ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
-                    }
-                } else {
-                    if (ImGui::Button("Stop recording", ImVec2(-1, 0))) {
-                        recorder.stop(); spdlog::info("recording stopped ({:.1f}s, {:.1f} MB)",
-                                                      recorder.seconds(), recorder.bytes() / 1e6);
-                    }
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##mod", "{modality}", recModality, sizeof(recModality));
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##acq", "{acq} (optional)", recAcq, sizeof(recAcq));
+                    ImGui::TreePop();
+                }
+                ImGui::EndDisabled();
+
+                // Constructed name in a fixed slot: the live template preview when idle, the actual
+                // file being written while recording. Same widget/position either way (full path on hover).
+                static std::string recPreview;
+                static double recPreviewAt = -1e18;
+                if (!rec && dueEvery(recPreviewAt, 0.25)) recPreview = recFullPath();
+                const std::string shown = rec ? recorder.path() : recPreview;
+                ImGui::TextDisabled("-> %s", shown.c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", shown.c_str());
+
+                // Record / Stop: one button in a fixed position; only the label + action swap. While
+                // idle it's held until a stream is connected and no workspace stream is still missing
+                // (so a session can't quietly start short a stream — recording = every connected stream).
+                const bool blocked = !rec && (nConn == 0 || wsMissing > 0);
+                ImGui::BeginDisabled(blocked);
+                if (ImGui::Button(rec ? "Stop recording" : "Record", ImVec2(-1, 0))) {
+                    if (rec) { recorder.stop(); spdlog::info("recording stopped ({:.1f}s, {:.1f} MB)",
+                                                            recorder.seconds(), recorder.bytes() / 1e6); }
+                    else startRecording();
+                }
+                ImGui::EndDisabled();
+                // Disabled items don't hover by default — AllowWhenDisabled re-enables the tooltip.
+                if (blocked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(wsMissing > 0
+                        ? "Recording is held until your workspace's streams are present.\n"
+                          "Wait for the missing stream(s) to connect, or click Dismiss in the\n"
+                          "notice above to record without them."
+                        : "Connect at least one stream to record.");
+
+                // Status line (one slot): live REC stats while recording, else the connect/held hint.
+                if (rec)
                     ImGui::TextColored(ImVec4(1, 0.30f, 0.30f, 1),   // hard to miss while live
                                        "REC %.0fs \xc2\xb7 %d stream%s \xc2\xb7 %.2f MB",
                                        recorder.seconds(), recorder.streams(),
                                        recorder.streams() == 1 ? "" : "s", recorder.bytes() / 1e6);
-                }
+                else if (nConn == 0)
+                    ImGui::TextDisabled("Connect a stream to record.");
+                else if (wsMissing > 0) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                    ImGui::TextWrapped("recording held: %d workspace stream%s missing (connect them or dismiss above)",
+                                       wsMissing, wsMissing == 1 ? "" : "s");
+                    ImGui::PopStyleColor();
+                } else
+                    ImGui::TextDisabled("records %d connected stream%s", nConn, nConn == 1 ? "" : "s");
                 const std::string rerr = recorder.error();
                 if (!rerr.empty()) ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "rec error: %s", rerr.c_str());
                 bool rc = remote.listening();
@@ -2314,7 +2501,7 @@ int main(int argc, char** argv) {
                 ImGui::PushID(fi.uid.c_str());
                 const float rowH = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
                 char label[256];
-                if (fi.marker) {
+                if (effMarker(fi)) {
                     // Marker/event stream: connects to a MarkerSource that overlays
                     // event lines on the time-series plots (no waveform window).
                     MarkerSource* m = nullptr;
@@ -2345,6 +2532,14 @@ int main(int argc, char** argv) {
                         if (!m) connectStream(fi);            // connect
                         else    disconnectKey(fi.key);        // disconnect (no window to close)
                     }
+                    // A numeric stream shown as markers (declared a "Markers" type, or reclassified)
+                    // can go back to a waveform via right-click. Native string markers can't be data.
+                    if (m && !fi.stringMarker &&
+                        ImGui::BeginPopupContextItem("##mk2data")) {
+                        if (ImGui::MenuItem("Treat as data stream"))
+                            g_reclassifyKey = fi.key;
+                        ImGui::EndPopup();
+                    }
                 } else {
                     HfStreamSource* csrc = nullptr;
                     for (auto& s : sources)
@@ -2374,6 +2569,15 @@ int main(int argc, char** argv) {
                         if (!csrc) connectStream(fi);                        // connect
                         else       ImGui::SetWindowFocus(fi.name.c_str());   // already on: focus its plot
                     }
+                    // Irregular numeric stream (e.g. an int trigger arriving as a waveform): offer to
+                    // show it as event/marker overlays. Gated to irregular so a regular high-rate
+                    // stream can't accidentally become an event flood.
+                    if (csrc && fi.srate == 0.0 &&
+                        ImGui::BeginPopupContextItem("##data2mk")) {
+                        if (ImGui::MenuItem("Treat as marker (show as events)"))
+                            g_reclassifyKey = fi.key;
+                        ImGui::EndPopup();
+                    }
                 }
                 ImGui::Separator();
                 ImGui::PopID();
@@ -2402,7 +2606,7 @@ int main(int argc, char** argv) {
                 ImGui::Text("%.1f FPS  \xc2\xb7  %.2f ms avg / %.2f ms max",
                             avg > 0 ? 1000.0f / avg : 0.0f, avg, fps.maxv());
                 ImGui::PlotLines("##ft", fps.ms, FrameStats::N, fps.idx, nullptr,
-                                 0.0f, std::max(33.0f, fps.maxv() * 1.1f), ImVec2(-1, 50));
+                                 0.0f, std::max(33.0f, fps.maxv() * 1.1f), ImVec2(-1, uiScaled(50)));
                 ImGui::TextDisabled("ui+draw %.2f ms \xc2\xb7 gpu+vsync %.2f ms", uiMs, gpuMs);
                 ImGui::Checkbox("VSync", &vsync);
                 ImGui::SameLine();
@@ -2469,7 +2673,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 ImGui::SetNextWindowDockID(dockCenter, ImGuiCond_FirstUseEver);  // time-series tab
-                ImGui::SetNextWindowSize(ImVec2(680, 420), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(680), uiScaled(420)), ImGuiCond_FirstUseEver);
                 bool open = true;                       // window X disconnects the stream
                 // Unique, STABLE window id even if two streams share a name (else ImGui
                 // ID conflict + merged windows). The visible title carries a transient
@@ -2504,7 +2708,7 @@ int main(int argc, char** argv) {
 
             // ---- FFT / PSD (View menu) ----------------------------------
             if (showSpectrum) {
-            ImGui::SetNextWindowSize(ImVec2(580, 440), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(uiScaled(580), uiScaled(440)), ImGuiCond_FirstUseEver);
             ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
             if (focusSpectrum) { ImGui::SetNextWindowFocus(); focusSpectrum = false; }
             ImGui::Begin("Spectrum", &showSpectrum);
@@ -2527,7 +2731,7 @@ int main(int argc, char** argv) {
                 HfStreamSource* src = sources[fftStream].get();
 
                 // ---- left config strip; the plot fills the right (like the time series) ----
-                ImGui::BeginChild("cfg", ImVec2(200, 0), ImGuiChildFlags_Borders);
+                ImGui::BeginChild("cfg", ImVec2(uiScaled(200), 0), ImGuiChildFlags_Borders);
                 ImGui::SetNextItemWidth(-1.0f);
                 if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                     for (int i = 0; i < (int)sources.size(); ++i)
@@ -2546,7 +2750,7 @@ int main(int argc, char** argv) {
                 const auto& labels = src->labels();
                 auto fpass = [&](int c) { return fftFilter.PassFilter(labels[c].c_str()); };
 
-                ImGui::SetNextItemWidth(80);
+                ImGui::SetNextItemWidth(uiScaled(80));
                 const char* szs[] = { "512", "1024", "2048", "4096" };
                 int szi = (fftN == 512) ? 0 : (fftN == 1024) ? 1 : (fftN == 2048) ? 2 : 3;
                 if (ImGui::Combo("N", &szi, szs, 4)) { fftN = 1 << (9 + szi); fftRefit = true; }
@@ -2707,7 +2911,7 @@ int main(int argc, char** argv) {
             for (auto& spp : spectros) {
                 Spectro& spectro = *spp;
                 LSL_ZONE("spectrogram win");
-                ImGui::SetNextWindowSize(ImVec2(620, 420), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(620), uiScaled(420)), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
                 if (spectro.focus) { ImGui::SetNextWindowFocus(); spectro.focus = false; }
                 char title[64];
@@ -2725,7 +2929,7 @@ int main(int argc, char** argv) {
                     bool reset = (spectro.uid != src->uid());
 
                     // ---- left config strip; the plot + colorbar fill the right ----
-                    ImGui::BeginChild("cfg", ImVec2(200, 0), ImGuiChildFlags_Borders);
+                    ImGui::BeginChild("cfg", ImVec2(uiScaled(200), 0), ImGuiChildFlags_Borders);
                     ImGui::SetNextItemWidth(-1.0f);
                     if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                         spectro.streamFilter.Draw("##sf", -1.0f);   // searchable
@@ -2753,20 +2957,20 @@ int main(int argc, char** argv) {
                         }
                         ImGui::EndCombo();
                     }
-                    ImGui::SetNextItemWidth(90);
+                    ImGui::SetNextItemWidth(uiScaled(90));
                     const char* nf[] = { "128", "256", "512", "1024" };
                     int ni = (spectro.nfft == 128) ? 0 : (spectro.nfft == 256) ? 1
                            : (spectro.nfft == 512) ? 2 : 3;
                     if (ImGui::Combo("NFFT", &ni, nf, 4)) { spectro.nfft = 1 << (7 + ni); reset = true; }
-                    ImGui::SetNextItemWidth(110);
+                    ImGui::SetNextItemWidth(uiScaled(110));
                     ImGui::SliderFloat("span (s)", &spectro.spanSec, 2.0f, 120.0f, "%.0f");
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     ImGui::DragFloatRange2("dB", &spectro.dbMin, &spectro.dbMax, 1.0f,
                                            -160.0f, 80.0f, "%.0f");
                     // Frequency range shown (Y-axis zoom). Vital when the sample rate is high but
                     // the signal is low-freq (48 kHz audio -> tones < 1 kHz); synced with mouse zoom.
                     const float ny = (float)(src->srate() * 0.5);
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::DragFloatRange2("Hz", &spectro.fMin, &spectro.fMax,
                                                std::max(0.5f, ny / 400.0f), 0.0f, ny, "%.0f"))
                         spectro.yDirty = true;
@@ -2888,8 +3092,9 @@ int main(int argc, char** argv) {
                         }
 
                         ImPlot::PushColormap(ImPlotColormap_Viridis);
-                        if (ImPlot::BeginPlot("##spectro", ImVec2(-70, -1))) {
+                        if (ImPlot::BeginPlot("##spectro", ImVec2(uiScaled(-70), -1))) {
                             ImPlot::SetupAxes("time (s)", "Hz");
+                            ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
                             if (!paused)   // live: follow the scroll; paused: free to pan/zoom the frozen view
                                 ImPlot::SetupAxisLimits(ImAxis_X1, viewX0, viewNewest, ImPlotCond_Always);
                             // Y range is the user's freq window (control or mouse-zoom). Force it
@@ -2916,7 +3121,7 @@ int main(int argc, char** argv) {
                             ImPlot::EndPlot();
                         }
                         ImGui::SameLine();
-                        ImPlot::ColormapScale("dB", spectro.dbMin, spectro.dbMax, ImVec2(60, -1));
+                        ImPlot::ColormapScale("dB", spectro.dbMin, spectro.dbMax, ImVec2(uiScaled(60), -1));
                         ImPlot::PopColormap();
                     }
                 }
@@ -2928,7 +3133,7 @@ int main(int argc, char** argv) {
             for (auto& epp : erps) {
                 Erp& erp = *epp;
                 LSL_ZONE("erp win");
-                ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(560), uiScaled(420)), ImGuiCond_FirstUseEver);
                 ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
                 if (erp.focus) { ImGui::SetNextWindowFocus(); erp.focus = false; }
                 char title[64];
@@ -2954,7 +3159,7 @@ int main(int argc, char** argv) {
                     // series / spectrum / spectrogram windows) ----
                     ImGui::BeginChild("cfg", ImVec2(230, 0), ImGuiChildFlags_Borders);
                     // data stream
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("stream", src->name().c_str())) {
                         erp.streamFilter.Draw("##sf", -1.0f);
                         for (int i = 0; i < (int)sources.size(); ++i) {
@@ -2970,7 +3175,7 @@ int main(int argc, char** argv) {
                     const auto& labels = src->labels();
                     // single-channel picker (disabled when averaging all channels)
                     ImGui::BeginDisabled(erp.allCh);
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     const char* chn = (erp.channel < (int)labels.size()) ? labels[erp.channel].c_str() : "ch";
                     if (ImGui::BeginCombo("channel", chn)) {
                         erp.chanFilter.Draw("##chf", -1.0f);
@@ -2985,11 +3190,11 @@ int main(int argc, char** argv) {
                     ImGui::EndDisabled();
                     if (ImGui::Checkbox("all channels", &erp.allCh)) reset = true;  // average every channel
                     if (erp.allCh) {
-                        ImGui::SetNextItemWidth(140);
+                        ImGui::SetNextItemWidth(uiScaled(140));
                         if (ImGui::SliderInt("max ch", &erp.maxCh, 1, std::max(1, src->channels()))) reset = true;
                     }
                     // trigger marker stream
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("trigger", mk->name().c_str())) {
                         erp.markerFilter.Draw("##mf", -1.0f);
                         for (int i = 0; i < (int)markerSources.size(); ++i) {
@@ -3001,13 +3206,19 @@ int main(int argc, char** argv) {
                         ImGui::EndCombo();
                     }
                     mk = markerSources[erp.markerIdx].get();
-                    if (erp.labelFilter.Draw("match", 140.0f)) reset = true;  // only events matching fire
+                    // Exact-match list of trigger labels, '|'-separated (see erpLabelMatches).
+                    ImGui::SetNextItemWidth(uiScaled(140));
+                    if (ImGui::InputTextWithHint("match", "e.g. start_a | start_b",
+                            erp.labelFilter.InputBuf, sizeof erp.labelFilter.InputBuf))
+                        reset = true;
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("only trigger on events whose text matches (blank = every event)");
+                        ImGui::SetTooltip("Align on events whose label exactly equals any of these,\n"
+                                          "separated by ' | ' (a pipe with a space each side) — e.g.\n"
+                                          "start_a | start_b. A label may contain a bare '|'. Blank = every event.");
 
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::SliderFloat("pre (ms)", &erp.preMs, 10.0f, 1000.0f, "%.0f")) reset = true;
-                    ImGui::SetNextItemWidth(140);
+                    ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::SliderFloat("post (ms)", &erp.postMs, 50.0f, 2000.0f, "%.0f")) reset = true;
                     if (ImGui::Checkbox("baseline", &erp.baseline)) reset = true;
                     ImGui::SameLine();
@@ -3045,7 +3256,7 @@ int main(int argc, char** argv) {
                             // nchan x nbins row-major, so it feeds PlotHeatmap directly.
                             if (erp.nchan == 0 || erp.nbins == 0 || erp.count == 0) {
                                 ImGui::TextDisabled("waiting for epochs...");
-                            } else if (ImPlot::BeginPlot("##erpr", ImVec2(-70, -1), ImPlotFlags_NoLegend)) {
+                            } else if (ImPlot::BeginPlot("##erpr", ImVec2(uiScaled(-70), -1), ImPlotFlags_NoLegend)) {
                                 ImPlot::SetupAxes("time (ms)", nullptr,
                                                   ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
                                 ImPlot::SetupAxisLimits(ImAxis_X1, -erp.preMs, erp.postMs, erpCond);

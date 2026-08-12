@@ -7,7 +7,7 @@
 //
 //   MockEEG      32ch @ 500 Hz   — 10-20 labels + scalp positions; last 2 are ~10x-scale EOG
 //                                  (alpha + mains line noise + movement transients / blinks)
-//   MockChirp     1ch @ 1000 Hz  — 1 -> 120 Hz sweep (spectrogram)
+//   MockChirp     1ch @ 1000 Hz  — 1 -> 40 Hz sweep (spectrogram)
 //   MockAudio     2ch @ 48 kHz   — 440 / 660 Hz stereo tone (spectrum / high-rate stress)
 //   MockEvoked    1ch @ 250 Hz   + MockEvokedMarkers — P100 every trial, P300 on "target" (ERP)
 //

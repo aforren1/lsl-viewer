@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']        # vX.Y.Z -> build everything and publish a GitHub Release (see the `release` job)
   pull_request:
 
 # Cancel superseded runs on the same ref (e.g. force-pushes to a PR).
@@ -48,6 +49,17 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
+      # The release version's single specification point: the git tag. Computed once here and
+      # fed to CMake (-DLSL_VERSION below), which stamps the exe VERSIONINFO, the macOS plist,
+      # and version.txt (the installer reads it) so all three always agree. Non-tag builds
+      # (branch pushes / PRs) get an obvious 0.0.0.
+      - name: Determine version
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"                      # tag vX.Y.Z -> X.Y.Z
+          case "$ver" in [0-9]*) ;; *) ver=0.0.0 ;; esac  # non-tag build -> 0.0.0
+          echo "APP_VERSION=$ver" >> "$GITHUB_ENV"
+
       # Compile check incl. the UI test suite + Test Engine (LSL_TESTS=ON, no LTO so the
       # link stays fast). The tests themselves need a GPU to run, so CI only builds them.
       - name: Build (with tests)
@@ -69,9 +81,11 @@ jobs:
       # Shippable artifact: a static Release build (LTO on) — SDL3 + liblsl folded into the
       # executable, so each binary is self-contained (no SDL3/lsl libs to ship alongside).
       - name: Build (release, static)
+        # Quote -DLSL_VERSION so PowerShell (the Windows runner's shell) keeps the dotted value
+        # intact instead of stripping it to the major component.
         run: >
           cmake -S . -B build -G "${{ matrix.gen }}"
-          -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON &&
+          -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON "-DLSL_VERSION=${{ env.APP_VERSION }}" &&
           cmake --build build --config Release --parallel
 
       - name: Strip binaries (Unix)
@@ -111,7 +125,9 @@ jobs:
       # the per-user locations. The portable .zip above is the no-install alternative.
       - name: Build Windows installer
         if: matrix.name == 'windows'
-        # Single-source the installer version from CMake's version.txt (project(... VERSION)).
+        # The installer version comes from build/version.txt, which CMake wrote from
+        # ${PROJECT_VERSION} = the tag (see the "Determine version" step + -DLSL_VERSION). So the
+        # installer, exe VERSIONINFO, and macOS plist all resolve to the same git tag.
         run: |
           $v = (Get-Content build/version.txt).Trim()
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$v" packaging\lsl-viewer.iss
@@ -146,11 +162,14 @@ jobs:
           APP="LSL Viewer.app"                       # binary is static; only system frameworks remain
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp build/lsl_viewer "$APP/Contents/MacOS/"
-          cp build/Info.plist "$APP/Contents/"      # configured from ${PROJECT_VERSION}
+          # build/Info.plist is already configured with the tag version (CMake -DLSL_VERSION),
+          # so no PlistBuddy override is needed - one specification point (the tag).
+          cp build/Info.plist "$APP/Contents/"
           cp lsl_viewer.icns "$APP/Contents/Resources/"
           mkdir dmgroot
           cp -R "$APP" dmgroot/
           ln -s /Applications dmgroot/Applications     # drag-to-install target
+          cp build/xdf_record dmgroot/                 # headless recorder CLI, beside the app
           cp LICENSE THIRD_PARTY_LICENSES dmgroot/
           hdiutil create -volname "LSL Viewer" -srcfolder dmgroot -ov -format UDZO LSL-Viewer.dmg
 
@@ -237,6 +256,64 @@ jobs:
           if-no-files-found: error
           path: LSL-Viewer-${{ matrix.arch }}.AppImage
 
+  # Fully-static headless recorder. Built CLI-only (LSL_CLI_ONLY skips the GUI deps) against musl
+  # via zig as the C/C++ toolchain, then `-static` — so xdf_record has NO glibc / no shared-library
+  # dependencies and runs on any Linux (old glibc, Alpine/musl, containers) as a single file. The
+  # viewer can't be static (it needs the host's GPU driver + display libs at runtime), so it's not
+  # built here. Runs on a normal (glibc) runner so the checkout/upload actions work — zig cross-
+  # compiles to musl regardless of host.
+  xdf-record-musl:
+    name: xdf_record-linux-musl
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install zig
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          echo "ZIG=$PWD/zig-linux-x86_64-0.13.0/zig" >> "$GITHUB_ENV"
+      - name: Toolchain wrappers (zig as cc/c++/ar/ranlib targeting musl)
+        run: |
+          mkdir -p z
+          printf '#!/bin/sh\nexec "$ZIG" cc  -target x86_64-linux-musl "$@"\n' > z/zcc
+          printf '#!/bin/sh\nexec "$ZIG" c++ -target x86_64-linux-musl "$@"\n' > z/zxx
+          printf '#!/bin/sh\nexec "$ZIG" ar "$@"\n'     > z/zar
+          printf '#!/bin/sh\nexec "$ZIG" ranlib "$@"\n' > z/zranlib
+          chmod +x z/*
+      - name: Build (fully static, CLI only)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLSL_CLI_ONLY=ON -DLSL_STATIC=ON \
+            -DCMAKE_C_COMPILER="$PWD/z/zcc"   -DCMAKE_CXX_COMPILER="$PWD/z/zxx" \
+            -DCMAKE_AR="$PWD/z/zar"           -DCMAKE_RANLIB="$PWD/z/zranlib" \
+            -DCMAKE_C_COMPILER_AR="$PWD/z/zar"        -DCMAKE_CXX_COMPILER_AR="$PWD/z/zar" \
+            -DCMAKE_C_COMPILER_RANLIB="$PWD/z/zranlib" -DCMAKE_CXX_COMPILER_RANLIB="$PWD/z/zranlib" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          cmake --build build --target xdf_record --parallel
+          strip build/xdf_record
+      - name: Verify fully static
+        run: |
+          file build/xdf_record
+          ldd build/xdf_record || true        # expect: "not a dynamic executable"
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp build/xdf_record LICENSE THIRD_PARTY_LICENSES dist/
+      - name: Attest build provenance
+        if: github.event_name == 'push' && github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/xdf_record
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: xdf-record-linux-musl
+          if-no-files-found: error
+          path: dist/*
+
   # Recording conformance: record the mock streams with our headless recorder AND the real
   # LabRecorder (LabRecorderCLI) at once, and check the two XDFs hold identical data. Both
   # are CLI/headless, so this runs without a display. Pinned to ubuntu-24.04 to match the
@@ -259,10 +336,10 @@ jobs:
           curl -fsSL -o /tmp/labrec.deb https://github.com/labstreaminglayer/App-LabRecorder/releases/download/v1.17.1/LabRecorder-1.17.0-noble_amd64.deb
           sudo apt-get install -y /tmp/labrec.deb
 
-      # Only the headless recorder is needed; --target skips building SDL/the viewer.
+      # Only the headless recorder is needed; LSL_CLI_ONLY skips configuring SDL/ImGui entirely.
       - name: Build xdf_record
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_X11=OFF
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLSL_CLI_ONLY=ON
           cmake --build build --target xdf_record --parallel
 
       - name: Install Python deps
@@ -274,3 +351,37 @@ jobs:
           printf '[lab]\nKnownPeers = {127.0.0.1}\n[multicast]\nResolveScope = link\n' > lsl_api.cfg
           export LSLAPICFG="$PWD/lsl_api.cfg" XDF_RECORD="$PWD/build/xdf_record"
           python3 tests/compare_labrecorder.py
+
+  # On a version tag (vX.Y.Z) gather every build artifact and publish them as a GitHub Release.
+  # Single-file artifacts (.dmg / installer .exe / .AppImage) attach directly; multi-file bundles
+  # (the portable per-OS folders, the musl recorder) are zipped first. Uses the gh CLI (first-party,
+  # always current on the runner) so there are no version-pinned third-party actions to break.
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, appimage, xdf-record-musl]      # the artifact producers (build runs the UI tests)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write                              # create the release + upload assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download this run's artifacts
+        run: gh run download "${{ github.run_id }}" --dir dl --repo "${{ github.repository }}"
+      - name: Assemble release assets
+        run: |
+          mkdir -p assets
+          for d in dl/*/; do
+            name="$(basename "$d")"
+            if [ "$(find "$d" -maxdepth 1 -type f | wc -l)" -eq 1 ]; then
+              cp "$d"/* assets/                                            # one file -> attach as-is
+            else
+              (cd "$d" && zip -qr "$GITHUB_WORKSPACE/assets/${name}.zip" .)  # bundle -> one .zip
+            fi
+          done
+          ls -la assets
+      - name: Publish release
+        run: |
+          TAG="${{ github.ref_name }}"
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --generate-notes assets/* \
+            || gh release upload "$TAG" --repo "${{ github.repository }}" --clobber assets/*
