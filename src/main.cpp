@@ -173,10 +173,13 @@ static bool isMarkerStream(lsl::stream_info& info) {
 
 // Stable key for "the user dismissed this stream" bookkeeping: source_id (globally
 // unique, stable across reconnects) when set, else uid. Works for any connected source;
-// the resolved-stream equivalent is cached in FoundInfo::key below.
+// the resolved-stream equivalent is cached in FoundInfo::key below. source_id alone is NOT
+// unique: many devices publish their data stream and their marker stream under the SAME
+// source_id (e.g. actiCHamp), so the name is folded in to tell them apart — otherwise
+// disconnecting/dismissing one would take the other with it. Name is stable across reconnects.
 template <class Src>
 static std::string streamKeyOf(const Src& s) {
-    return !s.sourceId().empty() ? s.sourceId() : s.uid();
+    return !s.sourceId().empty() ? s.sourceId() + "|" + s.name() : s.uid();
 }
 
 // Per-stream override of the marker-vs-data classification (keyed by stream key). Present = the user
@@ -192,7 +195,7 @@ static std::string                 g_reclassifyKey;
 // read this metadata every frame. Compute it once per refresh and read the cache in the loop.
 struct FoundInfo {
     lsl::stream_info info;         // live handle (needed to open an inlet on connect)
-    std::string key;               // streamKey: source_id or uid
+    std::string key;               // streamKey: source_id+name (disambiguates shared source_id), or uid
     std::string sourceId, uid;
     std::string name, type, hostname;
     int    channels = 0;
@@ -204,8 +207,8 @@ static FoundInfo makeFound(lsl::stream_info info) {
     FoundInfo f;
     f.sourceId     = info.source_id();
     f.uid          = info.uid();
-    f.key          = !f.sourceId.empty() ? f.sourceId : f.uid;
     f.name         = info.name();
+    f.key          = !f.sourceId.empty() ? f.sourceId + "|" + f.name : f.uid;   // name disambiguates shared source_id
     f.type         = info.type();
     f.hostname     = info.hostname();
     f.channels     = info.channel_count();
@@ -224,12 +227,14 @@ static bool effMarker(const FoundInfo& f) {
     }
     return f.marker;
 }
-// Is this connected source the same resolved stream? Prefer source_id (globally unique,
-// stable across reconnects) so a reconnected stream (new uid) isn't double-connected; fall
-// back to uid. Reads the cached FoundInfo fields, so no per-frame stream_info accessors.
+// Is this connected source the same resolved stream? Match on (source_id, name) — source_id
+// for reconnect stability (a reconnected stream keeps it but gets a new uid), name to separate
+// a device's data and marker streams that share a source_id; fall back to uid when there is no
+// source_id. Compares cached FoundInfo fields, so no per-frame stream_info accessors/allocations.
 template <class Src>
 static bool sameStream(const Src& s, const FoundInfo& f) {
-    return !f.sourceId.empty() ? (s.sourceId() == f.sourceId) : (s.uid() == f.uid);
+    return !f.sourceId.empty() ? (s.sourceId() == f.sourceId && s.name() == f.name)
+                               : (s.uid() == f.uid);
 }
 
 // BIDS-ish filename templating: substitute {subject}/{session}/{task}/{run}/{acq}/{modality}

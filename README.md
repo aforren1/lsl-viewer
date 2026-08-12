@@ -57,7 +57,7 @@ zoomed views use the conditioned signal.
 ### Other
 
 - Docking layout: a Streams rail on the left; plots and analysis windows are tabs you arrange.
-- Saved workspaces: store the current view (per-stream filters/channels/gains, the open analysis windows, the dock layout) and reload it later. On load it reconnects the streams the workspace referenced (matched by `source_id`) and lists any that aren't on the network; recording is held until they connect or the notice is dismissed.
+- Saved workspaces: store the current view (per-stream filters/channels/gains, the open analysis windows, the dock layout) and reload it later. On load it reconnects the streams the workspace referenced (matched by source id + name) and lists any that aren't on the network; recording is held until they connect or the notice is dismissed.
 - Per-stream info: type, source id, channels, sensor positions, and live measured-rate / clock-offset / dropout counters.
 - TCP remote control for recording (see below).
 - Light / dark theme; layout persisted between sessions.
@@ -70,7 +70,7 @@ With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), 
 |---|---|
 | `streams` | list resolvable streams, one per line: `key \| name \| type \| Nch \| rate` |
 | `selected` | the keys currently connected (= what gets recorded) |
-| `select all\|none\|<k1,k2,…>` | choose which streams to connect/record (`key` = `source_id`); rejected while recording (the set is locked until `stop`) |
+| `select all\|none\|<k1,k2,…>` | choose which streams to connect/record (each `key` is the identifier shown by `streams`); rejected while recording (the set is locked until `stop`) |
 | `set <subject\|session\|task\|run\|acq\|modality> <value>` | fill a filename-template field |
 | `filename <path>` | set the output path/template directly |
 | `start [path]` · `stop` | begin / end recording |
@@ -94,7 +94,7 @@ with socket.create_connection(("localhost", 22345)) as rc:
     #   mock-evoked-markers | MockEvokedMarkers | Markers |  1ch | 0
     #   mock-audio          | MockAudio         | Audio   |  2ch | 48000
 
-    # record only the EEG + its markers (keys are the source_ids from `streams`)
+    # record only the EEG + its markers (keys come from the `streams` list)
     cmd(rc, "select mock-eeg,mock-evoked-markers")
     print(cmd(rc, "selected"))                 # -> mock-eeg mock-evoked-markers
 
