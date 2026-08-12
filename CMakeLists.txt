@@ -8,11 +8,11 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 
 # Version single-specification point: the git release tag. CI derives it from the tag and passes
-# -DLSL_VERSION=X.Y.Z; a plain dev build stays 0.0.0. It flows to the exe VERSIONINFO (.rc), the
+# -DLSL_VIEWER_VERSION=X.Y.Z; a plain dev build stays 0.0.0. It flows to the exe VERSIONINFO (.rc), the
 # macOS bundle plist, and the Windows installer (all configured from ${PROJECT_VERSION}), so the
 # three never disagree.
-set(LSL_VERSION "0.0.0" CACHE STRING "Release version (CI passes the git tag)")
-project(lsl_viewer VERSION ${LSL_VERSION} LANGUAGES CXX)
+set(LSL_VIEWER_VERSION "0.0.0" CACHE STRING "Release version (CI passes the git tag)")
+project(lsl_viewer VERSION ${LSL_VIEWER_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,11 +23,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
 
-option(LSL_TRACY "Enable the Tracy frame profiler" OFF)
-option(LSL_TESTS "Build with the Dear ImGui Test Engine and UI tests" OFF)
-option(LSL_STATIC "Static-link SDL3 + liblsl (+ static MSVC CRT) into one self-contained binary" OFF)
+option(LSL_VIEWER_TRACY "Enable the Tracy frame profiler" OFF)
+option(LSL_VIEWER_TESTS "Build with the Dear ImGui Test Engine and UI tests" OFF)
+option(LSL_VIEWER_STATIC "Static-link SDL3 + liblsl (+ static MSVC CRT) into one self-contained binary" OFF)
 # CLI-only skips every GUI dependency (SDL3/ImGui/ImPlot/KissFFT) and builds just the headless
-# xdf_record. Combined with LSL_STATIC + -static it yields a fully-static recorder (no glibc/GPU
+# xdf_record. Combined with LSL_VIEWER_STATIC + -static it yields a fully-static recorder (no glibc/GPU
 # deps) — e.g. under musl/Alpine — that runs on any Linux. The viewer needs the GPU/display stack
 # and can't be fully static, so it's excluded here.
 option(LSL_CLI_ONLY "Build only the headless xdf_record CLI (no GUI deps)" OFF)
@@ -38,7 +38,7 @@ option(LSL_CLI_ONLY "Build only the headless xdf_record CLI (no GUI deps)" OFF)
 # liblsl's `lsl` target keeps its name + propagates LIBLSL_STATIC (PUBLIC), so the
 # link/compile lines below are unchanged. Mostly a Windows convenience; on Linux
 # the GPU driver / glibc stay dynamic regardless, so prefer AppImage for shipping.
-if(LSL_STATIC)
+if(LSL_VIEWER_STATIC)
   set(SDL_STATIC       ON  CACHE BOOL "" FORCE)
   set(SDL_SHARED       OFF CACHE BOOL "" FORCE)
   set(LSL_BUILD_STATIC ON  CACHE BOOL "" FORCE)
@@ -131,7 +131,7 @@ FetchContent_Declare(kissfft
 )
 
 # --- Tracy (optional frame profiler) ----------------------------------------
-if(LSL_TRACY)
+if(LSL_VIEWER_TRACY)
   # On-demand: collect only while a profiler server is connected, so an
   # unattended run doesn't pile profiling data into memory indefinitely.
   set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
@@ -143,7 +143,7 @@ if(LSL_TRACY)
 endif()
 
 # --- Dear ImGui Test Engine (optional UI testing + capture) -----------------
-if(LSL_TESTS)
+if(LSL_VIEWER_TESTS)
   FetchContent_Declare(imgui_test_engine
     GIT_REPOSITORY https://github.com/ocornut/imgui_test_engine.git
     GIT_TAG        main
@@ -156,10 +156,10 @@ if(LSL_CLI_ONLY)
 else()
   FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog kissfft)
 endif()
-if(LSL_TRACY)
+if(LSL_VIEWER_TRACY)
   FetchContent_MakeAvailable(tracy)
 endif()
-if(LSL_TESTS)
+if(LSL_VIEWER_TESTS)
   FetchContent_MakeAvailable(imgui_test_engine)
 endif()
 
@@ -188,7 +188,7 @@ target_link_libraries(ui PUBLIC SDL3::SDL3)
 
 # Test Engine hooks must be compiled INTO imgui (and seen by every consumer, or
 # the ImGuiContext layout diverges) — so the define is PUBLIC on `ui`.
-if(LSL_TESTS)
+if(LSL_VIEWER_TESTS)
   target_compile_definitions(ui PUBLIC IMGUI_ENABLE_TEST_ENGINE)
   set(TE_DIR ${imgui_test_engine_SOURCE_DIR}/imgui_test_engine)
   add_library(imgui_te STATIC
@@ -231,8 +231,8 @@ if(WIN32)
   # ws2_32 = Winsock for the remote-control TCP server (remote_control.hpp).
   target_link_libraries(lsl_viewer PRIVATE onecore ws2_32)
   # SDL3.dll / lsl.dll are built in _deps subdirs; copy them next to the exe.
-  # (No-op when LSL_STATIC: there are no runtime DLLs to copy.)
-  if(NOT LSL_STATIC)
+  # (No-op when LSL_VIEWER_STATIC: there are no runtime DLLs to copy.)
+  if(NOT LSL_VIEWER_STATIC)
     add_custom_command(TARGET lsl_viewer POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               $<TARGET_RUNTIME_DLLS:lsl_viewer> $<TARGET_FILE_DIR:lsl_viewer>
@@ -246,21 +246,21 @@ endif()  # NOT LSL_CLI_ONLY
 add_executable(xdf_record tools/xdf_record.cpp)
 target_include_directories(xdf_record PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(xdf_record PRIVATE lsl spdlog::spdlog)
-if(WIN32 AND NOT LSL_STATIC)
+if(WIN32 AND NOT LSL_VIEWER_STATIC)
   add_custom_command(TARGET xdf_record POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:xdf_record> $<TARGET_FILE_DIR:xdf_record>
     COMMAND_EXPAND_LISTS)
 endif()
 
-if(LSL_TRACY AND NOT LSL_CLI_ONLY)
-  target_compile_definitions(lsl_viewer PRIVATE LSL_TRACY)
+if(LSL_VIEWER_TRACY AND NOT LSL_CLI_ONLY)
+  target_compile_definitions(lsl_viewer PRIVATE LSL_VIEWER_TRACY)
   target_link_libraries(lsl_viewer PRIVATE Tracy::TracyClient)
 endif()
 
-if(LSL_TESTS AND NOT LSL_CLI_ONLY)
+if(LSL_VIEWER_TESTS AND NOT LSL_CLI_ONLY)
   target_sources(lsl_viewer PRIVATE tests/ui_tests.cpp)
-  target_compile_definitions(lsl_viewer PRIVATE LSL_TESTS)
+  target_compile_definitions(lsl_viewer PRIVATE LSL_VIEWER_TESTS)
   target_link_libraries(lsl_viewer PRIVATE imgui_te)
   target_compile_options(lsl_viewer PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/Z7,-g>)
 endif()
@@ -269,9 +269,9 @@ endif()
 # (measured ~45% smaller binary, mostly LTO dropping unused ImGui/ImPlot; imgui_demo
 # is already omitted from the build above). Negligible runtime gain (the app is GPU-bound and the hot CPU code
 # is already header-only/single-TU). Enabled for Release, but NOT for the test
-# build (LSL_TESTS = the iteration loop) nor the default RelWithDebInfo dev build,
+# build (LSL_VIEWER_TESTS = the iteration loop) nor the default RelWithDebInfo dev build,
 # so iterative links stay fast.
-if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT LSL_TESTS AND NOT LSL_CLI_ONLY)
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT LSL_VIEWER_TESTS AND NOT LSL_CLI_ONLY)
   include(CheckIPOSupported)
   check_ipo_supported(RESULT _ipo_ok OUTPUT _ipo_msg LANGUAGES CXX)  # project is CXX-only
   if(_ipo_ok)

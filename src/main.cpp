@@ -57,7 +57,7 @@
 #include <unordered_set>
 #include <vector>
 
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
 #include "imgui_test_engine/imgui_te_engine.h"
 #include "imgui_test_engine/imgui_te_context.h"
 #include "imgui_test_engine/imgui_te_ui.h"
@@ -1662,7 +1662,7 @@ int main(int argc, char** argv) {
         }
     }
 
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
     const bool runTests = (argc > 1 && std::strcmp(argv[1], "--tests") == 0);
     // Optional filter: `--tests <query>` runs only matching tests (e.g. "ui/capture_*").
     const char* testFilter = (runTests && argc > 2) ? argv[2] : nullptr;
@@ -3334,7 +3334,7 @@ int main(int argc, char** argv) {
                 ImGui::ShowMetricsWindow(&showMetrics);  // vertex/draw-call inspector
             }
 
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
             if (!runTests) ImGuiTestEngine_ShowTestEngineWindows(engine, nullptr);
 #endif
             ImGui::Render();
@@ -3374,7 +3374,7 @@ int main(int argc, char** argv) {
             }
 
             SDL_GPUTexture* renderTarget = swapchain;
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
             // Render into an offscreen texture so the frame stays readable for
             // screen capture; recreate it when the swapchain size changes.
             if (swapchain) {
@@ -3408,7 +3408,7 @@ int main(int argc, char** argv) {
                 ImGui_ImplSDLGPU3_RenderDrawData(draw_data, cmd, pass);
                 SDL_EndGPURenderPass(pass);
 
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
                 if (renderTarget != swapchain) {   // present the offscreen frame
                     SDL_GPUBlitInfo blit = {};
                     blit.source.texture      = offscreen;
@@ -3421,11 +3421,11 @@ int main(int argc, char** argv) {
                 }
 #endif
             }
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
             ImGuiTestEngine_PreSwap(engine);   // time measurement, before present
 #endif
             if (cmd) SDL_SubmitGPUCommandBuffer(cmd);   // presents the acquired swapchain (skip if acquire failed)
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
             ImGuiTestEngine_PostSwap(engine);  // processes capture / queue timing
             // The engine loads settings (incl. empty VideoCapture*ToEncoder entries) on the
             // first frame, clobbering any pre-Start values; (re)apply the ffmpeg path + params
@@ -3466,7 +3466,7 @@ int main(int argc, char** argv) {
             if (profAccum >= 3.0) { LSL_PROFILE_DUMP(profAccum); profAccum = 0.0; }
         }
 
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
         // Headless: exit once the queued tests have all drained (after a few
         // warm-up frames so the queue has actually started).
         if (runTests && frameCounter > 5 && ImGuiTestEngine_IsTestQueueEmpty(engine))
@@ -3475,7 +3475,7 @@ int main(int argc, char** argv) {
     }
     if (profile) LSL_PROFILE_DUMP(profAccum > 0 ? profAccum : 1.0);  // final partial window
 
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
     int exitCode = 0;
     if (runTests) {
         int tested = 0, ok = 0;
@@ -3489,7 +3489,7 @@ int main(int argc, char** argv) {
 
     // ---- Shutdown -------------------------------------------------------
     SDL_WaitForGPUIdle(gpu);
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
     if (offscreen) SDL_ReleaseGPUTexture(gpu, offscreen);
 #endif
     for (auto& s : sources)       s->requestStop();  // signal all so joins overlap
@@ -3504,7 +3504,7 @@ int main(int argc, char** argv) {
     ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
     // Must be after ImGui::DestroyContext() so test-engine .ini data can save.
     ImGuiTestEngine_DestroyContext(engine);
 #endif
@@ -3513,7 +3513,7 @@ int main(int argc, char** argv) {
     SDL_DestroyGPUDevice(gpu);
     SDL_DestroyWindow(window);
     SDL_Quit();
-#ifdef LSL_TESTS
+#ifdef LSL_VIEWER_TESTS
     return exitCode;
 #else
     return 0;

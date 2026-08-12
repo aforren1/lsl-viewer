@@ -95,10 +95,10 @@ uv run tests/compare_labrecorder.py        # all mock streams, incl. 48 kHz audi
 
 | Flag | Effect |
 |------|--------|
-| `-DLSL_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]` |
-| `-DLSL_TRACY=ON`  | enable the [Tracy](https://github.com/wolfpld/tracy) frame profiler (connect the Tracy server to view) |
-| `-DLSL_STATIC=ON` | static-link SDL3 + liblsl into one self-contained binary (see below) |
-| `-DLSL_CLI_ONLY=ON` | build **only** the headless `xdf_record` (skip all GUI deps: SDL3/ImGui/ImPlot/KissFFT). With `-DLSL_STATIC=ON` + a musl toolchain + `-DCMAKE_EXE_LINKER_FLAGS=-static` → a fully-static recorder with no glibc/GPU deps |
+| `-DLSL_VIEWER_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]` |
+| `-DLSL_VIEWER_TRACY=ON`  | enable the [Tracy](https://github.com/wolfpld/tracy) frame profiler (connect the Tracy server to view) |
+| `-DLSL_VIEWER_STATIC=ON` | static-link SDL3 + liblsl into one self-contained binary (see below) |
+| `-DLSL_CLI_ONLY=ON` | build **only** the headless `xdf_record` (skip all GUI deps: SDL3/ImGui/ImPlot/KissFFT). With `-DLSL_VIEWER_STATIC=ON` + a musl toolchain + `-DCMAKE_EXE_LINKER_FLAGS=-static` → a fully-static recorder with no glibc/GPU deps |
 | `-DSDL_X11=OFF`   | Linux/WSL: build the Wayland backend only |
 
 There's also a lightweight built-in text profiler: run with `LSL_PROFILE=1` for a
@@ -107,11 +107,11 @@ readout (no Tracy needed).
 
 ## Static build (single-file distribution)
 
-`-DLSL_STATIC=ON` folds SDL3 and liblsl into the executable so there's nothing to
+`-DLSL_VIEWER_STATIC=ON` folds SDL3 and liblsl into the executable so there's nothing to
 ship alongside it:
 
 ```bash
-cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DLSL_STATIC=ON
+cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release -DLSL_VIEWER_STATIC=ON
 cmake --build build-static
 ```
 
@@ -166,7 +166,7 @@ tools/                   standalone helpers (not linked into the viewer)
   xdf_record.cpp           headless XDF recorder CLI (no GUI deps)
 
 tests/                   Dear ImGui Test Engine UI tests + screenshot captures
-  ui_tests.cpp             enabled with -DLSL_TESTS=ON; run via `lsl_viewer --tests`
+  ui_tests.cpp             enabled with -DLSL_VIEWER_TESTS=ON; run via `lsl_viewer --tests`
   compare_labrecorder.py   records the mock streams with our recorder + LabRecorder and
                            checks the XDFs are identical (needs LabRecorderCLI; runs locally)
 

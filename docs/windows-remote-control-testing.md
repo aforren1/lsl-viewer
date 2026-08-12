@@ -27,7 +27,7 @@ replies + the resulting `RemoteState`. Building with tests on runs the genuine
 Winsock path:
 
 ```powershell
-cmake -S . -B build-test -DLSL_TESTS=ON
+cmake -S . -B build-test -DLSL_VIEWER_TESTS=ON
 cmake --build build-test --config Release
 .\build-test\Release\lsl_viewer.exe --tests remote
 ```

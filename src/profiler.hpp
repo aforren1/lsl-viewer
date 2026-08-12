@@ -1,7 +1,7 @@
 #pragma once
 // Thin profiling layer. Two backends, picked at build time:
 //
-//   -DLSL_TRACY=ON   LSL_ZONE forwards to the Tracy client (interactive timeline).
+//   -DLSL_VIEWER_TRACY=ON   LSL_ZONE forwards to the Tracy client (interactive timeline).
 //   (default)        LSL_ZONE feeds a lightweight built-in TEXT profiler that
 //                    accumulates per-zone count/total/avg/max and prints a sorted
 //                    table to stdout — readable without a GUI. Opt-in at runtime
@@ -14,7 +14,7 @@
 //   LSL_PROFILE_ENABLE(bool)  turn the text profiler on/off
 //   LSL_PROFILE_DUMP(seconds) print the table for the elapsed window, then reset
 
-#if defined(LSL_TRACY)
+#if defined(LSL_VIEWER_TRACY)
   #include <tracy/Tracy.hpp>
   #define LSL_ZONE(name)         ZoneScopedN(name)
   #define LSL_FRAME_MARK()       FrameMark
