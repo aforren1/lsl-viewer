@@ -69,7 +69,7 @@ With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), 
 |---|---|
 | `streams` | list resolvable streams, one per line: `key \| name \| type \| Nch \| rate` |
 | `selected` | the keys currently connected (= what gets recorded) |
-| `select all\|none\|<k1,k2,…>` | choose which streams to connect/record (`key` = `source_id`) |
+| `select all\|none\|<k1,k2,…>` | choose which streams to connect/record (`key` = `source_id`); rejected while recording (the set is locked until `stop`) |
 | `set <subject\|session\|task\|run\|acq\|modality> <value>` | fill a filename-template field |
 | `filename <path>` | set the output path/template directly |
 | `start [path]` · `stop` | begin / end recording |

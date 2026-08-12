@@ -218,8 +218,11 @@ static FoundInfo makeFound(lsl::stream_info info) {
 // Effective classification: the user's per-stream override if present, else the cached default.
 // Reads FoundInfo::marker + g_streamKind, so no per-frame stream_info accessors.
 static bool effMarker(const FoundInfo& f) {
-    auto it = g_streamKind.find(f.key);
-    return it != g_streamKind.end() ? it->second : f.marker;
+    if (!g_streamKind.empty()) {   // common case has no overrides — skip the map lookup
+        auto it = g_streamKind.find(f.key);
+        if (it != g_streamKind.end()) return it->second;
+    }
+    return f.marker;
 }
 // Is this connected source the same resolved stream? Prefer source_id (globally unique,
 // stable across reconnects) so a reconnected stream (new uid) isn't double-connected; fall
@@ -1349,6 +1352,7 @@ static bool erpLabelMatches(const char* filter, const std::string& text) {
     bool blank = true;
     for (const char* q = filter; *q; ++q) if (!std::isspace((unsigned char)*q)) { blank = false; break; }
     if (blank) return true;
+    bool anyLabel = false;                                     // any non-empty label segment seen?
     const char* a = filter;                                    // current segment start
     for (const char* p = filter; ; ++p) {
         const bool sep = (p[0] == ' ' && p[1] == '|' && p[2] == ' ');   // " | " delimiter
@@ -1358,11 +1362,11 @@ static bool erpLabelMatches(const char* filter, const std::string& text) {
         while (s < b && std::isspace((unsigned char)*s)) ++s;
         while (b > s && std::isspace((unsigned char)b[-1])) --b;
         const std::size_t n = (std::size_t)(b - s);
-        if (n && text.size() == n && text.compare(0, n, s, n) == 0) return true;
+        if (n) { anyLabel = true; if (text.size() == n && text.compare(0, n, s, n) == 0) return true; }
         if (!*p) break;
         p += 2; a = p + 1;                                     // skip " | " (loop's ++p does the 3rd char)
     }
-    return false;
+    return !anyLabel;   // only separators, no real labels -> behave like blank (match every event)
 }
 
 static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
@@ -1482,7 +1486,9 @@ static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBu
     buf->appendf("scale=%.3f\n", g_uiScale);
     buf->appendf("recdir=%s\n",  g_recDir);
     buf->appendf("rectmpl=%s\n", g_recTmpl);
-    for (const auto& [k, kind] : g_streamKind) buf->appendf("streamkind=%d %s\n", kind ? 1 : 0, k.c_str());
+    // skip an empty key: it would serialize as "streamkind=0 \n", which the "%d %511[^\n]" read can't
+    // round-trip (no chars before the newline). streamKey is never empty in practice (LSL uid is set).
+    for (const auto& [k, kind] : g_streamKind) if (!k.empty()) buf->appendf("streamkind=%d %s\n", kind ? 1 : 0, k.c_str());
     buf->append("\n");
 }
 // SDL folder-picker result. The callback runs on SDL's dialog thread (a separate thread
@@ -2138,7 +2144,7 @@ int main(int argc, char** argv) {
                 }
             };
             // Apply a pending "treat as marker" / "treat as data" toggle (set last frame by the
-            // Info-panel button or the rail right-click): tear down the stream's current source and
+            // rail row's right-click menu): tear down the stream's current source and
             // rebuild it as the other type. Direct rebuild (not disconnect+connect) so it sidesteps
             // the dismissed / auto-reconnect machinery.
             if (!g_reclassifyKey.empty()) {
@@ -2147,6 +2153,12 @@ int main(int argc, char** argv) {
                         [&](const std::unique_ptr<HfStreamSource>& p){ return streamKeyOf(*p) == key; });
                     di != sources.end()) {                       // data -> marker
                     lsl::stream_info info = (*di)->info();
+                    // Keep analysis windows that were showing this stream bound to it by key, so
+                    // reverting the toggle re-binds them rather than leaving them on whatever stream
+                    // shifts into the vacated index.
+                    for (auto& sp : spectros) if (sp->streamIdx < (int)sources.size() && streamKeyOf(*sources[sp->streamIdx]) == key) sp->wantSid = key;
+                    for (auto& ep : erps)     if (ep->streamIdx < (int)sources.size() && streamKeyOf(*sources[ep->streamIdx]) == key) ep->wantSid = key;
+                    if (fftStream < (int)sources.size() && streamKeyOf(*sources[fftStream]) == key) fftWantSid = key;
                     edgeMap.erase(di->get()); pauseHead.erase(di->get()); dispOpts.erase(di->get());
                     (*di)->requestStop(); closing.push_back(std::move(*di)); sources.erase(di);
                     if (isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = true;
@@ -2157,6 +2169,8 @@ int main(int argc, char** argv) {
                         [&](const std::unique_ptr<MarkerSource>& p){ return streamKeyOf(*p) == key; });
                     mi != markerSources.end()) {                 // marker -> data
                     lsl::stream_info info = (*mi)->info();
+                    // Same: keep ERP windows' marker side bound to this stream by key across the flip.
+                    for (auto& ep : erps) if (ep->markerIdx < (int)markerSources.size() && streamKeyOf(*markerSources[ep->markerIdx]) == key) ep->wantMsid = key;
                     (*mi)->requestStop(); closingMrk.push_back(std::move(*mi)); markerSources.erase(mi);
                     if (!isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = false;
                     auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
@@ -2164,15 +2178,18 @@ int main(int argc, char** argv) {
                     ImGui::MarkIniSettingsDirty();
                 }
             }
-            if (autoConnect)
+            // Auto-connect is suppressed while recording: the recorded set is fixed at Start, so a
+            // newly-appearing stream must not quietly join the display (it wouldn't be recorded).
+            if (autoConnect && !recorder.active())
                 for (auto& fi : found)
                     if (!dismissed.count(fi.key) && !connected(fi))
                         connectStream(fi);
 
             // Built-in demo: while it's emitting, auto-connect its own streams (source_id
             // "mock-*") so one click both publishes and shows them — but still honor a manual
-            // disconnect (dismissed), so a row's X stays closed without fighting it.
-            if (mockStreams.running())
+            // disconnect (dismissed), so a row's X stays closed without fighting it. Also frozen
+            // while recording (same fixed-set reason as above).
+            if (mockStreams.running() && !recorder.active())
                 for (auto& fi : found)
                     if (fi.sourceId.rfind("mock-", 0) == 0 &&
                         !dismissed.count(fi.key) && !connected(fi))
@@ -2272,14 +2289,16 @@ int main(int argc, char** argv) {
                 // "*" = connect all discovered, empty = disconnect all, else make the
                 // connected set exactly the given keys.
                 if (rcState.setSelection) {
-                    const auto& sel = *rcState.setSelection;
-                    const bool all = (sel.size() == 1 && sel[0] == "*");
-                    const std::set<std::string> want(sel.begin(), sel.end());
-                    for (auto& fi : found) {
-                        const bool shouldConn = all || want.count(fi.key) != 0;
-                        const bool isConn = connected(fi);
-                        if (shouldConn && !isConn)      connectStream(fi);
-                        else if (!shouldConn && isConn) disconnectKey(fi.key);
+                    if (!recorder.active()) {   // ignore a select that raced an in-progress recording
+                        const auto& sel = *rcState.setSelection;
+                        const bool all = (sel.size() == 1 && sel[0] == "*");
+                        const std::set<std::string> want(sel.begin(), sel.end());
+                        for (auto& fi : found) {
+                            const bool shouldConn = all || want.count(fi.key) != 0;
+                            const bool isConn = connected(fi);
+                            if (shouldConn && !isConn)      connectStream(fi);
+                            else if (!shouldConn && isConn) disconnectKey(fi.key);
+                        }
                     }
                     rcState.setSelection.reset();
                 }
@@ -2521,14 +2540,15 @@ int main(int argc, char** argv) {
                     const bool clicked = ImGui::Selectable(label, false, 0, ImVec2(0, rowH));
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered()) {
+                        const char* act = recorder.active() ? "stop recording to change streams"
+                                                            : (m ? "click to disconnect" : "click to connect");
                         if (m) ImGui::SetTooltip("%s  (host: %s)\n%zu events total \xc2\xb7 overlay on"
-                                                 " the time-series plots (toggle per plot)"
-                                                 "\nclick to disconnect",
-                                                 fi.uid.c_str(), fi.hostname.c_str(), m->count());
-                        else   ImGui::SetTooltip("%s  (host: %s)\nclick to connect",
-                                                 fi.uid.c_str(), fi.hostname.c_str());
+                                                 " the time-series plots (toggle per plot)\n%s",
+                                                 fi.uid.c_str(), fi.hostname.c_str(), m->count(), act);
+                        else   ImGui::SetTooltip("%s  (host: %s)\n%s",
+                                                 fi.uid.c_str(), fi.hostname.c_str(), act);
                     }
-                    if (clicked) {
+                    if (clicked && !recorder.active()) {   // stream set is locked while recording
                         if (!m) connectStream(fi);            // connect
                         else    disconnectKey(fi.key);        // disconnect (no window to close)
                     }
@@ -2562,17 +2582,20 @@ int main(int argc, char** argv) {
                     const bool clicked = ImGui::Selectable(label, false, 0, ImVec2(0, rowH));
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s  (host: %s)\nclick to %s",
+                        ImGui::SetTooltip("%s  (host: %s)\n%s",
                                           fi.uid.c_str(), fi.hostname.c_str(),
-                                          csrc ? "focus" : "connect");
+                                          (!csrc && recorder.active()) ? "stop recording to change streams"
+                                                                       : (csrc ? "click to focus" : "click to connect"));
                     if (clicked) {
-                        if (!csrc) connectStream(fi);                        // connect
-                        else       ImGui::SetWindowFocus(fi.name.c_str());   // already on: focus its plot
+                        if (!csrc) { if (!recorder.active()) connectStream(fi); }  // connect (locked while recording)
+                        else       ImGui::SetWindowFocus(fi.name.c_str());         // focus its plot (always allowed)
                     }
-                    // Irregular numeric stream (e.g. an int trigger arriving as a waveform): offer to
-                    // show it as event/marker overlays. Gated to irregular so a regular high-rate
-                    // stream can't accidentally become an event flood.
-                    if (csrc && fi.srate == 0.0 &&
+                    // Numeric stream the user wants as event/marker overlays. Offered for irregular
+                    // streams (e.g. an int trigger arriving as a waveform) — gated so a regular
+                    // high-rate stream can't accidentally become an event flood — OR for any stream
+                    // that's a marker by default (a "Markers"-typed stream they'd flipped to data),
+                    // so that flip is always reversible regardless of rate.
+                    if (csrc && (fi.srate == 0.0 || fi.marker) &&
                         ImGui::BeginPopupContextItem("##data2mk")) {
                         if (ImGui::MenuItem("Treat as marker (show as events)"))
                             g_reclassifyKey = fi.key;
@@ -2692,7 +2715,9 @@ int main(int argc, char** argv) {
                     }
                 }
                 title += "###" + id;
-                ImGui::Begin(title.c_str(), &open);
+                // While recording, hide the close (X): closing the window disconnects the stream, and
+                // the connected set is locked for the duration of the recording.
+                ImGui::Begin(title.c_str(), recorder.active() ? nullptr : &open);
                 drawStream(*s, o, edge, /*followX=*/(!paused || justPaused), headFreeze,
                            markerViews, scratch);
                 ImGui::End();
@@ -3157,7 +3182,7 @@ int main(int argc, char** argv) {
 
                     // ---- left config strip; the plot fills the right (matches the time
                     // series / spectrum / spectrogram windows) ----
-                    ImGui::BeginChild("cfg", ImVec2(230, 0), ImGuiChildFlags_Borders);
+                    ImGui::BeginChild("cfg", ImVec2(uiScaled(230), 0), ImGuiChildFlags_Borders);
                     // data stream
                     ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("stream", src->name().c_str())) {
