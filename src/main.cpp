@@ -1765,9 +1765,10 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<Spectro>> spectros;
     std::vector<std::unique_ptr<Erp>>     erps;
     int nextSpectroId = 1, nextErpId = 1;
+    bool showMarkers  = false;   // Marker events log (View menu) — see events with no data stream
     bool showMetrics  = false;   // ImGui metrics/debugger (Debug menu) — vertex counts, draw calls
     // one-shot "raise this window to the front" requests, set from the menu
-    bool focusSpectrum = false, focusMetrics = false;
+    bool focusSpectrum = false, focusMarkers = false, focusMetrics = false;
     // one-shot: a new analysis window was just opened — ensure a bottom dock row
     // exists for it (ImGui prunes the row once its last window closes).
     bool wantBottom = false;
@@ -2019,6 +2020,7 @@ int main(int argc, char** argv) {
                     // These toggle visibility, but a click also raises the window so it
                     // can't stay buried behind a stream plot.
                     if (ImGui::MenuItem("Spectrum", nullptr, showSpectrum))    { showSpectrum = true; focusSpectrum = true; wantBottom = true; }
+                    if (ImGui::MenuItem("Marker events", nullptr, showMarkers)) { showMarkers = true; focusMarkers = true; wantBottom = true; }
                     if (ImGui::MenuItem("New spectrogram")) {
                         auto s = std::make_unique<Spectro>(); s->id = nextSpectroId++; spectros.push_back(std::move(s));
                         wantBottom = true;
@@ -3380,6 +3382,38 @@ int main(int argc, char** argv) {
                 ImGui::End();
             }
             std::erase_if(erps, [](const std::unique_ptr<Erp>& e) { return !e->open; });
+
+            // ---- Marker events: a plain "time  value" scrolling log per connected marker
+            // stream, so events are visible even with NO continuous stream to overlay them on
+            // (the per-plot overlay needs a data plot). This was the original motivating use.
+            if (showMarkers) {
+                if (focusMarkers) { ImGui::SetNextWindowFocus(); focusMarkers = false; }
+                ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
+                if (ImGui::Begin("Marker events", &showMarkers)) {
+                    if (markerSources.empty())
+                        ImGui::TextDisabled("Connect a marker stream (string / \"Markers\"-typed) to see its events here.");
+                    for (auto& msp : markerSources) {
+                        MarkerSource& mk = *msp;
+                        ImGui::PushID(&mk);
+                        char hdr[192];
+                        std::snprintf(hdr, sizeof(hdr), "%s  \xc2\xb7  %zu events \xc2\xb7 %.1f/s###mk",
+                                      mk.name().c_str(), mk.count(), mk.rate());
+                        if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
+                            const auto& evs = mk.tailCached(500);   // last few hundred lines
+                            ImGui::BeginChild("log", ImVec2(0, 200), ImGuiChildFlags_Borders);
+                            ImGuiListClipper clip; clip.Begin((int)evs.size());
+                            while (clip.Step())
+                                for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i)
+                                    ImGui::Text("%.3f   %s", evs[i].t, evs[i].text.c_str());
+                            // Stick to the newest line unless the user has scrolled up.
+                            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+                            ImGui::EndChild();
+                        }
+                        ImGui::PopID();
+                    }
+                }
+                ImGui::End();
+            }
 
             if (showMetrics) {
                 if (focusMetrics) { ImGui::SetNextWindowFocus(); focusMetrics = false; }

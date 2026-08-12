@@ -21,6 +21,7 @@ I used AI (Claude Opus 4.8) to help me develop this tool. Special thanks to the 
 - A raster/heatmap mode for high channel counts (32–256+), where individual line traces become too thin to read.
 - Pause to inspect a frozen window.
 - Dropouts are drawn as gaps on the real timeline rather than concatenating across the missing span.
+- Marker/event streams overlay as labeled event lines on the time series; a standalone **Marker events** log (View menu) also lists them as a scrolling `time  value` feed, so events are visible even with no continuous stream running.
 
 ### Signal conditioning
 

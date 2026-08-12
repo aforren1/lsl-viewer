@@ -712,6 +712,19 @@ public:
         return cached_;
     }
 
+    // The last up to `n` events, cached (rebuilt only when a new event arrives). For the
+    // standalone marker-event log, which wants a fixed line count regardless of rate, unlike
+    // cachedEvents()'s 64 s window. Main-thread only.
+    const std::vector<Event>& tailCached(std::size_t n) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (total_ != tailSeen_ || tailN_ != n) {
+            tailSeen_ = total_; tailN_ = n;
+            const std::size_t start = events_.size() > n ? events_.size() - n : 0;
+            tail_.assign(events_.begin() + start, events_.end());
+        }
+        return tail_;
+    }
+
     // Recent rate (events/s over the last `window` s) — more useful than a raw count
     // for a long session; 0 once events stop arriving.
     double rate(double window = 5.0) const {
@@ -788,6 +801,8 @@ private:
     std::vector<Event>  events_;
     std::vector<Event>  cached_;         // render-thread snapshot (see cachedEvents)
     std::size_t         cachedSeen_ = (std::size_t)-1;  // total_ when cached_ was built
+    std::vector<Event>  tail_;           // render-thread snapshot (see tailCached)
+    std::size_t         tailSeen_ = (std::size_t)-1, tailN_ = 0;  // total_/n when tail_ was built
     std::size_t         total_ = 0;     // lifetime count (events_ is pruned)
     std::string         error_;
     std::atomic<double> lastData_{0.0};
