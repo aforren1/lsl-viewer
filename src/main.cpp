@@ -2581,24 +2581,24 @@ int main(int argc, char** argv) {
                     const bool clicked = ImGui::Selectable(label, false, 0, ImVec2(0, rowH));
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered()) {
-                        const char* act = recorder.active() ? "stop recording to change streams"
-                                                            : (m ? "click to disconnect" : "click to connect");
+                        const char* act = m ? "click to open its events \xc2\xb7 right-click to disconnect"
+                                          : recorder.active() ? "stop recording to change streams"
+                                          : "click to connect";
                         if (m) ImGui::SetTooltip("%s  (host: %s)\n%zu events total \xc2\xb7 overlay on"
                                                  " the time-series plots (toggle per plot)\n%s",
                                                  fi.uid.c_str(), fi.hostname.c_str(), m->count(), act);
                         else   ImGui::SetTooltip("%s  (host: %s)\n%s",
                                                  fi.uid.c_str(), fi.hostname.c_str(), act);
                     }
-                    if (clicked && !recorder.active()) {   // stream set is locked while recording
-                        if (!m) connectStream(fi);            // connect
-                        else    disconnectKey(fi.key);        // disconnect (no window to close)
+                    if (clicked) {   // left-click: connect if new, else reveal its events log (no plot to focus)
+                        if (!m) { if (!recorder.active()) connectStream(fi); }  // connect (locked while recording)
+                        else    { showMarkers = true; focusMarkers = true; wantBottom = true; }
                     }
-                    // A numeric stream shown as markers (declared a "Markers" type, or reclassified)
-                    // can go back to a waveform via right-click. Native string markers can't be data.
-                    if (m && !fi.stringMarker &&
-                        ImGui::BeginPopupContextItem("##mk2data")) {
-                        if (ImGui::MenuItem("Treat as data stream"))
-                            g_reclassifyKey = fi.key;
+                    // Right-click a connected marker: disconnect, or (numeric markers only) flip it
+                    // back to a waveform. Native string markers can't be data.
+                    if (m && ImGui::BeginPopupContextItem("##mkctx")) {
+                        if (!recorder.active() && ImGui::MenuItem("Disconnect")) disconnectKey(fi.key);
+                        if (!fi.stringMarker && ImGui::MenuItem("Treat as data stream")) g_reclassifyKey = fi.key;
                         ImGui::EndPopup();
                     }
                 } else {
@@ -2626,19 +2626,20 @@ int main(int argc, char** argv) {
                         ImGui::SetTooltip("%s  (host: %s)\n%s",
                                           fi.uid.c_str(), fi.hostname.c_str(),
                                           (!csrc && recorder.active()) ? "stop recording to change streams"
-                                                                       : (csrc ? "click to focus" : "click to connect"));
+                                          : csrc ? "click to focus \xc2\xb7 right-click to disconnect"
+                                                 : "click to connect");
                     if (clicked) {
                         if (!csrc) { if (!recorder.active()) connectStream(fi); }  // connect (locked while recording)
                         else       ImGui::SetWindowFocus(fi.name.c_str());         // focus its plot (always allowed)
                     }
-                    // Numeric stream the user wants as event/marker overlays. Offered for irregular
-                    // streams (e.g. an int trigger arriving as a waveform) — gated so a regular
-                    // high-rate stream can't accidentally become an event flood — OR for any stream
-                    // that's a marker by default (a "Markers"-typed stream they'd flipped to data),
-                    // so that flip is always reversible regardless of rate.
-                    if (csrc && (fi.srate == 0.0 || fi.marker) &&
-                        ImGui::BeginPopupContextItem("##data2mk")) {
-                        if (ImGui::MenuItem("Treat as marker (show as events)"))
+                    // Right-click a connected data stream: disconnect. Additionally, a stream the user
+                    // wants as event/marker overlays can be flipped — offered for irregular streams
+                    // (e.g. an int trigger arriving as a waveform), gated so a regular high-rate stream
+                    // can't accidentally become an event flood, OR for any stream that's a marker by
+                    // default (a "Markers"-typed stream they'd flipped to data), so the flip reverses.
+                    if (csrc && ImGui::BeginPopupContextItem("##datactx")) {
+                        if (!recorder.active() && ImGui::MenuItem("Disconnect")) disconnectKey(fi.key);
+                        if ((fi.srate == 0.0 || fi.marker) && ImGui::MenuItem("Treat as marker (show as events)"))
                             g_reclassifyKey = fi.key;
                         ImGui::EndPopup();
                     }
