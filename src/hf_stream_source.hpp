@@ -686,6 +686,7 @@ public:
     int                channels() const { return channels_; }
 
     std::size_t count() const { std::lock_guard<std::mutex> lk(mtx_); return total_; }
+    double firstTime() const { std::lock_guard<std::mutex> lk(mtx_); return firstT_; }  // 1st event seen (relative-time zero)
 
     // Events with display-time >= tmin (events_ is time-ordered). Bounds the per-frame
     // copy for long recordings — callers pass the oldest visible time.
@@ -780,6 +781,7 @@ private:
                     if (!sample[c].empty()) text += ", " + sample[c];
 
                 std::lock_guard<std::mutex> lk(mtx_);
+                if (total_ == 0) firstT_ = ts + offset;   // stable zero for relative-time display
                 events_.push_back({ts + offset, std::move(text), total_});  // seq = ordinal
                 ++total_;
                 if (events_.size() > kMaxEvents)              // keep memory bounded
@@ -804,6 +806,7 @@ private:
     std::vector<Event>  tail_;           // render-thread snapshot (see tailCached)
     std::size_t         tailSeen_ = (std::size_t)-1, tailN_ = 0;  // total_/n when tail_ was built
     std::size_t         total_ = 0;     // lifetime count (events_ is pruned)
+    double              firstT_ = 0.0;  // display time of the first event ever seen (relative-time zero)
     std::string         error_;
     std::atomic<double> lastData_{0.0};
     jthread        worker_;

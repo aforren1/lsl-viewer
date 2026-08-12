@@ -1766,6 +1766,7 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<Erp>>     erps;
     int nextSpectroId = 1, nextErpId = 1;
     bool showMarkers  = false;   // Marker events log (View menu) — see events with no data stream
+    bool markersRelTime = true;  // Marker log: time relative to the stream's first event vs absolute LSL clock
     bool showMetrics  = false;   // ImGui metrics/debugger (Debug menu) — vertex counts, draw calls
     // one-shot "raise this window to the front" requests, set from the menu
     bool focusSpectrum = false, focusMarkers = false, focusMetrics = false;
@@ -3383,13 +3384,16 @@ int main(int argc, char** argv) {
             }
             std::erase_if(erps, [](const std::unique_ptr<Erp>& e) { return !e->open; });
 
-            // ---- Marker events: a plain "time  value" scrolling log per connected marker
-            // stream, so events are visible even with NO continuous stream to overlay them on
-            // (the per-plot overlay needs a data plot). This was the original motivating use.
+            // ---- Marker events: a scrolling "time / delta / delta-since-same-label / value" log
+            // per connected marker stream, so events are visible even with NO continuous stream to
+            // overlay them on (the per-plot overlay needs a data plot). The original motivating use.
             if (showMarkers) {
                 if (focusMarkers) { ImGui::SetNextWindowFocus(); focusMarkers = false; }
                 ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
                 if (ImGui::Begin("Marker events", &showMarkers)) {
+                    ImGui::Checkbox("Relative time", &markersRelTime);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Show t as seconds since the stream's first event, else the absolute LSL clock.");
                     if (markerSources.empty())
                         ImGui::TextDisabled("Connect a marker stream (string / \"Markers\"-typed) to see its events here.");
                     for (auto& msp : markerSources) {
@@ -3400,14 +3404,52 @@ int main(int argc, char** argv) {
                                       mk.name().c_str(), mk.count(), mk.rate());
                         if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
                             const auto& evs = mk.tailCached(500);   // last few hundred lines
-                            ImGui::BeginChild("log", ImVec2(0, 200), ImGuiChildFlags_Borders);
-                            ImGuiListClipper clip; clip.Begin((int)evs.size());
-                            while (clip.Step())
-                                for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i)
-                                    ImGui::Text("%.3f   %s", evs[i].t, evs[i].text.c_str());
-                            // Stick to the newest line unless the user has scrolled up.
-                            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
-                            ImGui::EndChild();
+                            const double t0 = markersRelTime ? mk.firstTime() : 0.0;
+                            // Δ-since-same-label: nearest earlier event with the same text.
+                            auto sameDelta = [&](int i) -> double {
+                                for (int j = i - 1; j >= 0; --j)
+                                    if (evs[j].text == evs[i].text) return evs[i].t - evs[j].t;
+                                return -1.0;   // no earlier occurrence in the buffer
+                            };
+                            if (ImGui::SmallButton("Copy CSV")) {
+                                std::string csv = "time,dt,dt_same,value\n";
+                                for (int i = 0; i < (int)evs.size(); ++i) {
+                                    char row[128];
+                                    std::snprintf(row, sizeof(row), "%.6f,", evs[i].t - t0);
+                                    csv += row;
+                                    if (i > 0) { std::snprintf(row, sizeof(row), "%.6f", evs[i].t - evs[i - 1].t); csv += row; }
+                                    csv += ',';
+                                    const double ds = sameDelta(i);
+                                    if (ds >= 0) { std::snprintf(row, sizeof(row), "%.6f", ds); csv += row; }
+                                    csv += ",\"";
+                                    for (char c : evs[i].text) { if (c == '"') csv += '"'; csv += c; }  // CSV-quote
+                                    csv += "\"\n";
+                                }
+                                ImGui::SetClipboardText(csv.c_str());
+                            }
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy these events to the clipboard as CSV.");
+                            constexpr auto tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg
+                                              | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
+                            if (ImGui::BeginTable("evs", 4, tf, ImVec2(0, 200))) {
+                                ImGui::TableSetupScrollFreeze(0, 1);
+                                ImGui::TableSetupColumn("t (s)");
+                                ImGui::TableSetupColumn("\xce\x94");             // delta from previous event
+                                ImGui::TableSetupColumn("\xce\x94 same");        // delta since same label
+                                ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
+                                ImGui::TableHeadersRow();
+                                ImGuiListClipper clip; clip.Begin((int)evs.size());
+                                while (clip.Step())
+                                    for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                                        ImGui::TableNextRow();
+                                        ImGui::TableNextColumn(); ImGui::Text("%.3f", evs[i].t - t0);
+                                        ImGui::TableNextColumn(); if (i > 0) ImGui::Text("%.3f", evs[i].t - evs[i - 1].t);
+                                        ImGui::TableNextColumn(); { const double ds = sameDelta(i); if (ds >= 0) ImGui::Text("%.3f", ds); }
+                                        ImGui::TableNextColumn(); ImGui::TextUnformatted(evs[i].text.c_str());
+                                    }
+                                // Stick to the newest row unless the user has scrolled up.
+                                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+                                ImGui::EndTable();
+                            }
                         }
                         ImGui::PopID();
                     }
