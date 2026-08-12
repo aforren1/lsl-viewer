@@ -2498,12 +2498,28 @@ int main(int argc, char** argv) {
                 bool rc = remote.listening();
                 if (ImGui::Checkbox("Remote control", &rc)) {
                     if (rc) {
-                        if (remote.start(rcPort, &rcState, rcBindAll)) spdlog::info("remote control listening on tcp:{}", rcPort);
+                        if (remote.start(rcPort, &rcState, rcBindAll))
+                            spdlog::info("remote control listening on {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", rcPort);
                         else spdlog::warn("remote control unavailable: {}", remote.error());  // e.g. Windows
                     } else { remote.stop(); spdlog::info("remote control stopped"); }
                 }
-                if (remote.listening()) { ImGui::SameLine(); ImGui::TextDisabled("tcp :%d", remote.port()); }
-                else {
+                if (remote.listening()) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s:%d", rcBindAll ? "0.0.0.0 (LAN)" : "127.0.0.1", remote.port());
+                }
+                // Expose to other machines. The control port has NO auth, so it's loopback-only
+                // unless opted in here (or via LSL_RC_BIND=all). Toggling while live re-binds the
+                // socket so the change takes effect without a manual stop/start.
+                if (ImGui::Checkbox("Allow LAN access (no auth)", &rcBindAll) && remote.listening()) {
+                    remote.stop();
+                    if (remote.start(rcPort, &rcState, rcBindAll))
+                        spdlog::info("remote control re-bound to {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", rcPort);
+                    else spdlog::warn("remote control unavailable: {}", remote.error());
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Let other machines on the network reach the control port.\n"
+                                      "There is no authentication — only enable on a trusted LAN.");
+                if (!remote.listening()) {
                     // Wrap on its own line — the rail is too narrow for a SameLine note,
                     // which clipped messages like "not supported on Windows yet".
                     const std::string re = remote.error();

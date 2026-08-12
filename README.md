@@ -63,7 +63,7 @@ zoomed views use the conditioned signal.
 
 ## Remote control
 
-With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client drives recording over TCP with newline-terminated commands; replies are human-readable lines. The port binds loopback (127.0.0.1) only by default; there is no authentication, so set `LSL_RC_BIND=all` to expose it on the LAN (trusted networks only). The commands:
+With a control port enabled (`LSL_RC_PORT=22345`, or from the Recording panel), a client drives recording over TCP with newline-terminated commands; replies are human-readable lines. The port binds loopback (127.0.0.1) only by default; there is no authentication, so to reach it from another machine turn on **Allow LAN access** in the Recording panel (or set `LSL_RC_BIND=all`) — trusted networks only. The commands:
 
 | command | effect |
 |---|---|

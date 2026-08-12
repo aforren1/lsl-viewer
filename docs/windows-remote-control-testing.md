@@ -62,15 +62,16 @@ $env:LSL_RC_PORT = "22345"
 
 The server binds **loopback (127.0.0.1) only by default** — there is no authentication, so
 it is not exposed on the network unless you ask for it. To let a client elsewhere on the LAN
-reach it, set `LSL_RC_BIND=all` before launching:
+reach it, tick **Allow LAN access** in the Recording panel (it re-binds the running server),
+or set `LSL_RC_BIND=all` before launching:
 
 ```powershell
 $env:LSL_RC_PORT = "22345"; $env:LSL_RC_BIND = "all"
 .\build\lsl_viewer.exe
 ```
 
-With `LSL_RC_BIND=all` the first launch triggers a **Windows Firewall** dialog — allow access
-on private networks. For the loopback client below you do not need it.
+Either way the first exposure triggers a **Windows Firewall** dialog — allow access on private
+networks. For the loopback client below you do not need it.
 
 Have at least one stream on the network (from a machine with Python + the venv):
 
