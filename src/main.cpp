@@ -2437,15 +2437,23 @@ int main(int argc, char** argv) {
                 if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
                     const float fw = (ImGui::GetContentRegionAvail().x
                                       - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##sub", "{subject}", recSubject, sizeof(recSubject));
+                    // A tooltip names the template token each field fills — the placeholder hint
+                    // vanishes once a value is typed, so this is how a filled field stays legible.
+                    auto recField = [&](const char* id, const char* hint, const char* tok,
+                                        char* buf, std::size_t sz) {
+                        ImGui::SetNextItemWidth(fw);
+                        ImGui::InputTextWithHint(id, hint, buf, sz);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("fills %s in the filename template", tok);
+                    };
+                    recField("##sub",  "{subject}",        "{subject}",  recSubject,  sizeof(recSubject));
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##ses", "{session}", recSession, sizeof(recSession));
-                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##task", "{task}", recTask, sizeof(recTask));
+                    recField("##ses",  "{session}",        "{session}",  recSession,  sizeof(recSession));
+                    recField("##task", "{task}",           "{task}",     recTask,     sizeof(recTask));
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##run", "{run}", recRun, sizeof(recRun));
-                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##mod", "{modality}", recModality, sizeof(recModality));
+                    recField("##run",  "{run}",            "{run}",      recRun,      sizeof(recRun));
+                    recField("##mod",  "{modality}",       "{modality}", recModality, sizeof(recModality));
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(fw); ImGui::InputTextWithHint("##acq", "{acq} (optional)", recAcq, sizeof(recAcq));
+                    recField("##acq",  "{acq} (optional)", "{acq}",      recAcq,      sizeof(recAcq));
                     ImGui::TreePop();
                 }
                 ImGui::EndDisabled();
@@ -2503,6 +2511,10 @@ int main(int argc, char** argv) {
                         else spdlog::warn("remote control unavailable: {}", remote.error());  // e.g. Windows
                     } else { remote.stop(); spdlog::info("remote control stopped"); }
                 }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Drive recording over TCP from a script or another machine:\n"
+                                      "start/stop, set the filename, pick streams, fetch the file.\n"
+                                      "Loopback-only unless \"Allow LAN access\" is on.");
                 if (remote.listening()) {
                     ImGui::SameLine();
                     ImGui::TextDisabled("%s:%d", rcBindAll ? "0.0.0.0 (LAN)" : "127.0.0.1", remote.port());
