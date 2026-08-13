@@ -1745,6 +1745,16 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<MarkerSource>>   markerSources;  // string/event streams
     std::vector<std::unique_ptr<MarkerSource>>   closingMrk;     // disconnected, awaiting worker exit
     std::unordered_set<std::string>              dismissed;      // user-disconnected (don't auto-reconnect)
+    // A (re-)connected stream must open docked. FirstUseEver only docks windows ImGui has
+    // never seen; a window whose saved settings lost their dock reference (undocked once, or
+    // its dock node was deleted while the stream was disconnected) restores as a floating
+    // window exactly covering the tab group it used to sit in — forever, since nothing
+    // rewrites the reference. So on connect, check whether the window actually came back
+    // docked (dockPending), and if not, force-dock it on its next Begin (dockForce). Layouts
+    // the user chose deliberately (splits, restarts, workspaces) restore docked, so they pass
+    // the check untouched.
+    std::unordered_set<std::string>              dockPending;    // connected: verify the window docked
+    std::unordered_set<std::string>              dockForce;      // came back floating: re-dock next Begin
     Recorder recorder;                                           // XDF recording
     // Which streams to record (keys); nullopt = all, empty set = none. Default none so
     // we never start recording every stream on the network by accident.
@@ -1822,6 +1832,11 @@ int main(int argc, char** argv) {
     // exists for it (ImGui prunes the row once its last window closes).
     bool wantBottom = false;
     bool resetLayout = false;    // one-shot: rebuild the default dock + re-dock every window (Tools menu)
+    // Dock node the stream windows currently live in (last frame). A forced re-dock targets
+    // this rather than dockCenter: after some layout histories the whole tab group is a
+    // FLOATING dock node sitting exactly over the (empty) central node, where a tab added to
+    // dockCenter would be buried underneath it. 0 = none seen; fall back to dockCenter.
+    ImGuiID streamDockNode = 0;
     bool paused       = false;   // freeze the scrolling plots (App menu / P)
     bool pausedPrev   = false;
 
@@ -2177,7 +2192,9 @@ int main(int argc, char** argv) {
                 for (auto& m : markerSources) if (sameStream(*m, fi)) return true;
                 return false;
             };
-            auto connectStream = [&](const FoundInfo& fi) {
+            // dockFresh: verify the new window opens docked (see dockPending above). Workspace
+            // restore passes false — its ini blob places windows, including deliberate floats.
+            auto connectStream = [&](const FoundInfo& fi, bool dockFresh = true) {
                 dismissed.erase(fi.key);
                 if (effMarker(fi)) {
                     auto m = std::make_unique<MarkerSource>(fi.info); m->start();
@@ -2194,12 +2211,14 @@ int main(int argc, char** argv) {
                     const auto t = std::chrono::steady_clock::now();
                     auto s = std::make_unique<HfStreamSource>(fi.info, 10.0); s->start();
                     sources.push_back(std::move(s));
+                    if (dockFresh) dockPending.insert(fi.key);
                     spdlog::debug("connect '{}' {:.2f} ms", fi.name,
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count());
                 }
             };
             auto disconnectKey = [&](const std::string& key) {
                 dismissed.insert(key);   // and don't auto-reconnect
+                dockPending.erase(key); dockForce.erase(key);   // stale dock checks for this stream
                 auto it = std::find_if(sources.begin(), sources.end(),
                     [&](const std::unique_ptr<HfStreamSource>& p) { return streamKeyOf(*p) == key; });
                 if (it != sources.end()) {   // data stream: deferred reap (markers reaped by the dismissed-sweep)
@@ -2239,6 +2258,7 @@ int main(int argc, char** argv) {
                     if (!isMarkerStream(info)) g_streamKind.erase(key); else g_streamKind[key] = false;
                     auto s = std::make_unique<HfStreamSource>(info, 10.0); s->start();
                     sources.push_back(std::move(s));
+                    dockPending.insert(key);   // the new waveform window must open docked too
                     ImGui::MarkIniSettingsDirty();
                 }
             }
@@ -2265,7 +2285,7 @@ int main(int argc, char** argv) {
                 for (auto& fi : found) {
                     for (auto& req : wsRequired)
                         if (req.first == fi.key && !wsConnectedOnce.count(fi.key) && !connected(fi)) {
-                            connectStream(fi); wsConnectedOnce.insert(fi.key);
+                            connectStream(fi, /*dockFresh=*/false); wsConnectedOnce.insert(fi.key);
                         }
                 }
 
@@ -2754,6 +2774,7 @@ int main(int argc, char** argv) {
             const bool   justPaused = paused && !pausedPrev;
             HfStreamSource* toRemove = nullptr;
             int winIdx = 0;
+            ImGuiID dockSeen = 0;   // first docked stream window this frame -> streamDockNode
             // Lock time axes: maintain the shared x window before drawing the plots. While live,
             // slide it to follow the newest data across all streams; while paused, leave it so the
             // ImPlot axis-links let the user pan/zoom one plot and have every other follow. The edge
@@ -2826,7 +2847,14 @@ int main(int argc, char** argv) {
                         edgeMap[s.get()] = edge;
                     }
                 }
-                ImGui::SetNextWindowDockID(dockCenter, dockCond);  // time-series tab
+                // Forced re-dock for a stream that connected but restored floating (see
+                // dockPending): land it beside its siblings, else in the central node.
+                if (!dockForce.empty() && dockForce.erase(streamKeyOf(*s))) {
+                    const bool sib = streamDockNode && ImGui::DockBuilderGetNode(streamDockNode);
+                    ImGui::SetNextWindowDockID(sib ? streamDockNode : dockCenter, ImGuiCond_Always);
+                } else {
+                    ImGui::SetNextWindowDockID(dockCenter, dockCond);  // time-series tab
+                }
                 ImGui::SetNextWindowSize(ImVec2(uiScaled(680), uiScaled(420)), ImGuiCond_FirstUseEver);
                 bool open = true;                       // window X disconnects the stream
                 // Unique, STABLE window id even if two streams share a name (else ImGui
@@ -2849,12 +2877,19 @@ int main(int argc, char** argv) {
                 // While recording, hide the close (X): closing the window disconnects the stream, and
                 // the connected set is locked for the duration of the recording.
                 ImGui::Begin(title.c_str(), recorder.active() ? nullptr : &open);
+                if (dockSeen == 0 && ImGui::IsWindowDocked()) dockSeen = ImGui::GetWindowDockID();
+                // Connect-frame dock check: a brand-new window was docked by FirstUseEver above;
+                // one restoring from saved settings may have come back floating (lost dock
+                // reference) — schedule the forced re-dock for its next Begin.
+                if (!dockPending.empty() && dockPending.erase(streamKeyOf(*s)) && !ImGui::IsWindowDocked())
+                    dockForce.insert(streamKeyOf(*s));
                 drawStream(*s, o, edge, /*followX=*/(!paused || justPaused), headFreeze,
                            axisLock, markerViews, scratch);
                 ImGui::End();
                 if (!open) toRemove = s.get();
                 ++winIdx;
             }
+            streamDockNode = dockSeen;
             pausedPrev = paused;
             if (toRemove) {   // closing the window (X) = disconnect (deferred worker reap)
                 spdlog::debug("disconnect '{}' (deferred reap)", toRemove->name());
