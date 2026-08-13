@@ -3492,7 +3492,9 @@ int main(int argc, char** argv) {
                 if (ImGui::Begin("Marker events", &showMarkers)) {
                     ImGui::Checkbox("Relative time", &markersRelTime);
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Show t as seconds since the stream's first event, else the absolute LSL clock.");
+                        ImGui::SetTooltip("Show t as seconds since the first event across ALL marker streams\n"
+                                          "(a shared origin, so the same instant reads the same in every log),\n"
+                                          "else the absolute LSL clock.");
                     ImGui::SameLine();
                     ImGui::Checkbox("Lock scroll to time", &markerLockScroll);
                     if (ImGui::IsItemHovered())
@@ -3505,6 +3507,15 @@ int main(int argc, char** argv) {
                         ImGui::SetTooltip("Number of recent events kept per stream.");
                     if (markerSources.empty())
                         ImGui::TextDisabled("Connect a marker stream (string / \"Markers\"-typed) to see its events here.");
+                    // Shared relative-time origin: the earliest first event across every marker
+                    // stream. Using each stream's own firstTime() would render the same absolute
+                    // instant differently per log, so a correctly time-locked scroll looked wrong.
+                    double markerT0 = 0.0; bool haveT0 = false;
+                    if (markersRelTime)
+                        for (auto& msp : markerSources) {
+                            const double f = msp->firstTime();
+                            if (f > 0.0 && (!haveT0 || f < markerT0)) { markerT0 = f; haveT0 = true; }
+                        }
                     for (auto& msp : markerSources) {
                         MarkerSource& mk = *msp;
                         ImGui::PushID(&mk);
@@ -3513,7 +3524,7 @@ int main(int argc, char** argv) {
                                       mk.name().c_str(), mk.count(), mk.rate());
                         if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
                             const auto& evs = mk.tailCached((std::size_t)markerDepth);
-                            const double t0 = markersRelTime ? mk.firstTime() : 0.0;
+                            const double t0 = markersRelTime ? markerT0 : 0.0;   // shared origin (see above)
                             // Δ-since-same-label: nearest earlier event with the same text.
                             auto sameDelta = [&](int i) -> double {
                                 for (int j = i - 1; j >= 0; --j)
