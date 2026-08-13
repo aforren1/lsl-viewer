@@ -2279,8 +2279,8 @@ int main(int argc, char** argv) {
             std::vector<MarkerStreamView> markerViews;
             for (std::size_t i = 0; i < markerSources.size(); ++i) {
                 MarkerStreamView v;
-                v.id   = !markerSources[i]->sourceId().empty() ? markerSources[i]->sourceId()
-                                                               : markerSources[i]->uid();
+                v.id   = streamKeyOf(*markerSources[i]);   // source_id+name: unique per stream, so the
+                                                           // per-plot overlay toggles/IDs don't collide
                 v.name = markerSources[i]->name();
                 v.col  = ImGui::GetColorU32(ImPlot::SampleColormap(
                     (markerSources.size() > 1 ? (float)i / (markerSources.size() - 1) : 0.0f),
@@ -3567,37 +3567,31 @@ int main(int argc, char** argv) {
                                 const float got  = ImGui::GetScrollY();
                                 if (!markerLockScroll) {
                                     if (got >= maxY) ImGui::SetScrollHereY(1.0f);   // follow newest
-                                } else if (markerFollowLatest) {
-                                    // Following the newest. A scroll UP (this log now sits clearly above the
-                                    // bottom) breaks follow for ALL logs and anchors at where the user landed.
-                                    if (!evs.empty() && got < maxY - rowH * 1.5f) {
-                                        markerFollowLatest = false;
-                                        const int r = std::clamp((int)std::lround(got / rowH), 0, (int)evs.size() - 1);
-                                        markerAnchorT = evs[r].t;
-                                        markerScrollSet[&mk] = got;
-                                    } else {
-                                        ImGui::SetScrollHereY(1.0f);   // pin to newest (tracks new events)
-                                        markerScrollSet[&mk] = maxY;
-                                    }
                                 } else {
-                                    // Pinned at a shared time. If the user moved THIS log away from where we
-                                    // placed it last frame, adopt its new position as the shared anchor.
+                                    // Did the user move THIS log away from where we placed it last frame?
+                                    // Compare to what we SET, not to maxY: maxY grows as events arrive, so a
+                                    // busy log would otherwise be misread as a scroll every frame (thrashing
+                                    // the shared follow/anchor). A real user scroll shifts `got` off the set
+                                    // value; new events don't.
                                     auto sit = markerScrollSet.find(&mk);
                                     if (sit != markerScrollSet.end() && !evs.empty() &&
                                         std::fabs(got - std::min(sit->second, maxY)) > rowH * 0.75f) {
-                                        if (got >= maxY - rowH * 0.5f) markerFollowLatest = true;  // back to bottom -> follow
+                                        if (got >= maxY - rowH * 0.75f) markerFollowLatest = true;  // at bottom -> follow
                                         else {
+                                            markerFollowLatest = false;
                                             const int r = std::clamp((int)std::lround(got / rowH), 0, (int)evs.size() - 1);
                                             markerAnchorT = evs[r].t;
                                         }
                                     }
-                                    // Reposition every log to the shared anchor time (each finds its own nearest
-                                    // event) for the NEXT frame; the one the user moved already matches, so it stays.
-                                    float want = 0.0f;
-                                    if (!evs.empty() && !markerFollowLatest) {
+                                    // Reposition for NEXT frame: follow the newest, or pin every log to the
+                                    // shared anchor time (each resolves it to its own nearest event).
+                                    if (evs.empty() || markerFollowLatest) {
+                                        ImGui::SetScrollHereY(1.0f);
+                                        markerScrollSet[&mk] = ImGui::GetScrollMaxY();
+                                    } else {
                                         const int topRow = (int)(std::lower_bound(evs.begin(), evs.end(), markerAnchorT,
                                             [](const MarkerSource::Event& e, double t){ return e.t < t; }) - evs.begin());
-                                        want = std::min((float)topRow * rowH, maxY);
+                                        const float want = std::min((float)topRow * rowH, maxY);
                                         ImGui::SetScrollY(want);
                                         markerScrollSet[&mk] = want;
                                     }
