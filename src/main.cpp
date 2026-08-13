@@ -1814,6 +1814,7 @@ int main(int argc, char** argv) {
     double markerAnchorT = 0.0;      // shared scroll-anchor time while locked
     std::unordered_map<const MarkerSource*, float> markerRowH;       // measured log row height (scroll<->time)
     std::unordered_map<const MarkerSource*, float> markerScrollSet;  // scroll we set last frame (-1 = none)
+    const MarkerSource* markerReveal = nullptr;   // one-shot: expand this stream's log (clicked in the rail)
     bool showMetrics  = false;   // ImGui metrics/debugger (Debug menu) — vertex counts, draw calls
     // one-shot "raise this window to the front" requests, set from the menu
     bool focusSpectrum = false, focusMarkers = false, focusMetrics = false;
@@ -2656,7 +2657,7 @@ int main(int argc, char** argv) {
                     }
                     if (clicked) {   // left-click: connect if new, else reveal its events log (no plot to focus)
                         if (!m) { if (!recorder.active()) connectStream(fi); }  // connect (locked while recording)
-                        else    { showMarkers = true; focusMarkers = true; wantBottom = true; }
+                        else    { showMarkers = true; focusMarkers = true; wantBottom = true; markerReveal = m; }
                     }
                     // Right-click a connected marker: disconnect, or (numeric markers only) flip it
                     // back to a waveform. Native string markers can't be data.
@@ -3522,7 +3523,8 @@ int main(int argc, char** argv) {
                         char hdr[192];
                         std::snprintf(hdr, sizeof(hdr), "%s  \xc2\xb7  %zu events \xc2\xb7 %.1f/s###mk",
                                       mk.name().c_str(), mk.count(), mk.rate());
-                        if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
+                        if (&mk == markerReveal) ImGui::SetNextItemOpen(true);   // rail click expands this one
+                        if (ImGui::CollapsingHeader(hdr)) {   // collapsed by default; open on demand
                             const auto& evs = mk.tailCached((std::size_t)markerDepth);
                             const double t0 = markersRelTime ? markerT0 : 0.0;   // shared origin (see above)
                             // Δ-since-same-label: nearest earlier event with the same text.
@@ -3614,6 +3616,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 ImGui::End();
+                markerReveal = nullptr;   // one-shot: consumed whether or not the window was open
             }
 
             if (showMetrics) {
