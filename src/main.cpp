@@ -3602,8 +3602,12 @@ int main(int argc, char** argv) {
                                         ImGui::SetScrollHereY(1.0f);
                                         markerScrollSet[&mk] = ImGui::GetScrollMaxY();
                                     } else {
-                                        const int topRow = (int)(std::lower_bound(evs.begin(), evs.end(), markerAnchorT,
-                                            [](const MarkerSource::Event& e, double t){ return e.t < t; }) - evs.begin());
+                                        // Top row = the LAST event with t <= anchor (upper_bound - 1), so a
+                                        // yoked log never shows a time past the user-scrolled log's top row;
+                                        // it lands on the nearest event at or before that timestamp.
+                                        auto ub = std::upper_bound(evs.begin(), evs.end(), markerAnchorT,
+                                            [](double t, const MarkerSource::Event& e){ return t < e.t; });
+                                        const int topRow = std::clamp((int)(ub - evs.begin()) - 1, 0, (int)evs.size() - 1);
                                         const float want = std::min((float)topRow * rowH, maxY);
                                         ImGui::SetScrollY(want);
                                         markerScrollSet[&mk] = want;
