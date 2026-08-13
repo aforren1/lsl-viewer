@@ -1797,6 +1797,7 @@ int main(int argc, char** argv) {
     // ImPlot axis-links write to; lockHistory is the followed window width (s) while live.
     bool   lockTimeAxes = false;
     double lockXMin = 0.0, lockXMax = 0.0;
+    double lockEdge = 0.0;       // smoothed shared right-edge (glides like the per-stream edges)
     float  lockHistory = 10.0f;
     bool showSpectrum = true;    // Spectrum window (View menu)
     // Spectrogram and ERP are multi-instance: "New ..." in the View menu adds a window;
@@ -2728,16 +2729,26 @@ int main(int argc, char** argv) {
             HfStreamSource* toRemove = nullptr;
             int winIdx = 0;
             // Lock time axes: maintain the shared x window before drawing the plots. While live,
-            // slide it to follow the newest data across all streams (shared width = lockHistory);
-            // while paused, leave it so the ImPlot axis-links let the user pan/zoom one plot and
-            // have every other follow. (Re)initialize if it's empty.
+            // slide it to follow the newest data across all streams; while paused, leave it so the
+            // ImPlot axis-links let the user pan/zoom one plot and have every other follow. The edge
+            // is SMOOTHED the same way the per-stream edges are (glide at wall-clock rate + ease
+            // toward the chunky newestTime), else the scroll snaps per chunk. (Re)init if empty.
             if (lockTimeAxes) {
                 double gNewest = 0.0;
                 for (auto& s : sources) if (s->anchored()) gNewest = std::max(gNewest, s->newestTime());
-                if (!paused || lockXMax <= lockXMin) {
-                    const double gEdge = gNewest - 0.15;
-                    lockXMax = gEdge;
-                    lockXMin = gEdge - std::clamp(lockHistory, 1.0f, 60.0f);
+                const double w = std::clamp(lockHistory, 1.0f, 60.0f);
+                if (!paused && gNewest > 0.0) {
+                    const double target = gNewest - 0.15;
+                    lockEdge += frameDtSec;                 // glide at wall-clock rate
+                    const double gap = target - lockEdge;
+                    if (lockEdge <= 0.0 || gap > w || gap < -0.25) lockEdge = target;  // init / resync
+                    else                                           lockEdge += 0.02 * gap;  // ease
+                    lockXMax = lockEdge;
+                    lockXMin = lockEdge - w;
+                } else if (lockXMax <= lockXMin && gNewest > 0.0) {   // first-frame init while paused
+                    lockEdge = gNewest - 0.15;
+                    lockXMax = lockEdge;
+                    lockXMin = lockEdge - w;
                 }
             }
             const AxisLock axisLock{ lockTimeAxes, &lockXMin, &lockXMax, &lockHistory };
