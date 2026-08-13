@@ -545,8 +545,14 @@ static const float* readWindow(InterleavedRing& rg, std::uint64_t endHead,
 // shared cond. (Overlay-mode Y is a separate AutoFit mechanism — see overlayYFit.)
 static ImPlotCond fitCond(bool changed) { return changed ? ImPlotCond_Always : ImPlotCond_Once; }
 
+// "Lock time axes" (Tools menu): when on, every time-series plot ImPlot-links its x axis to
+// the same shared (xMin,xMax), so their windows align and panning/zooming one moves all. The
+// caller slides that range to follow the live edge while running; history is the shared window
+// width. Off -> each plot follows its own edge with its own o.history (the pointers are unused).
+struct AxisLock { bool on = false; double* xMin = nullptr; double* xMax = nullptr; float* history = nullptr; };
+
 static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool followX,
-                       std::uint64_t headFreeze,
+                       std::uint64_t headFreeze, const AxisLock& lock,
                        const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
     LSL_ZONE("drawStream");
     const float kCfgWidth = uiScaled(230.0f);
@@ -602,9 +608,20 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     if (o.cfgShown) {
     ImGui::BeginChild("cfg", ImVec2(kCfgWidth, 0), ImGuiChildFlags_Borders);
     if (ImGui::SmallButton("< hide")) o.cfgShown = false;   // hide to widen the plot
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset view")) {   // restore default framing if a panel got unwieldy
+        o.history = 10.0f; o.gainUv = 150.0f; o.spacing = 0.0f;
+        std::fill(gain.begin(), gain.end(), 1.0f);   // per-channel gains -> unity
+        o.overlayYFit = true;                        // re-fit the overlay Y next frame
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Restore history / gains / spacing to defaults\n(keeps filters and channel selection).");
     if (ImGui::CollapsingHeader("Display")) {
         ImGui::SetNextItemWidth(uiScaled(110));
-        ImGui::SliderFloat("History (s)", &o.history, 1.0f, 60.0f, "%.0f");
+        // When axes are locked the History slider drives the SHARED window width, so any plot's
+        // slider moves them all; otherwise it's this plot's own window.
+        ImGui::SliderFloat("History (s)", lock.on ? lock.history : &o.history, 1.0f, 60.0f, "%.0f");
+        if (lock.on && ImGui::IsItemHovered()) ImGui::SetTooltip("shared while \"Lock time axes\" is on");
         ImGui::Checkbox("Stacked montage", &o.stacked);
         ImGui::BeginDisabled(!o.stacked);          // raster is a stacked-montage render style
         ImGui::Checkbox("Raster", &o.raster);
@@ -833,7 +850,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     const int    B  = s.binSamples();
     // Paused: anchor the summary read to the bin holding the frozen head.
     const std::uint64_t endBin = headFreeze ? headFreeze / (std::uint64_t)B : 0;
-    const double viewSamples   = (o.history + 0.5) * rate;  // read past both edges
+    const float  histW         = lock.on ? *lock.history : o.history;  // window width (s): shared when locked
+    const double viewSamples   = (histW + 0.5) * rate;      // read past both edges
     // Show the conditioned (filtered) signal when ANY stage is enabled, else raw.
     const bool   filtered = o.highpass || o.notch || o.lowpass || (o.refMode != 0);
     MinMaxSummary& summ = filtered ? s.summaryHp() : s.summary();
@@ -881,6 +899,10 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         const double secPerPx = (double)o.history / (double)o.lastPlotPx;
         xedge = std::round(edge / secPerPx) * secPerPx;
     }
+    // Visible x window. Locked: the shared (caller-maintained / link-updated) range. Unlocked:
+    // this plot's own [edge-history, edge]. Used for the raster pixel grid + the scale-bar anchor.
+    const double visX1 = lock.on ? *lock.xMax : xedge;
+    const double visX0 = lock.on ? *lock.xMin : (xedge - o.history);
 
     // Arm the overlay Y auto-fit while we're in a non-overlay mode, so switching INTO
     // overlay fits once before the axis is left free (the overlay branch consumes it).
@@ -896,8 +918,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
             ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
-            if (followX)
-                ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
+            if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
+            else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)show, ImPlotCond_Always);
             sc.tvals.resize(show); sc.tlabs.resize(show); sc.tstr.resize(show);
             for (int j = 0; j < show; ++j) {                  // channel names at row centers
@@ -914,8 +936,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             // scrolls (the native ~0.03 s summary bins are ~2 px wide -> sub-pixel drift).
             const std::size_t maxBins = envelopeBins();
             const float  inv      = (o.gainUv > 0.0f) ? 1.0f / o.gainUv : 0.0f;
-            const double bMin     = xedge - o.history, bMax = xedge;        // snapped axis range
-            const double secPerPx = o.history / (double)px;
+            const double bMin     = visX0, bMax = visX1;                    // visible (locked-aware) range
+            const double secPerPx = (visX1 - visX0) / (double)px;
             sc.x.resize(maxBins); sc.mn.resize(maxBins); sc.mx.resize(maxBins);
             // Channel 0 also builds the pixel-column -> summary-bin resample map (the bin
             // grid is shared by all channels, so it's computed once).
@@ -962,8 +984,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImPlot::SetupAxes("time (s)", nullptr,
                               ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
             ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
-            if (followX)
-                ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
+            if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
+            else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
             ImPlot::SetupAxisLimits(ImAxis_Y1, -0.6, (double)show - 0.4, ImPlotCond_Always);
 
             // Y ticks at lane centers labelled with channel names (top = first
@@ -1054,8 +1076,10 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 o.autoGainReq = false;
             }
 
-            // Amplitude scale bar near the left == gainUv units (unity-gain lanes).
-            const double xbar = ImPlot::GetPlotLimits().X.Min + 0.03 * o.history;
+            // Amplitude scale bar near the left == gainUv units (unity-gain lanes). Anchor it a
+            // fixed fraction into the actual visible width (works when locked/zoomed, not just live).
+            const ImPlotRect lim = ImPlot::GetPlotLimits();
+            const double xbar = lim.X.Min + 0.03 * lim.X.Size();
             const ImU32  col  = ImGui::GetColorU32(ImGuiCol_Text);   // adapts to theme
             ImDrawList*  dl   = ImPlot::GetPlotDrawList();
             dl->AddLine(ImPlot::PlotToPixels(xbar, -0.5), ImPlot::PlotToPixels(xbar, 0.5), col, 2.0f);
@@ -1080,8 +1104,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImPlot::SetupAxes("time (s)", streamUnit, ImPlotAxisFlags_None, yf);
         ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
         o.overlayYFit = false;
-        if (followX)
-            ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
+        if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
+        else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
 
         const int    px     = std::max(64, (int)ImPlot::GetPlotSize().x);
         o.lastPlotPx = ImPlot::GetPlotSize().x;   // for next frame's edge snap
@@ -1768,6 +1792,12 @@ int main(int argc, char** argv) {
     std::unordered_map<const HfStreamSource*, double>      edgeMap;   // smoothed X right-edge
     std::unordered_map<const HfStreamSource*, std::uint64_t> pauseHead; // frozen head at pause
     bool showPerf     = false;   // Performance overlay (View menu; hidden by default)
+    // Tools > Lock time axes: share ONE x (time) range across every time-series plot so their
+    // visible windows align and panning/zooming one moves all. lockX* is the shared range that
+    // ImPlot axis-links write to; lockHistory is the followed window width (s) while live.
+    bool   lockTimeAxes = false;
+    double lockXMin = 0.0, lockXMax = 0.0;
+    float  lockHistory = 10.0f;
     bool showSpectrum = true;    // Spectrum window (View menu)
     // Spectrogram and ERP are multi-instance: "New ..." in the View menu adds a window;
     // closing one removes it. Heatmaps/averages don't overlay, so separate windows let
@@ -1983,16 +2013,6 @@ int main(int argc, char** argv) {
             if (ImGui::BeginMainMenuBar()) {
                 if (ImGui::BeginMenu("App")) {
                     ImGui::MenuItem("Pause", "P", &paused);
-                    // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
-                    // (auto-connected below) so a newcomer can explore every view with no external source.
-                    const bool demo = mockStreams.running();
-                    if (ImGui::MenuItem("Emit demo streams", nullptr, demo)) {
-                        if (demo) { mockStreams.stop();  spdlog::info("demo streams stopped"); }
-                        else      { mockStreams.start(); spdlog::info("demo streams started"); }
-                    }
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->40 Hz chirp, a 48 kHz stereo\n"
-                                          "tone, and an evoked-response stream with markers.");
                     ImGui::Separator();
                     if (ImGui::MenuItem("Light theme", nullptr, &g_light)) {
                         applyTheme(g_light); ImGui::MarkIniSettingsDirty();
@@ -2025,6 +2045,24 @@ int main(int argc, char** argv) {
                         ImGui::MarkIniSettingsDirty();
                     }
                     if (ImGui::MenuItem("Quit", "Ctrl+Q")) done = true;
+                    ImGui::EndMenu();
+                }
+                if (ImGui::BeginMenu("Tools")) {
+                    ImGui::MenuItem("Lock time axes", nullptr, &lockTimeAxes);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Share one time window across all time-series plots:\n"
+                                          "they stay aligned, and panning/zooming one moves all.");
+                    ImGui::Separator();
+                    // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
+                    // (auto-connected below) so a newcomer can explore every view with no external source.
+                    const bool demo = mockStreams.running();
+                    if (ImGui::MenuItem("Emit demo streams", nullptr, demo)) {
+                        if (demo) { mockStreams.stop();  spdlog::info("demo streams stopped"); }
+                        else      { mockStreams.start(); spdlog::info("demo streams started"); }
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->40 Hz chirp, a 48 kHz stereo\n"
+                                          "tone, and an evoked-response stream with markers.");
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("View")) {
@@ -2689,6 +2727,20 @@ int main(int argc, char** argv) {
             const bool   justPaused = paused && !pausedPrev;
             HfStreamSource* toRemove = nullptr;
             int winIdx = 0;
+            // Lock time axes: maintain the shared x window before drawing the plots. While live,
+            // slide it to follow the newest data across all streams (shared width = lockHistory);
+            // while paused, leave it so the ImPlot axis-links let the user pan/zoom one plot and
+            // have every other follow. (Re)initialize if it's empty.
+            if (lockTimeAxes) {
+                double gNewest = 0.0;
+                for (auto& s : sources) if (s->anchored()) gNewest = std::max(gNewest, s->newestTime());
+                if (!paused || lockXMax <= lockXMin) {
+                    const double gEdge = gNewest - 0.15;
+                    lockXMax = gEdge;
+                    lockXMin = gEdge - std::clamp(lockHistory, 1.0f, 60.0f);
+                }
+            }
+            const AxisLock axisLock{ lockTimeAxes, &lockXMin, &lockXMax, &lockHistory };
             std::unordered_map<std::string, int> nameSeen;  // disambiguate same-named streams
             for (auto& s : sources) {
                 DisplayOpts& o = dispOpts[s.get()];   // per-stream settings (default on first use)
@@ -2761,7 +2813,7 @@ int main(int argc, char** argv) {
                 // the connected set is locked for the duration of the recording.
                 ImGui::Begin(title.c_str(), recorder.active() ? nullptr : &open);
                 drawStream(*s, o, edge, /*followX=*/(!paused || justPaused), headFreeze,
-                           markerViews, scratch);
+                           axisLock, markerViews, scratch);
                 ImGui::End();
                 if (!open) toRemove = s.get();
                 ++winIdx;
@@ -2798,7 +2850,7 @@ int main(int argc, char** argv) {
                 HfStreamSource* src = sources[fftStream].get();
 
                 // ---- left config strip; the plot fills the right (like the time series) ----
-                ImGui::BeginChild("cfg", ImVec2(uiScaled(200), 0), ImGuiChildFlags_Borders);
+                ImGui::BeginChild("cfg", ImVec2(uiScaled(230), 0), ImGuiChildFlags_Borders);
                 ImGui::SetNextItemWidth(-1.0f);
                 if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                     for (int i = 0; i < (int)sources.size(); ++i)
@@ -2996,7 +3048,7 @@ int main(int argc, char** argv) {
                     bool reset = (spectro.uid != src->uid());
 
                     // ---- left config strip; the plot + colorbar fill the right ----
-                    ImGui::BeginChild("cfg", ImVec2(uiScaled(200), 0), ImGuiChildFlags_Borders);
+                    ImGui::BeginChild("cfg", ImVec2(uiScaled(230), 0), ImGuiChildFlags_Borders);
                     ImGui::SetNextItemWidth(-1.0f);
                     if (ImGui::BeginCombo("##stream", src->name().c_str())) {
                         spectro.streamFilter.Draw("##sf", -1.0f);   // searchable
