@@ -1808,6 +1808,11 @@ int main(int argc, char** argv) {
     int nextSpectroId = 1, nextErpId = 1;
     bool showMarkers  = false;   // Marker events log (View menu) — see events with no data stream
     bool markersRelTime = true;  // Marker log: time relative to the stream's first event vs absolute LSL clock
+    int  markerDepth    = 500;   // events shown per stream in the marker log (runtime-adjustable)
+    bool markerLockScroll = false;   // scroll one marker log -> others jump to the nearest timestamp
+    bool markerFollowLatest = true;  // locked-scroll: follow newest vs pinned at markerAnchorT
+    double markerAnchorT = 0.0;      // shared scroll-anchor time while locked
+    std::unordered_map<const MarkerSource*, float> markerRowH;  // measured log row height (scroll<->time)
     bool showMetrics  = false;   // ImGui metrics/debugger (Debug menu) — vertex counts, draw calls
     // one-shot "raise this window to the front" requests, set from the menu
     bool focusSpectrum = false, focusMarkers = false, focusMetrics = false;
@@ -3468,6 +3473,16 @@ int main(int argc, char** argv) {
                     ImGui::Checkbox("Relative time", &markersRelTime);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Show t as seconds since the stream's first event, else the absolute LSL clock.");
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Lock scroll to time", &markerLockScroll);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Scrolling one log scrolls the others to the nearest timestamp.");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(uiScaled(110));
+                    if (ImGui::DragInt("Depth", &markerDepth, 5.0f, 20, 20000))
+                        markerDepth = std::clamp(markerDepth, 20, 20000);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Number of recent events kept per stream.");
                     if (markerSources.empty())
                         ImGui::TextDisabled("Connect a marker stream (string / \"Markers\"-typed) to see its events here.");
                     for (auto& msp : markerSources) {
@@ -3477,7 +3492,7 @@ int main(int argc, char** argv) {
                         std::snprintf(hdr, sizeof(hdr), "%s  \xc2\xb7  %zu events \xc2\xb7 %.1f/s###mk",
                                       mk.name().c_str(), mk.count(), mk.rate());
                         if (ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen)) {
-                            const auto& evs = mk.tailCached(500);   // last few hundred lines
+                            const auto& evs = mk.tailCached((std::size_t)markerDepth);
                             const double t0 = markersRelTime ? mk.firstTime() : 0.0;
                             // Δ-since-same-label: nearest earlier event with the same text.
                             auto sameDelta = [&](int i) -> double {
@@ -3504,13 +3519,27 @@ int main(int argc, char** argv) {
                             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy these events to the clipboard as CSV.");
                             constexpr auto tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg
                                               | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
-                            if (ImGui::BeginTable("evs", 4, tf, ImVec2(0, 200))) {
+                            if (ImGui::BeginTable("evs", 4, tf, ImVec2(0, uiScaled(200)))) {
                                 ImGui::TableSetupScrollFreeze(0, 1);
                                 ImGui::TableSetupColumn("t (s)");
                                 ImGui::TableSetupColumn("\xce\x94");             // delta from previous event
                                 ImGui::TableSetupColumn("\xce\x94 same");        // delta since same label
                                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
                                 ImGui::TableHeadersRow();
+                                // Locked scroll: place THIS log at the shared anchor time before drawing rows.
+                                // rowH (measured from last frame's clipper) converts between scroll px and
+                                // event index; each stream resolves the anchor time to its own nearest event.
+                                float rowH = markerRowH.count(&mk) ? markerRowH[&mk]
+                                                                   : ImGui::GetTextLineHeightWithSpacing();
+                                if (rowH < 1.0f) rowH = ImGui::GetTextLineHeightWithSpacing();
+                                float want = -1.0f;
+                                if (markerLockScroll && !evs.empty()) {
+                                    const int topRow = markerFollowLatest ? (int)evs.size()
+                                        : (int)(std::lower_bound(evs.begin(), evs.end(), markerAnchorT,
+                                            [](const MarkerSource::Event& e, double t){ return e.t < t; }) - evs.begin());
+                                    want = (float)topRow * rowH;
+                                    ImGui::SetScrollY(want);   // ImGui clamps to [0, max]
+                                }
                                 ImGuiListClipper clip; clip.Begin((int)evs.size());
                                 while (clip.Step())
                                     for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
@@ -3520,8 +3549,22 @@ int main(int argc, char** argv) {
                                         ImGui::TableNextColumn(); { const double ds = sameDelta(i); if (ds >= 0) ImGui::Text("%.3f", ds); }
                                         ImGui::TableNextColumn(); ImGui::TextUnformatted(evs[i].text.c_str());
                                     }
-                                // Stick to the newest row unless the user has scrolled up.
-                                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+                                if (clip.ItemsHeight > 0.0f) markerRowH[&mk] = clip.ItemsHeight;  // exact for next frame
+                                const float maxY = ImGui::GetScrollMaxY();
+                                if (!markerLockScroll) {
+                                    if (ImGui::GetScrollY() >= maxY) ImGui::SetScrollHereY(1.0f);  // follow newest
+                                } else if (want >= 0.0f) {
+                                    // If the user moved THIS log, adopt it as the shared anchor for the rest.
+                                    const float got = ImGui::GetScrollY();
+                                    if (std::fabs(got - std::min(want, maxY)) > rowH * 0.5f) {
+                                        if (got >= maxY - 0.5f) markerFollowLatest = true;
+                                        else {
+                                            markerFollowLatest = false;
+                                            const int r = std::clamp((int)std::lround(got / rowH), 0, (int)evs.size() - 1);
+                                            markerAnchorT = evs[r].t;
+                                        }
+                                    }
+                                }
                                 ImGui::EndTable();
                             }
                         }
