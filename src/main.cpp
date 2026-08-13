@@ -1812,13 +1812,15 @@ int main(int argc, char** argv) {
     bool markerLockScroll = false;   // scroll one marker log -> others jump to the nearest timestamp
     bool markerFollowLatest = true;  // locked-scroll: follow newest vs pinned at markerAnchorT
     double markerAnchorT = 0.0;      // shared scroll-anchor time while locked
-    std::unordered_map<const MarkerSource*, float> markerRowH;  // measured log row height (scroll<->time)
+    std::unordered_map<const MarkerSource*, float> markerRowH;       // measured log row height (scroll<->time)
+    std::unordered_map<const MarkerSource*, float> markerScrollSet;  // scroll we set last frame (-1 = none)
     bool showMetrics  = false;   // ImGui metrics/debugger (Debug menu) — vertex counts, draw calls
     // one-shot "raise this window to the front" requests, set from the menu
     bool focusSpectrum = false, focusMarkers = false, focusMetrics = false;
     // one-shot: a new analysis window was just opened — ensure a bottom dock row
     // exists for it (ImGui prunes the row once its last window closes).
     bool wantBottom = false;
+    bool resetLayout = false;    // one-shot: rebuild the default dock + re-dock every window (Tools menu)
     bool paused       = false;   // freeze the scrolling plots (App menu / P)
     bool pausedPrev   = false;
 
@@ -2058,6 +2060,10 @@ int main(int argc, char** argv) {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Share one time window across all time-series plots:\n"
                                           "they stay aligned, and panning/zooming one moves all.");
+                    if (ImGui::MenuItem("Reset window layout")) resetLayout = true;
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Rebuild the default dock layout and pull every window back\n"
+                                          "on-screen (fixes a window dragged somewhere unreachable).");
                     ImGui::Separator();
                     // Built-in demo: publish a synthetic EEG / chirp / audio / evoked set on loopback
                     // (auto-connected below) so a newcomer can explore every view with no external source.
@@ -2368,6 +2374,9 @@ int main(int argc, char** argv) {
             // so they open as tabs and can be split/rearranged but never bury the rail.
             const float sidebarW = uiScaled(280.0f);
             ImGuiID dockId = 0, dockCenter = 0, dockBottom = 0;   // time-series center, analysis bottom
+            // On a layout reset, force every window to re-dock (Always) this frame instead of only
+            // on first use, so they all snap back into the rebuilt dockspace.
+            const ImGuiCond dockCond = resetLayout ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
             {
                 ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + sidebarW, vp->WorkPos.y), ImGuiCond_Always);
                 ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - sidebarW, vp->WorkSize.y), ImGuiCond_Always);
@@ -2409,8 +2418,19 @@ int main(int argc, char** argv) {
                         }
                     }
                 };
+                // Reset layout: wipe the dock tree and rebuild the default split. The windows
+                // then re-dock via dockCond (below) = Always this frame, which also drags any that
+                // were floating off-screen back into the dockspace.
+                if (resetLayout) {
+                    ImGui::DockBuilderRemoveNode(dockId);
+                    ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace);
+                    ImGui::DockBuilderSetNodeSize(dockId, ImVec2(vp->WorkSize.x - sidebarW, vp->WorkSize.y));
+                    ImGuiID top = dockId;
+                    ImGui::DockBuilderSplitNode(top, ImGuiDir_Down, 0.32f, nullptr, &top);
+                    ImGui::DockBuilderFinish(dockId);
+                }
                 resolveNodes();
-                if (wantBottom && dockBottom == 0 && dockCenter != 0) {
+                if ((wantBottom || resetLayout) && dockBottom == 0 && dockCenter != 0) {
                     ImGui::DockBuilderSplitNode(dockCenter, ImGuiDir_Down, 0.32f,
                                                 &dockBottom, &dockCenter);
                     ImGui::DockBuilderFinish(dockId);
@@ -2805,7 +2825,7 @@ int main(int argc, char** argv) {
                         edgeMap[s.get()] = edge;
                     }
                 }
-                ImGui::SetNextWindowDockID(dockCenter, ImGuiCond_FirstUseEver);  // time-series tab
+                ImGui::SetNextWindowDockID(dockCenter, dockCond);  // time-series tab
                 ImGui::SetNextWindowSize(ImVec2(uiScaled(680), uiScaled(420)), ImGuiCond_FirstUseEver);
                 bool open = true;                       // window X disconnects the stream
                 // Unique, STABLE window id even if two streams share a name (else ImGui
@@ -2844,7 +2864,7 @@ int main(int argc, char** argv) {
             // ---- FFT / PSD (View menu) ----------------------------------
             if (showSpectrum) {
             ImGui::SetNextWindowSize(ImVec2(uiScaled(580), uiScaled(440)), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowDockID(dockBottom, dockCond);
             if (focusSpectrum) { ImGui::SetNextWindowFocus(); focusSpectrum = false; }
             ImGui::Begin("Spectrum", &showSpectrum);
             if (sources.empty()) {
@@ -3047,7 +3067,7 @@ int main(int argc, char** argv) {
                 Spectro& spectro = *spp;
                 LSL_ZONE("spectrogram win");
                 ImGui::SetNextWindowSize(ImVec2(uiScaled(620), uiScaled(420)), ImGuiCond_FirstUseEver);
-                ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowDockID(dockBottom, dockCond);
                 if (spectro.focus) { ImGui::SetNextWindowFocus(); spectro.focus = false; }
                 char title[64];
                 std::snprintf(title, sizeof(title), "Spectrogram %d", spectro.id);
@@ -3269,7 +3289,7 @@ int main(int argc, char** argv) {
                 Erp& erp = *epp;
                 LSL_ZONE("erp win");
                 ImGui::SetNextWindowSize(ImVec2(uiScaled(560), uiScaled(420)), ImGuiCond_FirstUseEver);
-                ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowDockID(dockBottom, dockCond);
                 if (erp.focus) { ImGui::SetNextWindowFocus(); erp.focus = false; }
                 char title[64];
                 std::snprintf(title, sizeof(title), "ERP %d", erp.id);
@@ -3468,7 +3488,7 @@ int main(int argc, char** argv) {
             // overlay them on (the per-plot overlay needs a data plot). The original motivating use.
             if (showMarkers) {
                 if (focusMarkers) { ImGui::SetNextWindowFocus(); focusMarkers = false; }
-                ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowDockID(dockBottom, dockCond);
                 if (ImGui::Begin("Marker events", &showMarkers)) {
                     ImGui::Checkbox("Relative time", &markersRelTime);
                     if (ImGui::IsItemHovered())
@@ -3526,20 +3546,11 @@ int main(int argc, char** argv) {
                                 ImGui::TableSetupColumn("\xce\x94 same");        // delta since same label
                                 ImGui::TableSetupColumn("value", ImGuiTableColumnFlags_WidthStretch);
                                 ImGui::TableHeadersRow();
-                                // Locked scroll: place THIS log at the shared anchor time before drawing rows.
-                                // rowH (measured from last frame's clipper) converts between scroll px and
-                                // event index; each stream resolves the anchor time to its own nearest event.
-                                float rowH = markerRowH.count(&mk) ? markerRowH[&mk]
-                                                                   : ImGui::GetTextLineHeightWithSpacing();
-                                if (rowH < 1.0f) rowH = ImGui::GetTextLineHeightWithSpacing();
-                                float want = -1.0f;
-                                if (markerLockScroll && !evs.empty()) {
-                                    const int topRow = markerFollowLatest ? (int)evs.size()
-                                        : (int)(std::lower_bound(evs.begin(), evs.end(), markerAnchorT,
-                                            [](const MarkerSource::Event& e, double t){ return e.t < t; }) - evs.begin());
-                                    want = (float)topRow * rowH;
-                                    ImGui::SetScrollY(want);   // ImGui clamps to [0, max]
-                                }
+                                // Draw the rows first (do NOT SetScrollY before): SetScrollY is deferred to
+                                // the next frame, so GetScrollY() here reflects last frame's position plus any
+                                // wheel/drag this frame. Comparing it to what we SET last frame is how we tell a
+                                // user scroll apart from our own repositioning (comparing to THIS frame's target
+                                // would always mismatch -> anchor thrash / oscillation).
                                 ImGuiListClipper clip; clip.Begin((int)evs.size());
                                 while (clip.Step())
                                     for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
@@ -3549,20 +3560,46 @@ int main(int argc, char** argv) {
                                         ImGui::TableNextColumn(); { const double ds = sameDelta(i); if (ds >= 0) ImGui::Text("%.3f", ds); }
                                         ImGui::TableNextColumn(); ImGui::TextUnformatted(evs[i].text.c_str());
                                     }
-                                if (clip.ItemsHeight > 0.0f) markerRowH[&mk] = clip.ItemsHeight;  // exact for next frame
+                                if (clip.ItemsHeight > 0.0f) markerRowH[&mk] = clip.ItemsHeight;  // exact row height
+                                float rowH = markerRowH.count(&mk) ? markerRowH[&mk] : ImGui::GetTextLineHeightWithSpacing();
+                                if (rowH < 1.0f) rowH = ImGui::GetTextLineHeightWithSpacing();
                                 const float maxY = ImGui::GetScrollMaxY();
+                                const float got  = ImGui::GetScrollY();
                                 if (!markerLockScroll) {
-                                    if (ImGui::GetScrollY() >= maxY) ImGui::SetScrollHereY(1.0f);  // follow newest
-                                } else if (want >= 0.0f) {
-                                    // If the user moved THIS log, adopt it as the shared anchor for the rest.
-                                    const float got = ImGui::GetScrollY();
-                                    if (std::fabs(got - std::min(want, maxY)) > rowH * 0.5f) {
-                                        if (got >= maxY - 0.5f) markerFollowLatest = true;
+                                    if (got >= maxY) ImGui::SetScrollHereY(1.0f);   // follow newest
+                                } else if (markerFollowLatest) {
+                                    // Following the newest. A scroll UP (this log now sits clearly above the
+                                    // bottom) breaks follow for ALL logs and anchors at where the user landed.
+                                    if (!evs.empty() && got < maxY - rowH * 1.5f) {
+                                        markerFollowLatest = false;
+                                        const int r = std::clamp((int)std::lround(got / rowH), 0, (int)evs.size() - 1);
+                                        markerAnchorT = evs[r].t;
+                                        markerScrollSet[&mk] = got;
+                                    } else {
+                                        ImGui::SetScrollHereY(1.0f);   // pin to newest (tracks new events)
+                                        markerScrollSet[&mk] = maxY;
+                                    }
+                                } else {
+                                    // Pinned at a shared time. If the user moved THIS log away from where we
+                                    // placed it last frame, adopt its new position as the shared anchor.
+                                    auto sit = markerScrollSet.find(&mk);
+                                    if (sit != markerScrollSet.end() && !evs.empty() &&
+                                        std::fabs(got - std::min(sit->second, maxY)) > rowH * 0.75f) {
+                                        if (got >= maxY - rowH * 0.5f) markerFollowLatest = true;  // back to bottom -> follow
                                         else {
-                                            markerFollowLatest = false;
                                             const int r = std::clamp((int)std::lround(got / rowH), 0, (int)evs.size() - 1);
                                             markerAnchorT = evs[r].t;
                                         }
+                                    }
+                                    // Reposition every log to the shared anchor time (each finds its own nearest
+                                    // event) for the NEXT frame; the one the user moved already matches, so it stays.
+                                    float want = 0.0f;
+                                    if (!evs.empty() && !markerFollowLatest) {
+                                        const int topRow = (int)(std::lower_bound(evs.begin(), evs.end(), markerAnchorT,
+                                            [](const MarkerSource::Event& e, double t){ return e.t < t; }) - evs.begin());
+                                        want = std::min((float)topRow * rowH, maxY);
+                                        ImGui::SetScrollY(want);
+                                        markerScrollSet[&mk] = want;
                                     }
                                 }
                                 ImGui::EndTable();
@@ -3576,9 +3613,11 @@ int main(int argc, char** argv) {
 
             if (showMetrics) {
                 if (focusMetrics) { ImGui::SetNextWindowFocus(); focusMetrics = false; }
-                ImGui::SetNextWindowDockID(dockBottom, ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowDockID(dockBottom, dockCond);
                 ImGui::ShowMetricsWindow(&showMetrics);  // vertex/draw-call inspector
             }
+
+            resetLayout = false;   // consumed: every window has re-docked this frame
 
 #ifdef LSL_VIEWER_TESTS
             if (!runTests) ImGuiTestEngine_ShowTestEngineWindows(engine, nullptr);
