@@ -4,8 +4,9 @@ The recording remote-control server ([`src/remote_control.hpp`](../src/remote_co
 is a small TCP server. It was rewritten to be cross-platform: a thin socket layer
 (`rc_socket_t` / `rc_close` / `RcWsaInit`) sits over **Winsock** on Windows and BSD
 sockets elsewhere, so the accept/recv/dispatch logic is shared. The POSIX path is
-verified end-to-end on Linux; the **Winsock path has only been link-verified** so
-far. This doc is the checklist to confirm it actually runs on Windows.
+verified end-to-end on Linux, and the `remote/roundtrip` test below passes on Windows,
+which covers bind, accept, two concurrent clients, and teardown. This doc is the
+checklist for the parts that only the live server shows.
 
 What's Windows-specific (i.e. what this is really testing):
 - `WSAStartup` / `WSACleanup` (done once via the function-local `RcWsaInit` static),
@@ -114,10 +115,15 @@ $c.Close()
 
 - [ ] Connecting prints the banner `lsl-viewer remote control. type `help`.`
 - [ ] `streams` lists each discovered stream as `key | name | type | Nch | rate`
-- [ ] `select <key>` replies `ok: connecting <key>` and the stream gains `[rec]` in
+- [ ] `select <key>` replies `ok: connected 1 stream(s)` and the stream gains `[rec]` in
       `streams` **and** appears as a plot in the viewer window (connection IS the
       record selector now — recording captures all connected streams)
 - [ ] `select all` / `select none` connect / disconnect everything
+- [ ] a bogus key (`select nope`) is refused whole: `error: unknown stream(s): nope`,
+      and `selected` is unchanged
+- [ ] `start` replies `ok: recording -> <path>` (not an optimistic ok) and `start`
+      with nothing connected replies `error: no streams connected`
+- [ ] a **second** client can connect and run `status` while the first stays open
 - [ ] `start` then `stop` produces a `.xdf` (default is the BIDS template
       `sub-{subject}/ses-{session}/{modality}/..._{modality}.xdf` under
       `~/Documents/lsl-recordings`; `status` shows the resolved path); `status` shows
@@ -130,10 +136,30 @@ $c.Close()
 ### Discovery (optional)
 
 While listening, the viewer also publishes an LSL outlet named `LSLViewerControl`
-(type `ViewerControl`); the TCP port is encoded in its `source_id` as
-`lsl-viewer-rc:<port>` and the host comes from `info.hostname()`. A client can resolve
-type `ViewerControl` to find host:port without knowing them in advance — worth a quick
-check that the outlet shows up in an LSL stream viewer / `pylsl.resolve_byprop`.
+(type `ViewerControl`); the TCP port is the last field of its `source_id`,
+`lsl-viewer-rc:<host>:<pid>:<port>`. A client resolves type `ViewerControl` to find the
+endpoint without knowing it in advance. Verified on this machine with `pylsl`:
+
+```
+resolved 1
+  name=LSLViewerControl host=MWPF4RADY3 source_id=lsl-viewer-rc:MWPF4RADY3:16956:22345
+  desc: port=22345 pid=16956 bind=loopback
+  connect 127.0.0.1:22345 -> 'lsl-viewer remote control. type `help`.'
+```
+
+Note that `info.hostname()` is the machine name even when the server is bound to
+loopback — connect to `127.0.0.1` unless the beacon's `bind` field says `all`. Reading
+`bind`/`port`/`pid` needs an inlet on the beacon (`StreamInlet(info).info().desc()`);
+`source_id` alone is enough for the port.
+
+### Second instance (optional)
+
+Start a second viewer **without** `LSL_RC_PORT` and tick **Remote control**: 22345 is
+taken, so it binds an ephemeral port and announces that one (the label next to the
+checkbox shows it, and two beacons now resolve). With `LSL_RC_PORT` set, the second
+viewer instead logs `remote control unavailable: bind() failed (port in use?)` — a
+pinned port is never silently exchanged for another. The `remote/second_instance` test
+covers both paths, including the Windows-specific bind semantics.
 
 ---
 

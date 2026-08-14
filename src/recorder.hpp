@@ -1,15 +1,20 @@
 #pragma once
 // Records LSL streams to an XDF file (LabRecorder-compatible). One worker thread per
 // stream pulls RAW sample timestamps (sender clock, post-processing left off) and
-// writes Samples chunks; every few seconds it writes a ClockOffset chunk
-// (time_correction vs local_clock) so an importer (pyxdf) can map all streams onto a
-// common clock and dejitter — i.e. the timestamp synchronization lives in the file,
-// not in altered timestamps. A shared, mutex-guarded xdf::Writer interleaves chunks.
+// writes Samples chunks. Alongside it, a per-stream thread writes a ClockOffset chunk
+// every 5 s (time_correction vs local_clock) so an importer (pyxdf) can map all streams
+// onto a common clock and dejitter — i.e. the timestamp synchronization lives in the
+// file, not in altered timestamps — and one shared thread writes Boundary chunks every
+// 10 s. Both are off the data path for the same reason LabRecorder splits them out: a
+// round trip to an unresponsive sender must not stall pulls, and resync markers must
+// keep coming even when a stream goes quiet. A shared, mutex-guarded xdf::Writer
+// interleaves chunks.
 
 #include "xdf_writer.hpp"
 #include <lsl_cpp.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -61,6 +66,13 @@ public:
             workers_.emplace_back([this, info, id, wr](stop_token st) { record(st, info, id, wr); });
             ++id;
         }
+        // Boundary chunks are the importer's resync points in a file that gets truncated
+        // (crash, full disk), so they must not depend on any one stream still delivering:
+        // their own thread emits them while the recording is up, even if every stream is
+        // silent. LabRecorder does the same, at the same 10 s interval.
+        workers_.emplace_back([wr = writer_](stop_token st) {
+            while (waitFor(st, 10.0)) { try { wr->boundary(); } catch (const std::exception&) {} }
+        });
         return true;
     }
 
@@ -71,7 +83,8 @@ public:
         for (auto& w : workers_) w.request_stop();
         // Hand the workers + writer to a detached-ish closer so the UI thread doesn't
         // block on each worker's join (a worker can be parked ~0.5 s in pull_chunk's
-        // timeout). Same deferred-reap idea as stream disconnect. The workers hold their
+        // timeout, and longer if its offset thread is mid-time_correction against a
+        // sender that stopped answering). Same deferred-reap idea as stream disconnect. The workers hold their
         // own shared_ptr to the writer, so the file stays valid until they're all done,
         // then the writer drops here and flushes + closes. A subsequent stop() / the
         // dtor joins this thread, so the file is never truncated.
@@ -86,21 +99,24 @@ public:
     }
 
 private:
+    // Cancelable sleep, checked every 100 ms so a stop() isn't delayed by a whole interval.
+    // Returns false as soon as a stop is requested.
+    static bool waitFor(const stop_token& st, double seconds) {
+        for (double slept = 0.0; slept < seconds; slept += 0.1) {
+            if (st.stop_requested()) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return !st.stop_requested();
+    }
+
     template <class T>
     void pumpLoop(stop_token st, lsl::stream_inlet& inlet, xdf::Writer& w, xdf::streamid_t id,
                   int nchan, double& first, double& last, std::uint64_t& count) {
         std::vector<T>      buf;
         std::vector<double> ts;
-        double lastClock = 0.0, lastBoundary = lsl::local_clock();
         while (!st.stop_requested()) {
             try { inlet.pull_chunk_multiplexed(buf, &ts, 0.5); }
             catch (const std::exception&) { continue; }  // recover=true reconnects the pull
-            const double now = lsl::local_clock();
-            if (now - lastClock > 5.0) {                 // periodic clock sync
-                try { w.clock_offset(id, now, inlet.time_correction()); } catch (...) {}
-                lastClock = now;
-                if (id == 1 && now - lastBoundary > 10.0) { w.boundary(); lastBoundary = now; }
-            }
             if (ts.empty()) continue;
             if (first == 0.0) first = ts.front();
             last   = ts.back();
@@ -128,15 +144,28 @@ private:
             try { w.clock_offset(id, lsl::local_clock(), inlet.time_correction(2.0)); } catch (...) {}
 
             double first = 0.0, last = 0.0; std::uint64_t count = 0;
-            switch (full.channel_format()) {
-            case lsl::cf_float32:  pumpLoop<float>      (st, inlet, w, id, nchan, first, last, count); break;
-            case lsl::cf_double64: pumpLoop<double>     (st, inlet, w, id, nchan, first, last, count); break;
-            case lsl::cf_int32:    pumpLoop<std::int32_t>(st, inlet, w, id, nchan, first, last, count); break;
-            case lsl::cf_int16:    pumpLoop<std::int16_t>(st, inlet, w, id, nchan, first, last, count); break;
-            case lsl::cf_int8:     pumpLoop<char>        (st, inlet, w, id, nchan, first, last, count); break;
-            case lsl::cf_int64:    pumpLoop<std::int64_t>(st, inlet, w, id, nchan, first, last, count); break;
-            case lsl::cf_string:   pumpLoop<std::string>(st, inlet, w, id, nchan, first, last, count); break;
-            default: break;       // cf_undefined: header only
+            {
+                // time_correction() is a round trip to the sender, so it runs beside the pull,
+                // not inside it: on a connected-but-unresponsive peer an inline measurement
+                // parks the pump for its whole timeout while samples pile up in the inlet
+                // buffer. Scoped so it is joined before the footer — no ClockOffset chunk for
+                // this stream can land after the stream's own StreamFooter.
+                jthread offsets([&](stop_token ost) {
+                    while (waitFor(ost, 5.0)) {
+                        try { w.clock_offset(id, lsl::local_clock(), inlet.time_correction(2.0)); }
+                        catch (const std::exception&) { /* transient; retry next tick */ }
+                    }
+                });
+                switch (full.channel_format()) {
+                case lsl::cf_float32:  pumpLoop<float>      (st, inlet, w, id, nchan, first, last, count); break;
+                case lsl::cf_double64: pumpLoop<double>     (st, inlet, w, id, nchan, first, last, count); break;
+                case lsl::cf_int32:    pumpLoop<std::int32_t>(st, inlet, w, id, nchan, first, last, count); break;
+                case lsl::cf_int16:    pumpLoop<std::int16_t>(st, inlet, w, id, nchan, first, last, count); break;
+                case lsl::cf_int8:     pumpLoop<char>        (st, inlet, w, id, nchan, first, last, count); break;
+                case lsl::cf_int64:    pumpLoop<std::int64_t>(st, inlet, w, id, nchan, first, last, count); break;
+                case lsl::cf_string:   pumpLoop<std::string>(st, inlet, w, id, nchan, first, last, count); break;
+                default: break;       // cf_undefined: header only
+                }
             }
 
             std::ostringstream f;        // footer: bounds for the importer

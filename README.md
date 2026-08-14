@@ -64,19 +64,23 @@ You can apply the filter stages in any combination. The spectrum, spectrogram, a
 
 Enable a control port from the Recording panel, or with `LSL_RC_PORT=22345`. A client then controls the recording over TCP. The commands end with a newline, and the replies are lines of readable text.
 
-The port binds to loopback (127.0.0.1) only. There is no authentication. To use the port from a different machine, turn on **Allow LAN access** in the Recording panel, or set `LSL_RC_BIND=all`. Use trusted networks only.
+The port binds to loopback (127.0.0.1) only. There is no authentication. To use the port from a different machine, turn on **Allow LAN access** in the Recording panel, or set `LSL_RC_BIND=all`. Use trusted networks only. Up to four clients can connect at the same time.
 
 | Command | Effect |
 |---|---|
-| `streams` | Lists the streams that LSL can resolve, one per line: `key \| name \| type \| Nch \| rate` |
+| `streams` | Lists the streams that LSL can resolve, one per line: `key \| name \| type \| Nch \| rate`. The first field is the key. If there are no streams, the reply is `(none)`. |
 | `selected` | Shows the keys that are connected. These streams are the ones that get recorded. |
-| `select all\|none\|<k1,k2,...>` | Selects the streams to connect and record. Each `key` is an identifier from `streams`. The command is refused during a recording, because the set is locked until `stop`. |
+| `select all\|none\|<k1,k2,...>` | Selects the streams to connect and record. Each `key` is an identifier from `streams`. If a key is not a stream that the viewer can see, the viewer refuses the whole command. The command is also refused during a recording, because the set is locked until `stop`. |
 | `set <subject\|session\|task\|run\|acq\|modality> <value>` | Fills one field of the filename template. |
 | `filename <path>` | Sets the output path or template directly. |
 | `start [path]` and `stop` | Start and stop the recording. |
 | `get` | Sends the last completed recording to the client: a header line `OK <bytes> <name>`, then `<bytes>` of raw XDF. |
 | `status` | Shows the recording state, the file, the seconds, the megabytes, and the streams. |
 | `help` and `quit` | List the commands, and close the connection. |
+
+Each reply is one line, and it starts with `ok:` or `error:`. The exceptions are `streams`, which gives one line for each stream, and `get`, which gives a header line and then raw data.
+
+The `select`, `start`, and `stop` commands must go through the viewer. They do not reply until the viewer has done the work, thus the reply gives the result: `ok: recording -> /path/file.xdf`, or `error: no streams connected`. A `status` that comes after such a reply always shows the new state. If the viewer does not answer in 2 seconds, the reply is `error: the viewer did not respond`, and the command is discarded.
 
 Thus a script can find the streams on the network, select the streams it wants, fill the BIDS fields, and record. The same process that runs the experiment can do all of this:
 
@@ -94,24 +98,30 @@ with socket.create_connection(("localhost", 22345)) as rc:
     #   mock-audio          | MockAudio         | Audio   |  2ch | 48000
 
     # Record the EEG and its markers only. The keys come from the `streams` list.
-    cmd(rc, "select mock-eeg,mock-evoked-markers")
+    # A key that the viewer cannot see makes this fail, thus a typo cannot
+    # silently give you a recording with fewer streams than you asked for.
+    print(cmd(rc, "select mock-eeg,mock-evoked-markers"))   # -> ok: connected 2 stream(s)
     print(cmd(rc, "selected"))                 # -> mock-eeg mock-evoked-markers
 
-    task_settings = {"subject": "01",
-                     "session": "01",
-                     "task": "posner",
-                     "run": "1"}
+    settings = {"subject": "01",
+                "session": "01",
+                "task": "posner",
+                "run": "1"}
 
     for field, val in settings.items():
         cmd(rc, f"set {field} {val}")          # -> sub-01/ses-01/eeg/sub-01_..._eeg.xdf
 
-    cmd(rc, "start")
+    # `start` returns when the file is open, thus this catches a bad path or an
+    # empty selection before the experiment runs.
+    reply = cmd(rc, "start")
+    if reply.startswith("error"):
+        raise RuntimeError(reply)
     # Present the stimuli, and push the markers through LSL.
     cmd(rc, "stop")
     print(cmd(rc, "status"))
 ```
 
-After `stop`, the `get` command sends the completed `.xdf` file back on the same connection. This is useful when the viewer runs on the acquisition machine and the analysis runs on a different machine.
+After `stop`, the `get` command sends the completed `.xdf` file back on the same connection. This is useful when the viewer runs on the acquisition machine and the analysis runs on a different machine. The command waits up to 3 seconds for the viewer to flush the file, thus a script can call `get` directly after `stop`.
 
 ```python
 def fetch(rc, dest):
@@ -129,7 +139,25 @@ def fetch(rc, dest):
     open(dest, "wb").write(body[:size])
 ```
 
-The viewer also announces the control endpoint through LSL, with the type `ViewerControl`. Resolve it to get the host and the port instead of writing `22345` in your code. The port is in `source_id`, in the form `lsl-viewer-rc:<port>`. To examine the endpoint by hand, use `nc localhost 22345`.
+### Discovery
+
+The viewer also announces the control endpoint through LSL, with the type `ViewerControl`. Resolve it to get the host and the port instead of writing `22345` in your code. The `source_id` has the form `lsl-viewer-rc:<host>:<pid>:<port>`, thus the port is the text after the last colon. The host and the process ID make the identifier different for each viewer, because LSL uses `source_id` as the identity of a stream.
+
+```python
+from pylsl import resolve_byprop, StreamInlet
+
+for info in resolve_byprop("type", "ViewerControl", timeout=5.0):
+    port = int(info.source_id().rsplit(":", 1)[1])
+    desc = StreamInlet(info).info(timeout=3).desc()      # port, pid, bind, protocol
+    host = "127.0.0.1" if desc.child_value("bind") == "loopback" else info.hostname()
+```
+
+Two things to know when you write a client:
+
+- **The port can move.** If port 22345 is in use, and you did not set `LSL_RC_PORT`, the viewer takes a port from the operating system and announces that one. Thus a second viewer on the same machine also has a control port. If you do set `LSL_RC_PORT`, the viewer uses that port or none, because a script that asks for a port must not get a different one.
+- **The host from `resolve` is not always the address to connect to.** A viewer that binds to loopback only is reachable at `127.0.0.1`, and only from the same machine, but LSL still reports the machine name. The `bind` field in the description says which: `loopback` or `all`.
+
+To examine the endpoint by hand, use `nc localhost 22345`.
 
 ## System requirements
 

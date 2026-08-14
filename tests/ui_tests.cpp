@@ -15,9 +15,12 @@
 #include "filter.hpp"
 #include "fft.hpp"               // Psd (KissFFT-backed) under test
 #include "remote_control.hpp"   // TCP control server under test (+ its rc_socket_t layer)
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #if !defined(_WIN32)
 #include <sys/time.h>           // timeval for SO_RCVTIMEO
@@ -45,6 +48,15 @@ static rc_socket_t rcTestConnect(int port) {
     return fd;
 }
 static void rcTestSend(rc_socket_t fd, const std::string& s) { ::send(fd, s.data(), (int)s.size(), 0); }
+// Sessions are reaped on their own threads, so the client roster the GUI reads settles
+// shortly after a connect/disconnect rather than immediately.
+static bool rcTestWaitClients(const RemoteControl& rc, std::size_t n) {
+    for (int i = 0; i < 100; ++i) {
+        if (rc.clients().size() == n) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
 static std::string rcTestRecv(rc_socket_t fd) {   // one reply burst (small, single loopback segment)
     char buf[2048];
     const int n = (int)::recv(fd, buf, (int)sizeof(buf), 0);
@@ -135,7 +147,8 @@ void RegisterAppTests(ImGuiTestEngine* e) {
     // Remote-control server roundtrip: start the TCP server, drive it from a
     // loopback client, and assert both the text replies AND the RemoteState the
     // server hands back to the main loop. No UI — exercises the real socket path
-    // (Winsock on Windows CI, BSD sockets elsewhere). See remote_control.hpp.
+    // (Winsock on Windows CI, BSD sockets elsewhere). select/start/stop block until
+    // a main loop applies them, so this stands in a fake one. See remote_control.hpp.
     t = IM_REGISTER_TEST(e, "remote", "roundtrip");
     t->TestFunc = [](ImGuiTestContext*) {
         RemoteState st;
@@ -147,11 +160,45 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK(rc.start(port, &st));
         if (!rc.listening()) return;            // bind failed (port busy?) — don't hang
 
-        rc_socket_t fd = rcTestConnect(port);
+        // Stand-in for the viewer's frame loop: drain the queue and answer each request
+        // the way main.cpp does. `pump` gates it so the timeout path can be tested too.
+        std::atomic<bool> pump{true}, loopUp{true};
+        std::vector<std::string> lastSelect;
+        std::string lastFilename;
+        std::thread loop([&] {
+            while (loopUp) {
+                if (pump) {
+                    std::lock_guard<std::mutex> lk(st.mtx);
+                    if (st.setFilename) { lastFilename = *st.setFilename; st.setFilename.reset(); }
+                    for (auto& req : st.queue) {
+                        switch (req->kind) {
+                        case RcRequest::Kind::Select:
+                            lastSelect = req->keys;
+                            req->msg = (req->keys.size() == 1 && req->keys[0] == "unknown-key")
+                                     ? "error: unknown stream(s): unknown-key (see `streams`)"
+                                     : "ok: connected " + std::to_string(req->keys.size()) + " stream(s)";
+                            break;
+                        case RcRequest::Kind::Start: req->msg = "ok: recording -> " + lastFilename; break;
+                        case RcRequest::Kind::Stop:  req->msg = "ok: stopped -> " + lastFilename;   break;
+                        }
+                        req->done = true;
+                    }
+                    if (!st.queue.empty()) { st.queue.clear(); st.cv.notify_all(); }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        });
+
+        rc_socket_t fd = rcTestConnect(rc.port());   // the port it actually bound
         IM_CHECK(fd != RC_INVALID);
-        if (fd == RC_INVALID) { rc.stop(); return; }
+        if (fd == RC_INVALID) { loopUp = false; loop.join(); rc.stop(); return; }
 
         IM_CHECK(rcTestRecv(fd).find("remote control") != std::string::npos);   // hello banner
+
+        // The roster the Recording panel shows: one peer, addressed the way the panel
+        // prints it.
+        IM_CHECK(rcTestWaitClients(rc, 1));
+        IM_CHECK(rc.clients().front().rfind("127.0.0.1:", 0) == 0);
 
         rcTestSend(fd, "status\n");
         IM_CHECK(rcTestRecv(fd).find("recording=false") != std::string::npos);
@@ -161,39 +208,116 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK(streams.find("mock-eeg") != std::string::npos);
         IM_CHECK(streams.find("mock-acc") != std::string::npos);
 
-        // `select <key>` must mutate RemoteState.setSelection (set under st.mtx by
-        // the server thread; the reply is sent after, so it's visible once we read it).
+        // `select <key>` reaches the main loop as a request, and its reply is the
+        // outcome the main loop wrote — not an optimistic ok.
         rcTestSend(fd, "select mock-eeg\n");
-        IM_CHECK(rcTestRecv(fd).find("ok") != std::string::npos);
-        {
-            std::lock_guard<std::mutex> lk(st.mtx);
-            IM_CHECK(st.setSelection.has_value());
-            IM_CHECK(st.setSelection->size() == 1);
-            IM_CHECK_STR_EQ(st.setSelection->front().c_str(), "mock-eeg");
-        }
+        IM_CHECK(rcTestRecv(fd).find("ok: connected 1") != std::string::npos);
+        IM_CHECK(lastSelect.size() == 1);
+        IM_CHECK_STR_EQ(lastSelect.front().c_str(), "mock-eeg");
 
+        rcTestSend(fd, "select unknown-key\n");   // rejected whole, not half-applied
+        IM_CHECK(rcTestRecv(fd).find("error: unknown stream(s)") != std::string::npos);
+
+        // `start <path>` sets the filename first, so the request the loop applies
+        // already sees it, and the reply names the file it opened.
         rcTestSend(fd, "start /tmp/rc_unit.xdf\n");
-        IM_CHECK(rcTestRecv(fd).find("starting") != std::string::npos);
-        {
-            std::lock_guard<std::mutex> lk(st.mtx);
-            IM_CHECK(st.startReq);
-            IM_CHECK(st.setFilename.has_value());
-            IM_CHECK_STR_EQ(st.setFilename->c_str(), "/tmp/rc_unit.xdf");
-        }
+        IM_CHECK(rcTestRecv(fd).find("ok: recording -> /tmp/rc_unit.xdf") != std::string::npos);
+        IM_CHECK_STR_EQ(lastFilename.c_str(), "/tmp/rc_unit.xdf");
 
         rcTestSend(fd, "stop\n");
-        IM_CHECK(rcTestRecv(fd).find("stopping") != std::string::npos);
-        { std::lock_guard<std::mutex> lk(st.mtx); IM_CHECK(st.stopReq); }
+        IM_CHECK(rcTestRecv(fd).find("ok: stopped") != std::string::npos);
 
         rcTestSend(fd, "frobnicate\n");        // unknown -> error, connection stays open
         IM_CHECK(rcTestRecv(fd).find("error") != std::string::npos);
 
+        // A second client is served while the first stays connected (one session
+        // thread each) — a script and a `nc` session can coexist.
+        rc_socket_t fd2 = rcTestConnect(port);
+        IM_CHECK(fd2 != RC_INVALID);
+        if (fd2 != RC_INVALID) {
+            IM_CHECK(rcTestRecv(fd2).find("remote control") != std::string::npos);
+            rcTestSend(fd2, "status\n");
+            IM_CHECK(rcTestRecv(fd2).find("recording=false") != std::string::npos);
+            rcTestSend(fd, "status\n");        // the first connection still works
+            IM_CHECK(rcTestRecv(fd).find("recording=false") != std::string::npos);
+            IM_CHECK(rcTestWaitClients(rc, 2));
+            rc_close(fd2);
+            IM_CHECK(rcTestWaitClients(rc, 1));   // and the roster drops it again
+        }
+
+        // With no main loop draining the queue, a request must give up rather than
+        // park the client forever, and must not stay queued to fire later.
+        pump = false;
+        rcTestSend(fd, "stop\n");
+        std::string late;
+        for (int i = 0; i < 4 && late.empty(); ++i) late = rcTestRecv(fd);   // 2 s server-side wait
+        IM_CHECK(late.find("did not respond") != std::string::npos);
+        { std::lock_guard<std::mutex> lk(st.mtx); IM_CHECK(st.queue.empty()); }
+        pump = true;
+
         rcTestSend(fd, "quit\n");
         IM_CHECK(rcTestRecv(fd).find("bye") != std::string::npos);
         rc_close(fd);
+        IM_CHECK(rcTestWaitClients(rc, 0));   // no phantom peers left on the roster
 
+        loopUp = false; loop.join();
         rc.stop();                              // joins the server thread cleanly
         IM_CHECK(!rc.listening());
+    };
+
+    // Discovery beacon identity. Two viewers that both use 22345 must not publish the same
+    // source_id (LSL would treat them as one logical stream), and the format is a contract:
+    // xdf_record skips beacons by the prefix, clients read the port after the last colon.
+    t = IM_REGISTER_TEST(e, "remote", "beacon_source_id");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const std::string sid = rc_beacon_source_id(22345);
+        IM_CHECK(sid.rfind("lsl-viewer-rc:", 0) == 0);              // xdf_record's filter
+        IM_CHECK_STR_EQ(sid.substr(sid.rfind(':') + 1).c_str(), "22345");
+        IM_CHECK(std::count(sid.begin(), sid.end(), ':') == 3);     // prefix:host:pid:port
+        IM_CHECK(sid.find(std::to_string(rc_pid())) != std::string::npos);
+        IM_CHECK(sid != rc_beacon_source_id(22346));                // the port distinguishes
+        IM_CHECK(rc_hostname() != "unknown");                       // and so does the host
+    };
+
+    // Two viewers on one host: the second can't have the same port, so start() falls back
+    // to an ephemeral one and announces that rather than going without a control port.
+    // This also pins down the platform bind semantics — on Windows SO_REUSEADDR would let
+    // the second bind SUCCEED on the live port and quietly split the connections, so the
+    // no-fallback case failing is the assertion that matters most there.
+    t = IM_REGISTER_TEST(e, "remote", "second_instance");
+    t->TestFunc = [](ImGuiTestContext*) {
+        RemoteState st1, st2;
+        RemoteControl rc1, rc2;
+        const int port = 22457;
+        IM_CHECK(rc1.start(port, &st1));
+        if (!rc1.listening()) return;            // bind failed (port busy?) — don't hang
+        IM_CHECK_EQ(rc1.port(), port);
+
+        IM_CHECK(!rc2.start(port, &st2, false, /*portFallback=*/false));   // pinned -> just fails
+        IM_CHECK(!rc2.listening());
+        IM_CHECK(rc2.error().find("bind") != std::string::npos);
+
+        IM_CHECK(rc2.start(port, &st2, false, /*portFallback=*/true));     // default -> moves
+        IM_CHECK(rc2.listening());
+        if (rc2.listening()) {
+            IM_CHECK(rc2.port() != 0);
+            IM_CHECK(rc2.port() != port);
+            rc_socket_t fd = rcTestConnect(rc2.port());   // and it's reachable there
+            IM_CHECK(fd != RC_INVALID);
+            if (fd != RC_INVALID) {
+                IM_CHECK(rcTestRecv(fd).find("remote control") != std::string::npos);
+                rc_close(fd);
+            }
+        }
+        rc2.stop();
+        rc1.stop();
+
+        // The port is free again straight after a clean stop: no lingering listener, and
+        // the accepted sockets' TIME_WAIT doesn't block a fresh bind.
+        RemoteControl rc3;
+        IM_CHECK(rc3.start(port, &st1));
+        IM_CHECK_EQ(rc3.port(), port);
+        rc3.stop();
     };
 
     // Performance overlay (off by default; shown via View menu) exposes VSync.

@@ -1764,12 +1764,19 @@ int main(int argc, char** argv) {
     // Loopback-only by default (the control port has no auth); LSL_RC_BIND=all exposes it
     // on the network for cross-machine lab control.
     bool          rcBindAll = false;
+    // A pinned port (LSL_RC_PORT) is taken literally: binding elsewhere would send the
+    // script that pinned it to the wrong place. Our own default may move, so a second
+    // viewer on this host still gets a control port -- discovery carries the real one.
+    bool          rcPortPinned = false;
     if (const char* b = std::getenv("LSL_RC_BIND"))
         rcBindAll = (std::strcmp(b, "all") == 0 || std::strcmp(b, "0.0.0.0") == 0);
     if (const char* p = std::getenv("LSL_RC_PORT")) {            // auto-start from env
         rcPort = std::atoi(p);
-        if (remote.start(rcPort, &rcState, rcBindAll))
-            spdlog::info("remote control listening on {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", rcPort);
+        rcPortPinned = true;
+        if (remote.start(rcPort, &rcState, rcBindAll, !rcPortPinned))
+            spdlog::info("remote control listening on {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", remote.port());
+        else
+            spdlog::warn("remote control unavailable: {}", remote.error());
     }
     RecVars recVars;                                     // g_recTmpl/g_recDir are file-scope (persisted)
     // BIDS entity defaults so the default template yields a valid name out of the box; the
@@ -2312,23 +2319,98 @@ int main(int argc, char** argv) {
 
             // Recording captures exactly the streams the viewer is connected to (a data
             // window or a marker overlay) — "what you're viewing is what you record".
-            auto startRecording = [&]() {
+            // Returns "" on success, else the reason — the remote `start` reply carries it
+            // back to the client, which has no other way to see a failure.
+            auto startRecording = [&]() -> std::string {
                 std::vector<lsl::stream_info> rec;
                 for (auto& fi : found) if (connected(fi)) rec.push_back(fi.info);
+                if (rec.empty()) return "no streams connected";   // Recorder::start just returns false
                 const std::string path = recFullPath();
-                if (recorder.start(path, rec))
-                    spdlog::info("recording {} stream(s) -> {}", rec.size(), path);
-                else
-                    spdlog::error("failed to start recording: {}", recorder.error());
+                if (!recorder.start(path, rec)) {
+                    const std::string e = recorder.error();
+                    spdlog::error("failed to start recording: {}", e);
+                    return e.empty() ? "the recorder refused to start" : e;
+                }
+                spdlog::info("recording {} stream(s) -> {}", rec.size(), path);
+                return {};
             };
 
-            // ---- Remote control: publish state, apply requests ----------
+            // ---- Remote control: apply requests, then publish state ----------
             if (remote.listening()) {
                 std::lock_guard<std::mutex> lk(rcState.mtx);
-                // Publish state at ~4 Hz (clients poll; rebuilding these strings every
-                // frame is the costly part). Requests below are still applied per frame.
+                if (rcState.setFilename) {
+                    std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", rcState.setFilename->c_str());
+                    ImGui::MarkIniSettingsDirty();
+                    rcState.setFilename.reset();
+                }
+                for (auto& [k, val] : rcState.setVars) {
+                    char* dst = (k == "subject")  ? recSubject : (k == "session")  ? recSession
+                              : (k == "task")     ? recTask    : (k == "run")      ? recRun
+                              : (k == "acq")      ? recAcq     : (k == "modality") ? recModality : nullptr;
+                    if (dst) std::snprintf(dst, 64, "%s", val.c_str());
+                }
+                rcState.setVars.clear();
+                // Requests the client is blocked on. Each gets the real outcome in req->msg;
+                // filename/set above are applied first, so a `start <path>` sees its own path.
+                const bool applied = !rcState.queue.empty();
+                for (auto& req : rcState.queue) {
+                    switch (req->kind) {
+                    case RcRequest::Kind::Select: {
+                        // `select` drives CONNECTIONS (recording captures all connected):
+                        // "*" = connect all discovered, empty = disconnect all, else make
+                        // the connected set exactly the given keys.
+                        if (recorder.active()) {   // the set is locked while recording (matches the UI)
+                            req->msg = "error: recording -- stop the recording before changing streams";
+                            break;
+                        }
+                        const bool all = (req->keys.size() == 1 && req->keys[0] == "*");
+                        if (!all) {
+                            // All-or-nothing on an unknown key: a typo used to be reported but
+                            // still applied, quietly recording fewer streams than asked for.
+                            std::string unknown;
+                            for (const auto& k : req->keys) {
+                                bool ok = false;
+                                for (auto& fi : found) if (fi.key == k) { ok = true; break; }
+                                if (!ok) unknown += " " + k;
+                            }
+                            if (!unknown.empty()) {
+                                req->msg = "error: unknown stream(s):" + unknown + " (see `streams`)";
+                                break;
+                            }
+                        }
+                        const std::set<std::string> want(req->keys.begin(), req->keys.end());
+                        int n = 0;
+                        for (auto& fi : found) {
+                            const bool shouldConn = all || want.count(fi.key) != 0;
+                            const bool isConn = connected(fi);
+                            if (shouldConn && !isConn)      connectStream(fi);
+                            else if (!shouldConn && isConn) disconnectKey(fi.key);
+                            if (shouldConn) ++n;
+                        }
+                        req->msg = "ok: connected " + std::to_string(n) + " stream(s)";
+                        break;
+                    }
+                    case RcRequest::Kind::Start:
+                        if (recorder.active()) { req->msg = "ok: already recording -> " + recorder.path(); break; }
+                        if (const std::string err = startRecording(); !err.empty()) req->msg = "error: " + err;
+                        else req->msg = "ok: recording -> " + recorder.path();
+                        break;
+                    case RcRequest::Kind::Stop:
+                        if (!recorder.active()) { req->msg = "ok: not recording"; break; }
+                        req->msg = "ok: stopped -> " + recorder.path();
+                        recorder.stop();
+                        spdlog::info("recording stopped (remote)");
+                        break;
+                    }
+                    req->done = true;
+                }
+                rcState.queue.clear();
+                // Publish at ~4 Hz (clients poll; rebuilding these strings every frame is the
+                // costly part), but always right after a request — the client is told the
+                // request is done, so a `status` right behind it must not answer with the
+                // state from before it.
                 static double lastPublish = -1e18;
-                if (dueEvery(lastPublish, 0.25)) {
+                if (dueEvery(lastPublish, 0.25) || applied) {
                     std::string s;
                     for (auto& fi : found) {
                         char ln[320];
@@ -2348,7 +2430,11 @@ int main(int argc, char** argv) {
                                   recorder.streams(), (unsigned long long)recorder.bytes());
                     rcState.statusText = st;
                     rcState.recording  = recorder.active();
-                    // Expose the last recording for `get` only once it's fully flushed/closed.
+                    // Expose the last recording for `get` only once it's fully flushed/closed;
+                    // closePending tells a stop-then-get client to wait for that instead of
+                    // hearing "no completed recording yet".
+                    const bool closing = !recorder.active() && !recorder.path().empty() && !recorder.fileFlushed();
+                    rcState.closePending = closing;
                     rcState.lastFile = (!recorder.active() && recorder.fileFlushed() && !recorder.path().empty())
                                        ? recorder.path() : std::string();
                     rcState.selectedText = [&]{
@@ -2357,37 +2443,7 @@ int main(int argc, char** argv) {
                         return j.empty() ? std::string("none") : j;
                     }();
                 }
-                if (rcState.setFilename) {
-                    std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", rcState.setFilename->c_str());
-                    ImGui::MarkIniSettingsDirty();
-                    rcState.setFilename.reset();
-                }
-                for (auto& [k, val] : rcState.setVars) {
-                    char* dst = (k == "subject")  ? recSubject : (k == "session")  ? recSession
-                              : (k == "task")     ? recTask    : (k == "run")      ? recRun
-                              : (k == "acq")      ? recAcq     : (k == "modality") ? recModality : nullptr;
-                    if (dst) std::snprintf(dst, 64, "%s", val.c_str());
-                }
-                rcState.setVars.clear();
-                // `select` now drives CONNECTIONS (recording captures all connected):
-                // "*" = connect all discovered, empty = disconnect all, else make the
-                // connected set exactly the given keys.
-                if (rcState.setSelection) {
-                    if (!recorder.active()) {   // ignore a select that raced an in-progress recording
-                        const auto& sel = *rcState.setSelection;
-                        const bool all = (sel.size() == 1 && sel[0] == "*");
-                        const std::set<std::string> want(sel.begin(), sel.end());
-                        for (auto& fi : found) {
-                            const bool shouldConn = all || want.count(fi.key) != 0;
-                            const bool isConn = connected(fi);
-                            if (shouldConn && !isConn)      connectStream(fi);
-                            else if (!shouldConn && isConn) disconnectKey(fi.key);
-                        }
-                    }
-                    rcState.setSelection.reset();
-                }
-                if (rcState.stopReq)  { rcState.stopReq = false; if (recorder.active()) { recorder.stop(); spdlog::info("recording stopped (remote)"); } }
-                if (rcState.startReq) { rcState.startReq = false; if (!recorder.active()) startRecording(); }
+                if (applied) rcState.cv.notify_all();   // after publishing, so the reply implies fresh state
             }
 
             // ---- Two-column layout: fixed Streams sidebar + a dockspace -----
@@ -2604,9 +2660,9 @@ int main(int argc, char** argv) {
                 bool rc = remote.listening();
                 if (ImGui::Checkbox("Remote control", &rc)) {
                     if (rc) {
-                        if (remote.start(rcPort, &rcState, rcBindAll))
-                            spdlog::info("remote control listening on {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", rcPort);
-                        else spdlog::warn("remote control unavailable: {}", remote.error());  // e.g. Windows
+                        if (remote.start(rcPort, &rcState, rcBindAll, !rcPortPinned))
+                            spdlog::info("remote control listening on {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", remote.port());
+                        else spdlog::warn("remote control unavailable: {}", remote.error());
                     } else { remote.stop(); spdlog::info("remote control stopped"); }
                 }
                 if (ImGui::IsItemHovered())
@@ -2616,14 +2672,27 @@ int main(int argc, char** argv) {
                 if (remote.listening()) {
                     ImGui::SameLine();
                     ImGui::TextDisabled("%s:%d", rcBindAll ? "0.0.0.0 (LAN)" : "127.0.0.1", remote.port());
+                    // Who is connected right now. There's no auth on this port, so the
+                    // check that matters on a trusted network is a human noticing a
+                    // client nobody meant to be there. Undimmed when >0 so it reads as a
+                    // state, not a hint, against the disabled text around it.
+                    const std::vector<std::string> rcPeers = remote.clients();
+                    if (rcPeers.empty())
+                        ImGui::TextDisabled("no control client");
+                    else {
+                        std::string list;
+                        for (const auto& p : rcPeers) { if (!list.empty()) list += ", "; list += p; }
+                        ImGui::TextWrapped("%d control client%s: %s", (int)rcPeers.size(),
+                                           rcPeers.size() == 1 ? "" : "s", list.c_str());
+                    }
                 }
                 // Expose to other machines. The control port has NO auth, so it's loopback-only
                 // unless opted in here (or via LSL_RC_BIND=all). Toggling while live re-binds the
                 // socket so the change takes effect without a manual stop/start.
                 if (ImGui::Checkbox("Allow LAN access (no auth)", &rcBindAll) && remote.listening()) {
                     remote.stop();
-                    if (remote.start(rcPort, &rcState, rcBindAll))
-                        spdlog::info("remote control re-bound to {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", rcPort);
+                    if (remote.start(rcPort, &rcState, rcBindAll, !rcPortPinned))
+                        spdlog::info("remote control re-bound to {}:{}", rcBindAll ? "0.0.0.0" : "127.0.0.1", remote.port());
                     else spdlog::warn("remote control unavailable: {}", remote.error());
                 }
                 if (ImGui::IsItemHovered())

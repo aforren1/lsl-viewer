@@ -767,7 +767,7 @@ private:
                 catch (const std::exception&) { continue; }   // recover reconnects the pull
                 const double now = lsl::local_clock();
                 if (now - lastCorr > 5.0) {                    // refresh clock offset
-                    try { offset = inlet.time_correction(); } catch (...) {}
+                    try { offset = inlet.time_correction(1.0); } catch (...) {}
                     lastCorr = now;
                 }
                 if (ts == 0.0 || sample.empty()) continue;

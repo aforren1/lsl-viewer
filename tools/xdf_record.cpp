@@ -55,7 +55,12 @@ int main(int argc, char** argv) {
 
     std::vector<lsl::stream_info> infos;
     for (auto& info : lsl::resolve_streams(resolve_wait)) {
-        if (info.source_id().rfind("lsl-viewer-rc", 0) == 0) continue;   // skip RC beacons
+        // Skip a viewer's control beacon (see remote_control.hpp): it never sends a
+        // sample, so recording it would leave an empty stream in the file. Matched on
+        // the type, which is fixed, as well as the source_id, which is not — the id
+        // has to grow a host/pid to stay unique across viewers.
+        if (info.type() == "ViewerControl" ||
+            info.source_id().rfind("lsl-viewer-rc", 0) == 0) continue;
         if (want.empty() || std::find(want.begin(), want.end(), info.name()) != want.end())
             infos.push_back(info);
     }
