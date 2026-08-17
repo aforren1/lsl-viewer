@@ -167,13 +167,14 @@ The viewer renders through **SDL_GPU**, the GPU abstraction of SDL3. Thus it nee
 - **macOS:** macOS 11 (Big Sur) or later, on a Mac with **Metal** support. This includes Apple Silicon Macs and Intel Macs with a Metal GPU. The `.app` and `.dmg` files are unsigned. For the first launch, right-click the app and select **Open**.
 - **Linux:** a **Vulkan** loader and driver (`libvulkan` and an ICD for your GPU), and **Wayland or X11**. The AppImage is the easiest way to run the viewer on different distributions.
 
-**Network:** LSL finds and reads the streams on the local network. It uses UDP multicast to resolve the streams, and TCP to transfer the data. Thus the sources must be on the same subnet, and you can be required to permit the viewer through the firewall.
+**Network:** LSL finds and reads the streams on the local network. It uses UDP multicast to resolve the streams, and TCP to transfer the data. Thus the sources must be on the same subnet, and you can be required to permit the viewer through the firewall. The Windows installer adds the firewall rules for you. See [docs/network.md](docs/network.md) for the ports, for the portable build, and for what to do when the viewer finds no streams.
 
 **Headless recorder:** `xdf_record` has no GPU or display requirements. It links only to liblsl, and the static musl build for Linux runs on all Linux distributions.
 
 ## Documentation
 
 - [docs/building.md](docs/building.md): how to build, the CMake flags, the static and single-file builds, Windows, and the repository layout.
+- [docs/network.md](docs/network.md): the LSL ports, the firewall rules that the Windows installer adds, and what to do when the viewer finds no streams.
 - [DESIGN.md](DESIGN.md): the architecture and the reasons for it (the ring buffers, the threading, and the rendering path).
 
 ## Roadmap
