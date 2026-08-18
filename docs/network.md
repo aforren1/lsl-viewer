@@ -1,6 +1,6 @@
 # Network and firewall
 
-LSL finds streams with UDP multicast and transfers the data with TCP. Thus the viewer must accept inbound traffic, and the sources must be on the same subnet. This page tells you which ports LSL uses, what the Windows installer does, and how to correct a machine that cannot see the streams.
+LSL finds streams with UDP broadcast and multicast, and transfers the data with TCP. Thus the viewer must accept inbound traffic, and the sources must be on the same subnet. This page tells you which ports LSL uses, what the Windows installer does, and how to correct a machine that cannot see the streams.
 
 For the LSL side of the subject, see the [LSL network connectivity guide](https://labstreaminglayer.readthedocs.io/info/network-connectivity.html).
 
@@ -8,14 +8,18 @@ For the LSL side of the subject, see the [LSL network connectivity guide](https:
 
 | Port | Protocol | Use |
 |---|---|---|
-| 16571 | UDP | Service discovery. A resolver sends its query here, by multicast and by unicast, and each provider listens here and replies. |
-| 16572 to 16604 | TCP | Stream data. Each outlet takes a free port from the range. |
-| 16572 to 16604 | UDP | Clock synchronization between an outlet and its inlets. |
+| 16571 | UDP | Service discovery. A resolver sends its query here as a broadcast, as a multicast, or as both, and each provider listens here and replies. |
+| 16572 to 16604 | TCP | Stream data. |
+| 16572 to 16604 | UDP | Service port for each outlet: clock synchronization, and replies about the stream. |
 | 22345 | TCP | The viewer remote-control port, if you turn it on. See the [Remote control](../README.md#remote-control) section. |
 
 The viewer is both a consumer and a provider: it reads the streams, and it announces its own control endpoint as an LSL stream. Thus it needs the inbound rules that a source needs, not only the rules that a recorder needs.
 
-Do not open the ports one by one. Permit the program instead, because liblsl selects a port from a range at run time, and the control listener can move to a port that the operating system gives it.
+liblsl takes the ports from 16572 in pairs, one TCP port and one UDP port for each outlet. Thus a machine can hold 16 outlets in the default range. The range and the discovery port are `BasePort`, `PortRange`, and `MulticastPort` in [lsl_api.cfg](https://labstreaminglayer.readthedocs.io/info/lslapicfg.html), if your site changed them.
+
+**IPv6 is on by default.** The `IPv6` setting in `lsl_api.cfg` is `allow`, thus liblsl uses IPv4 and IPv6 side by side, and it sends the discovery query to IPv4 and IPv6 multicast groups. A rule that permits IPv4 only can make the resolve fail, or make it slow while it waits for the IPv6 attempt. Permit both families, or set `IPv6 = disable` in the configuration file.
+
+Where the firewall can match on the program (Windows and macOS), permit the program and not the ports. liblsl selects a port from the range at run time, and the control listener can move to a port that the operating system gives it, thus a rule for one port is not sufficient. `firewalld` and `ufw` match on ports only, so the Linux instructions below open the range.
 
 ## Windows
 
@@ -75,20 +79,104 @@ Give the full path to the executable that you run. A rule points to one file, th
    Set-NetConnectionProfile -InterfaceAlias "Ethernet" -NetworkCategory Private
    ```
 
-3. Check that the machines are on the same subnet. Multicast does not cross a router unless the network is configured for it. If they are on different subnets, set `KnownPeers` in the [LSL configuration file](https://labstreaminglayer.readthedocs.io/info/lslapicfg.html) to list the source machines by address.
+3. Check the order of the network adapters, if the machine has more than one. This is frequent in a lab, where an amplifier has a dedicated adapter and the internet comes through Wi-Fi. Windows sends the discovery query through the adapter with the lowest metric, which is not always the adapter on the lab network.
+
+   ```powershell
+   Get-NetIPInterface | Sort-Object InterfaceMetric | Format-Table InterfaceAlias, AddressFamily, InterfaceMetric
+   ```
+
+   Give the lab adapter a lower metric than the others:
+
+   ```powershell
+   Set-NetIPInterface -InterfaceAlias "Ethernet" -InterfaceMetric 10
+   ```
+
+4. Check that the machines are on the same subnet. Multicast does not cross a router unless the network is configured for it. If they are on different subnets, set `KnownPeers` in the [LSL configuration file](https://labstreaminglayer.readthedocs.io/info/lslapicfg.html) to list the source machines by address. `KnownPeers` replaces the multicast discovery with a direct connection to each address that you give.
 
 **Only some streams appear.** The resolve traffic and the data traffic use different ports. If the streams show in the list but do not connect, the rule permits UDP but not TCP. A program rule with no protocol covers both; a port rule does not.
 
-## Linux and macOS
+## macOS
 
-Neither platform blocks inbound traffic by default on a typical desktop install.
+The macOS application firewall is not the usual cause of trouble. It is off by default, and it only filters inbound traffic. The **Local Network** privacy control is the usual cause.
 
-- **macOS** raises a prompt for incoming connections the first time you run the viewer. Select **Allow**. To correct a refusal, use System Settings > Network > Firewall > Options.
-- **Linux** with `ufw` or `firewalld` active needs the LSL ports. For example, with `ufw`:
+### Local network permission
 
-  ```sh
-  sudo ufw allow proto udp from 192.168.1.0/24 to any port 16571:16604
-  sudo ufw allow proto tcp from 192.168.1.0/24 to any port 16572:16604
-  ```
+macOS 15 (Sequoia) and later hold back the local network until you permit it, for each application. LSL resolves the streams with UDP broadcast and multicast, thus the viewer must have this permission. Without it, the viewer starts correctly and finds no streams, and macOS gives no error.
 
-  Give your own subnet.
+The first launch raises a prompt. Select **Allow**. To see or change the setting afterwards, go to **System Settings > Privacy & Security > Local Network**.
+
+Two things make this more difficult than it looks:
+
+- **The `.app` is unsigned.** macOS holds the permission against the code signature of the application. The release build has only the ad-hoc signature that the linker applies, and that signature changes with each build. Thus the permission does not always survive an update: the switch in System Settings can show as on while the permission does not apply. If the viewer finds no streams after an update, set the switch off and then on again, or delete the application, empty the Trash, and install it again to get a new prompt.
+- **`xdf_record` is a command-line tool.** It has no bundle of its own, thus macOS holds the permission against the program that started it. When you run the recorder from Terminal, the prompt names Terminal, and a permission that you gave to the viewer does not apply. Permit Terminal (or your terminal application) in the same **Local Network** list.
+
+### Application firewall
+
+If you turned the application firewall on, permit the viewer in **System Settings > Network > Firewall > Options**, or from a terminal:
+
+```sh
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "/Applications/LSL Viewer.app/Contents/MacOS/lsl_viewer"
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "/Applications/LSL Viewer.app/Contents/MacOS/lsl_viewer"
+```
+
+## Linux
+
+Debian and Ubuntu leave `ufw` inactive, thus the AppImage needs no change. Fedora, RHEL, and openSUSE start `firewalld` with a default zone that drops inbound traffic, thus LSL finds no streams there until you open the ports.
+
+### firewalld
+
+The repository has a service definition at [packaging/lsl.xml](../packaging/lsl.xml). Install it, and then add the service to your zone:
+
+```sh
+sudo cp packaging/lsl.xml /etc/firewalld/services/
+sudo firewall-cmd --reload
+sudo firewall-cmd --permanent --add-service=lsl
+sudo firewall-cmd --reload
+```
+
+The third command applies to the default zone. To open the ports on one interface only, name its zone, for example `--zone=internal`. Check the result with `firewall-cmd --list-services`.
+
+If you have the AppImage but not a copy of the repository, add the ports directly instead:
+
+```sh
+sudo firewall-cmd --permanent --add-port=16571/udp --add-port=16572-16604/tcp --add-port=16572-16604/udp
+sudo firewall-cmd --reload
+```
+
+### ufw
+
+```sh
+sudo ufw allow 16571/udp
+sudo ufw allow 16572:16604/tcp
+sudo ufw allow 16572:16604/udp
+```
+
+These rules apply to IPv4 and IPv6, which is what liblsl needs with its default `IPv6 = allow`.
+
+To permit your lab subnet only, give the source. But do this for both families, or set `IPv6 = disable` in `lsl_api.cfg` first, because a rule with an IPv4 source does not apply to the IPv6 query:
+
+```sh
+sudo ufw allow proto udp from 192.168.1.0/24 to any port 16571
+sudo ufw allow proto tcp from 192.168.1.0/24 to any port 16572:16604
+sudo ufw allow proto udp from 192.168.1.0/24 to any port 16572:16604
+```
+
+`ufw` matches on ports, not on programs, thus these rules apply to all LSL software on the machine, not to the viewer alone.
+
+## Check whether the queries arrive
+
+This applies to Linux and macOS. A firewall problem and a routing problem look the same from the viewer. `socat` tells them apart, because it shows the discovery packets as they arrive. Run it on the machine that cannot see the streams, and start a resolve from another machine:
+
+```sh
+socat -d -d UDP-RECV:16571,reuseaddr,broadcast STDOUT
+```
+
+A query gives a packet that holds `LSL:shortinfo` and the session ID. If you see the packets here but the viewer finds no streams, the discovery is not the problem: look at the data ports, 16572 to 16604. If you see nothing, the packets do not reach the machine, and the cause is the firewall, the adapter, or the subnet.
+
+To watch one multicast group instead of the broadcasts, join it:
+
+```sh
+socat -d -d 'UDP6-RECV:16571,reuseaddr,ipv6-join-group=[ff02:113D:6FDD:2C17:A643:FFE2:1BD1:3CD2]:eth0' STDOUT
+```
+
+Give your own interface name: `ip addr` lists them on Linux, and `ifconfig` on macOS.

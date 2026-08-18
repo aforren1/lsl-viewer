@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld service definition for Lab Streaming Layer.
+
+  Fedora, RHEL, and openSUSE start firewalld with a default zone that drops inbound
+  traffic, thus LSL resolves no streams there until these ports are open. Debian and
+  Ubuntu leave ufw inactive, and need nothing.
+
+  The ports, not the program: firewalld matches on ports only. This is sufficient
+  because liblsl keeps to a bounded range.
+
+  For how to install this file, see docs/network.md.
+-->
+<service>
+  <short>Lab Streaming Layer</short>
+  <description>Discovery, data, and clock synchronization for Lab Streaming Layer (LSL) streams on the local subnet.</description>
+  <!-- Service discovery: a resolver queries here by broadcast, by multicast, or both. -->
+  <port protocol="udp" port="16571"/>
+  <!-- Stream data. Each outlet takes a free port from the range. -->
+  <port protocol="tcp" port="16572-16604"/>
+  <!-- Service port for each outlet: clock synchronization, and replies about the stream. -->
+  <port protocol="udp" port="16572-16604"/>
+</service>

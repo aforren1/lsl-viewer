@@ -22,5 +22,11 @@
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- macOS 15 and later hold back the local network until the user permits it, and LSL
+         resolves streams with UDP broadcast and multicast. Without this key the system
+         prompt gives no reason, and a refusal makes the viewer find no streams with
+         nothing to say why. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>LSL Viewer finds and reads Lab Streaming Layer streams on your local network.</string>
 </dict>
 </plist>
