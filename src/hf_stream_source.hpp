@@ -685,8 +685,8 @@ public:
     const lsl::stream_info& info() const { return info_; }      // for reclassify (rebuild as an HfStreamSource)
     int                channels() const { return channels_; }
 
-    std::size_t count() const { std::lock_guard<std::mutex> lk(mtx_); return total_; }
-    double firstTime() const { std::lock_guard<std::mutex> lk(mtx_); return firstT_; }  // 1st event seen (relative-time zero)
+    std::size_t count() const { std::lock_guard<std::mutex> lk(mtx_); return total_ - cleared_; }
+    double firstTime() const { std::lock_guard<std::mutex> lk(mtx_); return firstT_; }  // 1st event since the last clear (relative-time zero)
 
     // Events with display-time >= tmin (events_ is time-ordered). Bounds the per-frame
     // copy for long recordings — callers pass the oldest visible time.
@@ -735,6 +735,29 @@ public:
         for (auto it = events_.rbegin(); it != events_.rend() && it->t >= cutoff; ++it) ++cnt;
         return (double)cnt / window;
     }
+    // Drop every buffered event. Display only: the recorder pulls its own inlets, so a
+    // clear never touches what is being written to disk. INVALIDATES every reference
+    // returned by cachedEvents() / tailCached() and every pointer into their elements,
+    // so callers must not clear while a frame still holds one (main.cpp defers the log's
+    // Clear buttons to after the window's End()).
+    //
+    // total_ stays monotonic: it is the source of Event::seq, which the ERP epoch
+    // accumulator uses to skip events it already consumed, so rewinding it would replay
+    // old triggers.
+    //
+    // `rebaseTime` restarts the relative-time origin (firstT_) on the next event. Only
+    // valid when EVERY marker stream is cleared together: the log's relative-time origin
+    // is shared (the earliest firstTime() across streams), so re-basing one stream alone
+    // would shift the displayed times of the logs that kept their events.
+    void clear(bool rebaseTime = false) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        events_.clear();
+        cleared_ = total_;
+        if (rebaseTime) firstT_ = 0.0;
+        cached_.clear();  cachedSeen_ = total_;   // accurate for the (now empty) events_
+        tail_.clear();    tailSeen_   = total_;
+    }
+
     std::string        error()  const { std::lock_guard<std::mutex> lk(mtx_); return error_; }
     double staleSeconds() const {
         const double t = lastData_.load(std::memory_order_relaxed);
@@ -781,7 +804,7 @@ private:
                     if (!sample[c].empty()) text += ", " + sample[c];
 
                 std::lock_guard<std::mutex> lk(mtx_);
-                if (total_ == 0) firstT_ = ts + offset;   // stable zero for relative-time display
+                if (firstT_ == 0.0) firstT_ = ts + offset;   // stable zero for relative-time display (also after a clear)
                 events_.push_back({ts + offset, std::move(text), total_});  // seq = ordinal
                 ++total_;
                 if (events_.size() > kMaxEvents)              // keep memory bounded
@@ -805,8 +828,9 @@ private:
     std::size_t         cachedSeen_ = (std::size_t)-1;  // total_ when cached_ was built
     std::vector<Event>  tail_;           // render-thread snapshot (see tailCached)
     std::size_t         tailSeen_ = (std::size_t)-1, tailN_ = 0;  // total_/n when tail_ was built
-    std::size_t         total_ = 0;     // lifetime count (events_ is pruned)
-    double              firstT_ = 0.0;  // display time of the first event ever seen (relative-time zero)
+    std::size_t         total_ = 0;     // lifetime count (events_ is pruned); monotonic -> Event::seq
+    std::size_t         cleared_ = 0;   // total_ at the last clear(); count() reports events since then
+    double              firstT_ = 0.0;  // display time of the first event since a rebasing clear (relative-time zero)
     std::string         error_;
     std::atomic<double> lastData_{0.0};
     jthread        worker_;

@@ -1704,7 +1704,9 @@ int main(int argc, char** argv) {
 
 #ifdef LSL_VIEWER_TESTS
     const bool runTests = (argc > 1 && std::strcmp(argv[1], "--tests") == 0);
-    // Optional filter: `--tests <query>` runs only matching tests (e.g. "ui/capture_*").
+    // Optional filter: `--tests <query>` runs only matching tests. The query is a
+    // case-insensitive SUBSTRING of the test name or its category, not a path:
+    // "capture" and "ui" match, "ui/capture_fft" matches nothing; "-capture" excludes.
     const char* testFilter = (runTests && argc > 2) ? argv[2] : nullptr;
     ImGuiTestEngine* engine = ImGuiTestEngine_CreateContext();
     ImGuiTestEngineIO& tio = ImGuiTestEngine_GetIO(engine);
@@ -2738,7 +2740,7 @@ int main(int argc, char** argv) {
                         const char* act = m ? "click to open its events \xc2\xb7 right-click to disconnect"
                                           : recorder.active() ? "stop recording to change streams"
                                           : "click to connect";
-                        if (m) ImGui::SetTooltip("%s  (host: %s)\n%zu events total \xc2\xb7 overlay on"
+                        if (m) ImGui::SetTooltip("%s  (host: %s)\n%zu events \xc2\xb7 overlay on"
                                                  " the time-series plots (toggle per plot)\n%s",
                                                  fi.uid.c_str(), fi.hostname.c_str(), m->count(), act);
                         else   ImGui::SetTooltip("%s  (host: %s)\n%s",
@@ -3594,22 +3596,44 @@ int main(int argc, char** argv) {
             if (showMarkers) {
                 if (focusMarkers) { ImGui::SetNextWindowFocus(); focusMarkers = false; }
                 ImGui::SetNextWindowDockID(dockBottom, dockCond);
+                MarkerSource* clearReq = nullptr;   // applied after End(): see the Clear buttons below
+                bool clearAllReq = false;
                 if (ImGui::Begin("Marker events", &showMarkers)) {
+                    // ---- left config strip (like the other views); the per-stream logs fill the right.
+                    // Sized to its widest control (a checkbox + label) rather than the 230 px the plot
+                    // views use: these are all short toggles, and the logs want the width.
+                    {
+                        const ImGuiStyle& st = ImGui::GetStyle();
+                        const float cfgW = ImGui::CalcTextSize("Lock scroll to time").x
+                                         + ImGui::GetFrameHeight() + st.ItemInnerSpacing.x + 2.0f * st.WindowPadding.x;
+                        ImGui::BeginChild("cfg", ImVec2(cfgW, 0), ImGuiChildFlags_Borders);
+                    }
                     ImGui::Checkbox("Relative time", &markersRelTime);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Show t as seconds since the first event across ALL marker streams\n"
                                           "(a shared origin, so the same instant reads the same in every log),\n"
                                           "else the absolute LSL clock.");
-                    ImGui::SameLine();
                     ImGui::Checkbox("Lock scroll to time", &markerLockScroll);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Scrolling one log scrolls the others to the nearest timestamp.");
-                    ImGui::SameLine();
-                    ImGui::SetNextItemWidth(uiScaled(110));
+                    ImGui::SetNextItemWidth(uiScaled(80));
                     if (ImGui::DragInt("Depth", &markerDepth, 5.0f, 20, 20000))
                         markerDepth = std::clamp(markerDepth, 20, 20000);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Number of recent events kept per stream.");
+                    if (!markerSources.empty()) {
+                        // Display-only: the recorder pulls its own inlets, so clearing the log
+                        // never drops anything from a running recording.
+                        if (ImGui::Button("Clear all")) clearAllReq = true;
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Discard the buffered events of every marker stream and\n"
+                                              "restart relative time. Affects this log and the plot\n"
+                                              "overlays only; a running recording is written from\n"
+                                              "separate inlets and is untouched.");
+                    }
+                    ImGui::EndChild();   // cfg
+                    ImGui::SameLine();
+                    ImGui::BeginChild("logs", ImVec2(0, 0));   // fills the rest; scrolls the headers
                     if (markerSources.empty())
                         ImGui::TextDisabled("Connect a marker stream (string / \"Markers\"-typed) to see its events here.");
                     // Shared relative-time origin: the earliest first event across every marker
@@ -3654,6 +3678,14 @@ int main(int argc, char** argv) {
                                 ImGui::SetClipboardText(csv.c_str());
                             }
                             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy these events to the clipboard as CSV.");
+                            ImGui::SameLine();
+                            // Deferred to the end of the frame: `evs` and the plot overlays alias
+                            // this source's caches, which clear() rebuilds.
+                            if (ImGui::SmallButton("Clear")) clearReq = &mk;
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Discard this stream's buffered events (display only).\n"
+                                                  "Relative time keeps the shared origin, so the other\n"
+                                                  "logs' timestamps do not move.");
                             constexpr auto tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg
                                               | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
                             if (ImGui::BeginTable("evs", 4, tf, ImVec2(0, uiScaled(200)))) {
@@ -3722,8 +3754,16 @@ int main(int argc, char** argv) {
                         }
                         ImGui::PopID();
                     }
+                    ImGui::EndChild();   // logs
                 }
                 ImGui::End();
+                // Only a full clear rebases relative time (see MarkerSource::clear). Either way
+                // resume following the newest row: a pinned lock-scroll anchor is an absolute time
+                // now older than every remaining event, which would strand each log on its first
+                // post-clear row.
+                if (clearAllReq || clearReq) markerFollowLatest = true;
+                if (clearAllReq) for (auto& msp : markerSources) msp->clear(/*rebaseTime=*/true);
+                else if (clearReq) clearReq->clear();
                 markerReveal = nullptr;   // one-shot: consumed whether or not the window was open
             }
 

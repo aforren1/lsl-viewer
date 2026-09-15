@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>   // strstr
 #include <mutex>
 #include <string>
 #include <thread>
@@ -327,6 +328,72 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->Yield(2);
         ctx->SetRef("//Streams");                  // Performance is a section in the rail now
         IM_CHECK(ctx->ItemExists("VSync"));
+    };
+
+    // Marker log "Clear" buttons: the clear is deferred to the end of the frame (the log
+    // rows and the plot overlays alias the source caches clear() rebuilds), so this drives
+    // both buttons and checks the events are actually gone after each.
+    //
+    // Like the capture tests, it needs streams and SKIPS without them: run it with the
+    // demo emitter (LSL_DEMO=1 ./lsl_viewer --tests marker_clear) or the mock script
+    // (python tools/lsl_test_streams.py --streams evoked). It deliberately does NOT switch
+    // the emitter on itself: connected stream windows outlive the emitter, so a test that
+    // started it would leave every later capture test finding streams and running instead
+    // of skipping.
+    t = IM_REGISTER_TEST(e, "ui", "marker_clear");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        // The stream header reads "<name>  .  N events  .  R/s" and is the only observable
+        // the test engine can read back; DebugLabel truncates at 32 chars, so a long stream
+        // name can cut the count off (-> -1, the test then skips its checks).
+        auto headerCount = [](ImGuiTestContext* c) -> int {
+            ImGuiTestItemInfo hi = c->ItemInfo("**/###mk");
+            const char* end = strstr(hi.DebugLabel, " events");
+            if (end == nullptr) return -1;
+            const char* begin = end;
+            while (begin > hi.DebugLabel && begin[-1] >= '0' && begin[-1] <= '9') begin--;
+            return (begin == end) ? -1 : atoi(begin);
+        };
+        ctx->SleepNoSkip(6.0f, 1.0f / 30.0f);          // discovery + autoconnect + a few markers
+        ctx->MenuCheck("//##MainMenuBar/View/Marker events");
+        ctx->Yield(2);
+        ctx->SetRef("//Marker events");
+        // Controls sit in the left "cfg" child window: reach them with the **/ wildcard.
+        if (!ctx->ItemExists("**/Clear all")) { ctx->LogInfo("no marker stream connected; skip"); return; }
+        ctx->ItemOpen("**/###mk");                     // first stream's log (collapsed by default)
+        ctx->Yield(2);
+
+        // Markers keep arriving (the demo emits ~1/s), so the count is only momentarily 0:
+        // assert the drop, not an exact zero.
+        const int beforeOne = headerCount(ctx);
+        ctx->ItemClick("**/Clear");                    // per-stream clear
+        ctx->Yield(3);
+        const int afterOne = headerCount(ctx);
+        ctx->LogInfo("per-stream clear: %d -> %d events", beforeOne, afterOne);
+        IM_CHECK(ctx->ItemExists("**/Clear all"));        // window survived the deferred clear
+        if (beforeOne > 1) IM_CHECK(afterOne < beforeOne);
+
+        ctx->SleepNoSkip(3.0f, 1.0f / 30.0f);          // let the log fill again
+        const int beforeAll = headerCount(ctx);
+        ctx->ItemClick("**/Clear all");
+        ctx->Yield(3);
+        const int afterAll = headerCount(ctx);
+        ctx->LogInfo("clear all: %d -> %d events", beforeAll, afterAll);
+        IM_CHECK(ctx->ItemExists("**/Clear all"));
+        if (beforeAll > 1) IM_CHECK(afterAll < beforeAll);
+    };
+
+    // Marker events log: left controls strip + one expanded per-stream log. Needs a marker
+    // stream (demo emitter or the mock script); skips without one, like the other captures.
+    t = IM_REGISTER_TEST(e, "ui", "capture_markers");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SleepNoSkip(6.0f, 1.0f / 30.0f);          // discovery + autoconnect + a few markers
+        ctx->MenuCheck("//##MainMenuBar/View/Marker events");
+        ctx->Yield(2);
+        ctx->SetRef("//Marker events");
+        if (!ctx->ItemExists("**/Clear all")) { ctx->LogInfo("no marker stream connected; skip"); return; }
+        ctx->ItemOpen("**/###mk");
+        ctx->Yield(3);
+        ctx->CaptureScreenshotWindow("//Marker events", ImGuiCaptureFlags_HideMouseCursor);
     };
 
     // Screen capture of the browser + performance overlay (SDL_GPU readback).
