@@ -93,9 +93,13 @@ FetchContent_Declare(liblsl
 
 # --- Dear ImGui (docking branch) --------------------------------------------
 # imgui ships no CMakeLists by design; we build the sources we need below.
+# Pinned to a docking release tag. imgui, implot and the test engine are pinned as a set: the
+# test engine tracks imgui internals, so a floating branch on any of them can break the build
+# without a change here (2026-09-14: test engine main added ImMin(int, unsigned) calls that
+# GCC/Clang reject). Bump the three together.
 FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
-  GIT_TAG        docking
+  GIT_TAG        v1.92.9b-docking
   GIT_SHALLOW    TRUE
   # Force the SDL_GPU backend to use MSL source instead of its macOS-14-only .metallib, so the
   # viewer renders on macOS 11–13. See cmake/patch_imgui_msl.cmake for the full why.
@@ -105,8 +109,9 @@ FetchContent_Declare(imgui
 # --- ImPlot -----------------------------------------------------------------
 FetchContent_Declare(implot
   GIT_REPOSITORY https://github.com/epezent/implot.git
-  GIT_TAG        master
-  GIT_SHALLOW    TRUE
+  GIT_TAG        7eeb9168d2e5e6b14e266d8782ecf7e649dfc3a4   # master @ 2026-06-08
+  # No GIT_SHALLOW: a depth-1 clone only has the branch tip, so a commit-hash pin fails to
+  # check out once upstream moves on. (Tags are fine shallow; hashes are not.)
 )
 
 # --- spdlog (logging) -------------------------------------------------------
@@ -146,8 +151,8 @@ endif()
 if(LSL_VIEWER_TESTS)
   FetchContent_Declare(imgui_test_engine
     GIT_REPOSITORY https://github.com/ocornut/imgui_test_engine.git
-    GIT_TAG        main
-    GIT_SHALLOW    TRUE
+    GIT_TAG        fdc1cb0930fa9bc2bef1d884bf2c10b570d29170   # main @ 2026-08-07, matches v1.92.9b
+    # No GIT_SHALLOW: commit-hash pin (see implot above).
   )
 endif()
 

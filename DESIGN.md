@@ -156,8 +156,9 @@ before treating any detail as current.
 - **Marker / irregular streams** — detected via `cf_string` / `nominal_srate() == 0`, with a
   separate marker path (`MarkerSource`) and a sample-and-hold path for irregular numeric streams.
 - **FFT / spectrogram** — KissFFT (`src/fft.hpp`), rate-limited recompute, STFT spectrogram.
-- **Build / platform** — pinned `GIT_TAG`s (SDL3 `release-3.4.x`, liblsl tagged) and a
-  ubuntu / macos / windows CI matrix.
+- **Build / platform** — every FetchContent dependency pinned to a tag or commit (SDL3
+  `release-3.4.x`, liblsl tagged, imgui docking tag + matching implot / test engine commits)
+  and a ubuntu / macos / windows CI matrix.
 
 Not yet built: the multi-level min/max pyramid (only one `B` level exists; a scrolling view
 still translates bins without re-scanning, so this is a zoom-range refinement, not a gap).
