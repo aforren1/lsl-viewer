@@ -23,8 +23,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux,         os: ubuntu-latest,    gen: Ninja,                   bindir: build,         ext: "" }
-          - { name: linux-aarch64, os: ubuntu-24.04-arm, gen: Ninja,                   bindir: build,         ext: "" }
+          # Linux is pinned to 22.04 (not -latest): the portable binary links the runner's glibc
+          # and libstdc++ (linuxdeploy-style blacklist, nothing bundled), so the runner sets the
+          # floor. 24.04 needs GLIBC_2.38 / GLIBCXX_3.4.32, which Debian 12 (2.36 / 3.4.30) lacks.
+          # 22.04 needs 2.34 / 3.4.30, the same floor as the AppImage job below.
+          - { name: linux,         os: ubuntu-22.04,     gen: Ninja,                   bindir: build,         ext: "" }
+          - { name: linux-aarch64, os: ubuntu-22.04-arm, gen: Ninja,                   bindir: build,         ext: "" }
           - { name: macos,         os: macos-latest,     gen: Ninja,                   bindir: build,         ext: "" }
           - { name: windows,       os: windows-2022,     gen: "Visual Studio 17 2022", bindir: build/Release, ext: ".exe" }
     steps:

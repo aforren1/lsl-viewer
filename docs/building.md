@@ -23,8 +23,9 @@ grab them from the run's **Artifacts**:
   be fully static (it needs the host's GPU driver + display libraries at runtime), which is why
   only the recorder ships this way.
 
-The per-OS `lsl-viewer-linux` artifact is built on the latest Ubuntu (newer glibc); for
-broad Linux portability prefer the AppImage (viewer) or the musl `xdf_record` (recorder).
+The per-OS `lsl-viewer-linux` artifact and the AppImage are both built on Ubuntu 22.04, so
+both need glibc 2.34 and `GLIBCXX_3.4.30` (GCC 12) or newer on the host: Ubuntu 22.04,
+Debian 12, Fedora 35, RHEL 9, and later. For older hosts only the musl `xdf_record` runs.
 
 None of the artifacts are code-signed, so first launch trips Gatekeeper on macOS
 (right-click → Open, or `xattr -dr com.apple.quarantine "LSL Viewer.app"`) and SmartScreen
