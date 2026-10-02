@@ -27,6 +27,8 @@ Where the firewall can match on the program (Windows and macOS), permit the prog
 
 The installer has a **Windows Firewall** task, which is selected by default. It adds one inbound allow rule for `lsl_viewer.exe` and one for `xdf_record.exe`, for the private and domain profiles. A second, cleared checkbox adds the public profile too. The uninstaller deletes the rules.
 
+Before it adds the rules, the installer deletes all inbound rules for the two installed executables. This includes the block rules that the Windows prompt creates, thus a reinstall repairs a machine where a user selected **Cancel** on the prompt. It also deletes a rule that you added by hand for these paths. The installer does this also when you clear the task, thus an upgrade with the task cleared removes the rules of the earlier version.
+
 The task exists because the alternative is worse. With no rule, the first launch raises the "Windows Defender Firewall has blocked some features" prompt. A user who selects **Cancel**, or who cannot supply administrator credentials, gets a block rule that stays on the machine. The viewer then starts correctly but finds no streams, and nothing tells you why.
 
 For an unattended install, use `/TASKS=""` to clear the task:

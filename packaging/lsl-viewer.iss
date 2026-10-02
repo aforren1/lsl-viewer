@@ -55,12 +55,20 @@ Name: "{group}\Uninstall LSL Viewer"; Filename: "{uninstallexe}"
 [Run]
 ; Delete before add, because `netsh ... add rule` appends a duplicate rather than replacing,
 ; and an upgrade over an existing install would otherwise accumulate one rule per version.
+; The deletes run whether or not the task is selected, so that clearing the task on an upgrade
+; removes the rules an earlier version added instead of leaving them until uninstall.
+; The by-program deletes also remove the rules that the Defender prompt created (named after
+; the file, not FwRuleViewer). A Cancel on that prompt leaves a block rule, and a block rule
+; wins over our allow rule, so without this a reinstall would not repair the case the task
+; exists for. The cost is that a hand-made rule for these exact paths goes too.
 ; A delete that matches nothing exits nonzero; Inno does not check [Run] exit codes, so that
 ; is harmless. The rules name the program and set no `protocol=`, thus they cover TCP and UDP
 ; on every port: liblsl uses a port range, and the control listener can fall back to an
 ; ephemeral port, so a port-scoped rule would be wrong.
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FwRuleViewer}"""; Flags: runhidden; Tasks: firewall
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FwRuleRecord}"""; Flags: runhidden; Tasks: firewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FwRuleViewer}"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FwRuleRecord}"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all program=""{app}\{#MyAppExe}"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all program=""{app}\{#MyAppRecExe}"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FwRuleViewer}"" dir=in action=allow enable=yes profile={code:FwProfiles} program=""{app}\{#MyAppExe}"""; Flags: runhidden; Tasks: firewall; StatusMsg: "Adding Windows Firewall rules..."
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FwRuleRecord}"" dir=in action=allow enable=yes profile={code:FwProfiles} program=""{app}\{#MyAppRecExe}"""; Flags: runhidden; Tasks: firewall; StatusMsg: "Adding Windows Firewall rules..."
 Filename: "{app}\{#MyAppExe}"; Description: "Launch LSL Viewer"; Flags: nowait postinstall skipifsilent
@@ -68,6 +76,8 @@ Filename: "{app}\{#MyAppExe}"; Description: "Launch LSL Viewer"; Flags: nowait p
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FwRuleViewer}"""; Flags: runhidden; RunOnceId: "DelFwViewer"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FwRuleRecord}"""; Flags: runhidden; RunOnceId: "DelFwRecord"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all program=""{app}\{#MyAppExe}"""; Flags: runhidden; RunOnceId: "DelFwViewerProg"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all program=""{app}\{#MyAppRecExe}"""; Flags: runhidden; RunOnceId: "DelFwRecordProg"
 
 [Code]
 function FwProfiles(Param: String): String;

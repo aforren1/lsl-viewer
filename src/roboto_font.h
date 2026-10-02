@@ -1,4 +1,4 @@
-// Roboto-Regular, Apache-2.0 (Google) — embedded for cross-platform UI text.
+// Roboto-Regular 3.009, OFL-1.1 (The Roboto Project Authors), embedded for cross-platform UI text.
 // Generated from assets/fonts/Roboto-Regular.ttf via imgui binary_to_compressed_c.
 // Tracy uses this same face; we render it at ~15px (DPI-scaled).
 #pragma once

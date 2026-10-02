@@ -5,7 +5,7 @@
 
 #include "imgui.h"
 #include "implot.h"
-#include "roboto_font.h"   // embedded Roboto-Regular (Apache-2.0)
+#include "roboto_font.h"   // embedded Roboto-Regular (OFL-1.1)
 
 #include <SDL3/SDL.h>
 #include <cmath>

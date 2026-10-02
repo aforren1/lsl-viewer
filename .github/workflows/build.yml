@@ -170,6 +170,9 @@ jobs:
           # so no PlistBuddy override is needed - one specification point (the tag).
           cp build/Info.plist "$APP/Contents/"
           cp lsl_viewer.icns "$APP/Contents/Resources/"
+          # Also inside the bundle: the copies at the dmg root stay behind once the app is
+          # dragged to /Applications, and the notices must travel with the binary.
+          cp LICENSE THIRD_PARTY_LICENSES "$APP/Contents/Resources/"
           mkdir dmgroot
           cp -R "$APP" dmgroot/
           ln -s /Applications dmgroot/Applications     # drag-to-install target
@@ -306,6 +309,9 @@ jobs:
         run: |
           mkdir -p dist
           cp build/xdf_record LICENSE THIRD_PARTY_LICENSES dist/
+          # musl is statically linked, so its MIT notice must ship too. Take it from the zig
+          # install so the text always matches the musl version that zig links.
+          cp "$(dirname "$ZIG")/lib/libc/musl/COPYRIGHT" dist/musl-COPYRIGHT
       - name: Attest build provenance
         if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v4
