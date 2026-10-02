@@ -62,6 +62,19 @@ uv run tools/lsl_test_streams.py --streams eeg,sine,chirp,markers,evoked
 uv run tools/lsl_test_streams.py --help          # all streams + tunables
 ```
 
+To test with real data, `tools/xdf_replay.py` replays an XDF recording. Each
+stream becomes a live outlet with the recorded metadata (including the full
+`<desc>`) and timestamps, and all streams keep their relative timing. The tool
+reads the file while it plays, so playback starts at once and memory use stays
+small, also for multi-GB files. Use `--list` to show the streams, `--streams`
+to replay only some of them, and `--start` to start at a time in the file:
+
+```bash
+uv run tools/xdf_replay.py rec.xdf --list
+uv run tools/xdf_replay.py rec.xdf --suffix _replay --loop
+uv run tools/xdf_replay.py rec.xdf --streams type:EEG,type:Markers --start 60 --duration 30
+```
+
 By default the viewer waits for you to connect streams from the **Streams** rail;
 set `LSL_AUTOCONNECT=1` to auto-connect everything it discovers.
 
@@ -164,6 +177,7 @@ src/                     the viewer — one translation unit + header-only modul
 
 tools/                   standalone helpers (not linked into the viewer)
   lsl_test_streams.py      synthetic LSL sources for testing
+  xdf_replay.py            replays an XDF recording as live LSL outlets
   xdf_record.cpp           headless XDF recorder CLI (no GUI deps)
 
 tests/                   Dear ImGui Test Engine UI tests + screenshot captures

@@ -334,6 +334,7 @@ struct DisplayOpts {
     bool  overlayYFit = true;              // overlay mode: auto-fit Y once (on entry / scale change), then free
     bool  synced      = false;             // pushed our filter/reference state to the source yet?
     bool  autoGainReq = false;             // transient: Auto-gain clicked; measure amplitude this frame (not persisted)
+    int   hlLocked    = -1;                // channel whose lane highlight was pinned by a label click (not persisted)
 };
 
 // ---- Workspace (de)serialization: DisplayOpts <-> a compact "k=v ..." payload --
@@ -451,6 +452,49 @@ static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap) 
         else { flush(cs, ce); cs = iv[i].first; ce = iv[i].second; }
     }
     flush(cs, ce);
+}
+
+// Y axis of the stacked + raster montages. Its limits are pinned every frame, so ImPlot's axis
+// menu and whole-axis hover tint do nothing useful; dropping them frees hover and right-click
+// for the per-lane highlight. NoSideSwitch keeps the labels on the left, where it draws them.
+constexpr ImPlotAxisFlags kLaneAxisFlags = ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_NoMenus |
+                                           ImPlotAxisFlags_NoHighlight | ImPlotAxisFlags_NoSideSwitch;
+
+// Lane-label highlight for the stacked + raster montages, whose channel names are Y ticks.
+// With many lanes, finding one trace by eye is slow; hovering its name lights it up, and a
+// click pins it so the mouse can go back to the data. Hover wins over the pin so other lanes
+// can still be previewed. Clicking the pinned name again, or right-clicking any name, releases
+// it (the Y axis must have ImPlotAxisFlags_NoMenus so that right-click is ours). Row j's center
+// is at y = c0 - j. Call after the Y ticks are set up, before plotting. Returns the visible
+// row to highlight, or -1.
+static int laneHighlightRow(DisplayOpts& o, const std::vector<int>& visIdx, int show, double c0) {
+    int hov = -1;
+    if (ImPlot::IsAxisHovered(ImAxis_Y1)) {
+        const int j = (int)std::lround(c0 - ImPlot::GetPlotMousePos(IMPLOT_AUTO, ImAxis_Y1).y);
+        if (j >= 0 && j < show) hov = j;
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) o.hlLocked = -1;
+        else if (hov >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            o.hlLocked = (o.hlLocked == visIdx[hov]) ? -1 : visIdx[hov];
+    }
+    if (hov >= 0) return hov;
+    for (int j = 0; j < show; ++j) if (visIdx[j] == o.hlLocked) return j;
+    return -1;   // pinned channel is hidden (or none): leave every lane undimmed
+}
+
+// Tint row j's Y tick label in its channel color. ImPlot has already drawn the tick text by
+// now, so it is drawn again on top of the tint to stay crisp (same spot ImPlot uses).
+static void drawLaneLabelHighlight(const char* label, int c, double c0, int j) {
+    const ImVec2 sz   = ImGui::CalcTextSize(label);
+    const float  padX = ImPlot::GetStyle().LabelPadding.x;
+    const float  xr   = ImPlot::GetPlotPos().x;
+    const float  cy   = ImPlot::PlotToPixels(ImPlot::GetPlotLimits().X.Min, c0 - j).y;
+    const ImVec2 txt(xr - padX - sz.x, cy - 0.5f * sz.y);
+    ImDrawList*  dl   = ImGui::GetWindowDrawList();
+    ImVec4 col = ImPlot::GetColormapColor(c);
+    col.w = 0.45f;
+    dl->AddRectFilled(ImVec2(txt.x - 3.0f, txt.y - 1.0f), ImVec2(xr - 1.0f, txt.y + sz.y + 1.0f),
+                      ImGui::ColorConvertFloat4ToU32(col), 3.0f);
+    dl->AddText(txt, ImGui::GetColorU32(ImGuiCol_Text), label);
 }
 
 // Overlay marker events on the current plot as vertical lines + labels. `evs` must be
@@ -915,8 +959,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     // meaningful overlay heatmap), so overlay mode below ignores it. Reuses the envelope.
     if (o.stacked && o.raster) {
         if (ImPlot::BeginPlot("##plot", ImVec2(uiScaled(-70), -1), ImPlotFlags_NoLegend)) {
-            ImPlot::SetupAxes("time (s)", nullptr,
-                              ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+            ImPlot::SetupAxes("time (s)", nullptr, ImPlotAxisFlags_None, kLaneAxisFlags);
             ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
             if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
             else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
@@ -928,6 +971,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 sc.tlabs[j] = sc.tstr[j].c_str();
             }
             ImPlot::SetupAxisTicks(ImAxis_Y1, sc.tvals.data(), show, sc.tlabs.data());
+            const double hlC0  = (double)show - 0.5;
+            const int    hlRow = laneHighlightRow(o, sc.visIdx, show, hlC0);
             const int px = std::max(64, (int)ImPlot::GetPlotSize().x);
             o.lastPlotPx = ImPlot::GetPlotSize().x;
 
@@ -965,6 +1010,15 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImPlot::PlotHeatmap("##r", sc.raster.data(), show, px, 0.0, 1.0, nullptr,
                                     ImPlotPoint(bMin, 0.0), ImPlotPoint(bMax, (double)show));
                 drawDropoutRed(s, 0.0, 0.0);
+                if (hlRow >= 0) {   // a heatmap row can't be dimmed per-row, so outline it instead
+                    const double yc = hlC0 - hlRow;
+                    ImPlot::PushPlotClipRect();
+                    ImPlot::GetPlotDrawList()->AddRect(ImPlot::PlotToPixels(bMin, yc + 0.5),
+                                                       ImPlot::PlotToPixels(bMax, yc - 0.5),
+                                                       IM_COL32_WHITE, 0.0f, 0, 2.0f);
+                    ImPlot::PopPlotClipRect();
+                    drawLaneLabelHighlight(sc.tlabs[hlRow], sc.visIdx[hlRow], hlC0, hlRow);
+                }
                 drawMarkers(sc.markers, /*contrast=*/true);   // over the heatmap fill
                 ImPlot::EndPlot();
                 ImGui::SameLine();
@@ -981,8 +1035,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     // ---- Stacked montage: one lane per visible channel, gain-scaled ----------
     if (o.stacked) {
         if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
-            ImPlot::SetupAxes("time (s)", nullptr,
-                              ImPlotAxisFlags_None, ImPlotAxisFlags_NoGridLines);
+            ImPlot::SetupAxes("time (s)", nullptr, ImPlotAxisFlags_None, kLaneAxisFlags);
             ImPlot::SetupAxisFormat(ImAxis_X1, fmtTimeAxis);
             if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
             else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
@@ -1004,6 +1057,20 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 sc.tlabs[j] = sc.tstr[j].c_str();
             }
             ImPlot::SetupAxisTicks(ImAxis_Y1, sc.tvals.data(), show, sc.tlabs.data());
+            const double hlC0  = (double)(show - 1);
+            const int    hlRow = laneHighlightRow(o, sc.visIdx, show, hlC0);
+            if (hlRow >= 0) {   // faint lane band under the traces + tinted label
+                const ImPlotRect lim = ImPlot::GetPlotLimits();
+                const double     yc  = hlC0 - hlRow;
+                ImVec4 bg = ImPlot::GetColormapColor(sc.visIdx[hlRow]);
+                bg.w = 0.10f;
+                ImPlot::PushPlotClipRect();
+                ImPlot::GetPlotDrawList()->AddRectFilled(ImPlot::PlotToPixels(lim.X.Min, yc + 0.5),
+                                                         ImPlot::PlotToPixels(lim.X.Max, yc - 0.5),
+                                                         ImGui::ColorConvertFloat4ToU32(bg));
+                ImPlot::PopPlotClipRect();
+                drawLaneLabelHighlight(sc.tlabs[hlRow], sc.visIdx[hlRow], hlC0, hlRow);
+            }
 
             const int    px     = std::max(64, (int)ImPlot::GetPlotSize().x);
             o.lastPlotPx = ImPlot::GetPlotSize().x;   // for next frame's edge snap
@@ -1032,6 +1099,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 const int   c    = sc.visIdx[j];
                 const float lane = (float)(show - 1 - j);
                 const float g    = gain[c] * inv;
+                const bool  dim  = hlRow >= 0 && j != hlRow;   // fade the rest so the highlight reads
                 if (useEnv) {
                     LSL_ZONE("envelope");
                     const int n = espan.n;
@@ -1049,7 +1117,10 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                         sc.mx[i] = lane + sc.mx[i] * g;
                     }
                     char id[12]; std::snprintf(id, sizeof(id), "##b%d", c);
-                    ImPlot::PlotShaded(id, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, bandSpec(c));
+                    ImPlotSpec sp = bandSpec(c);
+                    if (j == hlRow) sp.FillAlpha = 0.9f;
+                    else if (dim)   sp.FillAlpha = 0.2f;
+                    ImPlot::PlotShaded(id, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, sp);
                 } else {
                     LSL_ZONE("raw");
                     const int n = fillRaw(c, sc.x, sc.y);
@@ -1065,7 +1136,9 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                     }
                     for (int i = 0; i < n; ++i) sc.y[i] = lane + sc.y[i] * g;
                     char id[12]; std::snprintf(id, sizeof(id), "##l%d", c);
-                    ImPlot::PlotLine(id, sc.x.data(), sc.y.data(), n, lineSpec(c, o.lineWidth));
+                    ImPlotSpec sp = lineSpec(c, j == hlRow ? 2.0f * o.lineWidth : o.lineWidth);
+                    if (dim) sp.LineColor.w = 0.3f;
+                    ImPlot::PlotLine(id, sc.x.data(), sc.y.data(), n, sp);
                 }
             }
             if (o.autoGainReq) {   // apply measured amplitudes now that every visible lane has one

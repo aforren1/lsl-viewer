@@ -457,6 +457,43 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->CaptureScreenshotWindow("//MockEEG", ImGuiCaptureFlags_HideMouseCursor); // after
     };
 
+    // Lane-label highlight: hover a stacked-montage channel name, click to pin it, move to
+    // the data (pin holds), then right-click the names to release. One capture per state.
+    t = IM_REGISTER_TEST(e, "ui", "capture_lane_highlight");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SleepNoSkip(2.5f, 1.0f / 30.0f);
+        if (ctx->GetWindowByRef("//MockEEG") == nullptr) {
+            ctx->LogInfo("MockEEG not present; skipping");
+            return;
+        }
+        ctx->WindowFocus("//MockEEG"); ctx->Yield(2);   // bring the docked tab forward
+        ImGuiTestItemInfo cfg = ctx->WindowInfo("//MockEEG/cfg");
+        ImGuiTestItemInfo plt = ctx->WindowInfo("//MockEEG/plt");
+        if (cfg.Window == nullptr || plt.Window == nullptr) { ctx->LogInfo("no cfg/plt child; skipping"); return; }
+        ctx->SetRef(cfg.Window);
+        ctx->ItemOpen("Display");
+        ctx->ItemCheck("Stacked montage");
+        ctx->SleepNoSkip(2.0f, 1.0f / 30.0f);
+
+        // Labels sit just inside the plot child's left edge; aim at the third lane from the top.
+        const ImVec2 p = plt.Window->Pos, sz = plt.Window->Size;
+        const ImVec2 label(p.x + 22.0f, p.y + 10.0f + (sz.y - 50.0f) * (2.5f / 16.0f));
+        ctx->MouseMoveToPos(label); ctx->Yield(3);
+        ctx->CaptureScreenshotWindow("//MockEEG", 0);                                // hover
+        ctx->MouseClick(ImGuiMouseButton_Left);
+        ctx->MouseMoveToPos(ImVec2(p.x + sz.x * 0.6f, p.y + sz.y * 0.7f)); ctx->Yield(3);
+        ctx->CaptureScreenshotWindow("//MockEEG", 0);                                // pinned
+        ctx->MouseMoveToPos(label);
+        ctx->MouseClick(ImGuiMouseButton_Right);
+        ctx->MouseMoveToPos(ImVec2(p.x + sz.x * 0.6f, p.y + sz.y * 0.7f)); ctx->Yield(3);
+        ctx->CaptureScreenshotWindow("//MockEEG", 0);                                // released
+
+        ctx->SetRef(cfg.Window); ctx->ItemCheck("**/Raster"); ctx->Yield(3);
+        ctx->MouseMoveToPos(label); ctx->Yield(3);
+        ctx->CaptureScreenshotWindow("//MockEEG", 0);                                // raster hover
+        ctx->ItemUncheck("**/Raster");
+    };
+
     // Channel-list pattern filter: typing "EOG" should leave only EOG* channels.
     t = IM_REGISTER_TEST(e, "ui", "capture_chanfilter");
     t->TestFunc = [](ImGuiTestContext* ctx) {

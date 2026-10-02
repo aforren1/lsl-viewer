@@ -16,6 +16,7 @@ To try all the views without an external source, launch the application and sele
 
 - A stacked montage that gives each channel its own named lane, or a shared-axis overlay. Each channel has a gain control, and there is an auto-fit.
 - A raster/heatmap mode for high channel counts (32 to 256 or more), where single line traces become too thin to read.
+- To find one channel quickly, hover over its name in the stacked montage or raster. The viewer highlights its lane. Click the name to keep the highlight. To remove it, click the name again or right-click a channel name.
 - A pause control, to examine a frozen window.
 - Dropouts show as gaps on the real timeline. The viewer does not join the data across the missing span.
 - **Lock time axes** (Tools menu) applies one time window to all stream plots. The plots stay aligned, and they pan and zoom together. If a plot becomes difficult to read, **Reset view** in its panel puts it back to the default framing.
