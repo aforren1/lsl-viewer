@@ -1685,7 +1685,10 @@ int main(int argc, char** argv) {
             base = (s == std::string::npos) ? std::string() : p.substr(0, s + 1);
         } else if (const char* bp = SDL_GetBasePath()) { base = bp; }   // SDL-owned, don't free
 
-        const bool portable = std::getenv("LSL_PORTABLE") != nullptr ||
+        // A test run must not write into the user's real workspaces, recordings or settings,
+        // and must not inherit a layout or path from them either.
+        const bool testRun  = argc > 1 && std::strcmp(argv[1], "--tests") == 0;
+        const bool portable = testRun || std::getenv("LSL_PORTABLE") != nullptr ||
                               (!base.empty() && std::filesystem::exists(base + "portable.txt"));
         if (portable && !base.empty()) {
             prefBase   = base + "lsl_viewer_data/";
@@ -1697,6 +1700,7 @@ int main(int argc, char** argv) {
             else if (const char* home = SDL_GetUserFolder(SDL_FOLDER_HOME))  recDefault = std::string(home) + "lsl-recordings";
         }
         if (!prefBase.empty()) { iniPath = prefBase + "imgui.ini"; io.IniFilename = iniPath.c_str(); }
+        if (testRun) io.IniFilename = nullptr;
     }
 
     loadEmbeddedFont(io);   // embedded Roboto, HiDPI-crisp (see theme.hpp)
@@ -2486,24 +2490,14 @@ int main(int argc, char** argv) {
                 // state from before it.
                 static double lastPublish = -1e18;
                 if (dueEvery(lastPublish, 0.25) || applied) {
-                    std::string s;
-                    for (auto& fi : found) {
-                        char ln[320];
-                        std::snprintf(ln, sizeof(ln), "%s | %s | %s | %dch | %s%s\n",
-                                      fi.key.c_str(), fi.name.c_str(), fi.type.c_str(),
-                                      fi.channels,
-                                      fi.srate > 0 ? std::to_string((int)fi.srate).c_str() : "irregular",
-                                      connected(fi) ? "  [rec]" : "");
-                        s += ln;
-                    }
-                    rcState.streamsText = s;
-                    const std::string fnow = recorder.active() ? recorder.path() : recFullPath();
-                    char st[420];
-                    std::snprintf(st, sizeof(st),
-                                  "recording=%s file=%s seconds=%.1f streams=%d bytes=%llu",
-                                  recorder.active() ? "true" : "false", fnow.c_str(), recorder.seconds(),
-                                  recorder.streams(), (unsigned long long)recorder.bytes());
-                    rcState.statusText = st;
+                    // Rebuilt in place, so the strings keep their capacity from one publish to the next.
+                    rcState.streamsText.clear();
+                    for (auto& fi : found)
+                        rc_append_stream_line(rcState.streamsText, fi.key, fi.name, fi.type,
+                                              fi.channels, fi.srate, connected(fi));
+                    rc_status_text(rcState.statusText, recorder.active(), recorder.seconds(),
+                                   recorder.streams(), recorder.bytes(),
+                                   recorder.active() ? recorder.path() : recFullPath());
                     rcState.recording  = recorder.active();
                     // Expose the last recording for `get` only once it's fully flushed/closed;
                     // closePending tells a stop-then-get client to wait for that instead of
@@ -2512,11 +2506,8 @@ int main(int argc, char** argv) {
                     rcState.closePending = closing;
                     rcState.lastFile = (!recorder.active() && recorder.fileFlushed() && !recorder.path().empty())
                                        ? recorder.path() : std::string();
-                    rcState.selectedText = [&]{
-                        std::string j;
-                        for (auto& fi : found) if (connected(fi)) j += fi.key + " ";
-                        return j.empty() ? std::string("none") : j;
-                    }();
+                    rcState.selectedText.clear();
+                    for (auto& fi : found) if (connected(fi)) rc_append_line(rcState.selectedText, fi.key);
                 }
                 if (applied) rcState.cv.notify_all();   // after publishing, so the reply implies fresh state
             }

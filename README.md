@@ -58,7 +58,7 @@ You can apply the filter stages in any combination. The spectrum, spectrogram, a
 - A docking layout. The Streams rail is on the left. The plots and the analysis windows are tabs that you arrange.
 - Saved workspaces. A workspace holds the current view: the filters, channels, and gains for each stream, the open analysis windows, and the dock layout. When you load a workspace, the viewer reconnects the streams that the workspace refers to (matched on source ID and name) and lists the streams that are not on the network. It holds the recording until those streams connect or you dismiss the notice.
 - Information for each stream: type, source ID, channels, sensor positions, and live counters for the measured rate, the clock offset, and the dropouts.
-- TCP remote control of the recording. See [Remote control](#remote-control).
+- TCP remote control of the recording, with client libraries for Python, MATLAB, and Octave. See [Remote control](#remote-control).
 - A light theme and a dark theme. The viewer keeps the layout between sessions.
 
 ## Remote control
@@ -67,91 +67,90 @@ Enable a control port from the Recording panel, or with `LSL_RC_PORT=22345`. A c
 
 The port binds to loopback (127.0.0.1) only. There is no authentication. To use the port from a different machine, turn on **Allow LAN access** in the Recording panel, or set `LSL_RC_BIND=all`. Use trusted networks only. Up to four clients can connect at the same time.
 
-| Command | Effect |
-|---|---|
-| `streams` | Lists the streams that LSL can resolve, one per line: `key \| name \| type \| Nch \| rate`. The first field is the key. If there are no streams, the reply is `(none)`. |
-| `selected` | Shows the keys that are connected. These streams are the ones that get recorded. |
-| `select all\|none\|<k1,k2,...>` | Selects the streams to connect and record. Each `key` is an identifier from `streams`. If a key is not a stream that the viewer can see, the viewer refuses the whole command. The command is also refused during a recording, because the set is locked until `stop`. |
-| `set <subject\|session\|task\|run\|acq\|modality> <value>` | Fills one field of the filename template. |
-| `filename <path>` | Sets the output path or template directly. |
-| `start [path]` and `stop` | Start and stop the recording. |
-| `get` | Sends the last completed recording to the client: a header line `OK <bytes> <name>`, then `<bytes>` of raw XDF. |
-| `status` | Shows the recording state, the file, the seconds, the megabytes, and the streams. |
-| `help` and `quit` | List the commands, and close the connection. |
+### Client libraries
 
-Each reply is one line, and it starts with `ok:` or `error:`. The exceptions are `streams`, which gives one line for each stream, and `get`, which gives a header line and then raw data.
+Use a client library instead of a raw socket. The libraries read the replies correctly, give an error when the viewer refuses a command, and copy a recording to your machine.
 
-The `select`, `start`, and `stop` commands must go through the viewer. They do not reply until the viewer has done the work, thus the reply gives the result: `ok: recording -> /path/file.xdf`, or `error: no streams connected`. A `status` that comes after such a reply always shows the new state. If the viewer does not answer in 2 seconds, the reply is `error: the viewer did not respond`, and the command is discarded.
+- **Python:** [clients/python](clients/python/README.md). One file with no dependencies. Copy `lsl_viewer_rc.py` into your project, or install it:
 
-Thus a script can find the streams on the network, select the streams it wants, fill the BIDS fields, and record. The same process that runs the experiment can do all of this:
+  ```sh
+  uv pip install "git+https://github.com/aforren1/lsl-viewer#subdirectory=clients/python"
+  ```
+
+- **MATLAB and GNU Octave:** [clients/matlab](clients/matlab/README.md). The same code runs in MATLAB R2019b or later and in Octave 6 or later. Add `clients/matlab` to the path.
+
+A script finds the streams, selects the streams it wants, fills the BIDS fields, records, and copies the file:
 
 ```python
-import socket
+import lsl_viewer_rc as rc
 
-def cmd(sock, line):
-    sock.sendall((line + "\n").encode())
-    return sock.recv(8192).decode().strip()
-
-with socket.create_connection(("localhost", 22345)) as rc:
-    print(cmd(rc, "streams"))
-    #   mock-eeg            | MockEEG           | EEG     | 32ch | 500
-    #   mock-evoked-markers | MockEvokedMarkers | Markers |  1ch | 0
-    #   mock-audio          | MockAudio         | Audio   |  2ch | 48000
-
-    # Record the EEG and its markers only. The keys come from the `streams` list.
-    # A key that the viewer cannot see makes this fail, thus a typo cannot
-    # silently give you a recording with fewer streams than you asked for.
-    print(cmd(rc, "select mock-eeg,mock-evoked-markers"))   # -> ok: connected 2 stream(s)
-    print(cmd(rc, "selected"))                 # -> mock-eeg mock-evoked-markers
-
-    settings = {"subject": "01",
-                "session": "01",
-                "task": "posner",
-                "run": "1"}
-
-    for field, val in settings.items():
-        cmd(rc, f"set {field} {val}")          # -> sub-01/ses-01/eeg/sub-01_..._eeg.xdf
-
-    # `start` returns when the file is open, thus this catches a bad path or an
-    # empty selection before the experiment runs.
-    reply = cmd(rc, "start")
-    if reply.startswith("error"):
-        raise RuntimeError(reply)
+with rc.Client("127.0.0.1", 22345) as viewer:
+    keys = [s.key for s in viewer.streams() if s.type in ("EEG", "Markers")]
+    viewer.select(keys)                 # An unknown key makes the viewer refuse all of them.
+    viewer.set(subject="01", session="01", task="posner", run=1)
+    viewer.start()                      # Returns when the file is open.
     # Present the stimuli, and push the markers through LSL.
-    cmd(rc, "stop")
-    print(cmd(rc, "status"))
+    viewer.stop()
+    viewer.get("data/")                 # Copy the .xdf file to this machine.
 ```
 
-After `stop`, the `get` command sends the completed `.xdf` file back on the same connection. This is useful when the viewer runs on the acquisition machine and the analysis runs on a different machine. The command waits up to 3 seconds for the viewer to flush the file, thus a script can call `get` directly after `stop`.
-
-```python
-def fetch(rc, dest):
-    rc.sendall(b"get\n")
-    buf = b""
-    while b"\n" not in buf:                      # Read the "OK <bytes> <name>" header line.
-        buf += rc.recv(4096)
-    head, _, body = buf.partition(b"\n")
-    tag, size, _name = head.split(maxsplit=2)
-    if tag != b"OK":
-        raise RuntimeError(head.decode())
-    size = int(size)
-    while len(body) < size:                      # Then read exactly <bytes> of raw XDF.
-        body += rc.recv(1 << 16)
-    open(dest, "wb").write(body[:size])
+```matlab
+rc = lslrc.Client('127.0.0.1', 22345);
+st = rc.streams();
+rc.select({st(strcmp({st.type}, 'EEG')).key});
+rc.set('subject', '01');
+rc.start();
+% Present the stimuli here.
+rc.stop();
+rc.get(pwd);                        % A folder: the file keeps its name.
+rc.close();
 ```
+
+### Protocol
+
+Read this section if you write a client for a different language. The libraries above follow these rules.
+
+| Command | Reply |
+|---|---|
+| `streams` | Lists the streams that LSL can resolve. The header is `ok: <N> streams`. Then come N lines, one for each stream: `key \| name \| type \| <C>ch \| <rate>`. The rate is an integer or `irregular`. A connected stream has `  [rec]` at the end of its line. The first field is the key. |
+| `selected` | Lists the keys that are connected. These streams are the ones that get recorded. The header is `ok: <N> selected`. Then come N lines, one key on each line. |
+| `select all\|none\|<k1,k2,...>` | Selects the streams to connect and record. Each `key` is an identifier from `streams`. If a key is not a stream that the viewer can see, the viewer refuses the whole command. The command is also refused during a recording, because the set is locked until `stop`. |
+| `set <subject\|session\|task\|run\|acq\|modality> <value>` | Fills one field of the filename template. The reply is `ok`. |
+| `filename <path>` | Sets the output path or template directly. The reply is `ok`. |
+| `start [path]` and `stop` | Start and stop the recording. |
+| `get` | Sends the last completed recording to the client. The header is `ok: <bytes> <name>`. Then come exactly `<bytes>` of raw XDF. |
+| `status` | Shows the recording state on one line: `ok: recording=<true\|false> seconds=<s> streams=<n> bytes=<n> file=<path>`. |
+| `help` | Lists the commands. The header is `ok: <N> lines`. Then come N lines of text. |
+| `quit` | Closes the connection. The reply is `bye`. |
+
+The viewer uses protocol 2. When a client connects, the viewer sends one line: ``ok: lsl-viewer remote control, protocol 2. type `help`.`` Read the version from the text `protocol <N>`. If the line does not have this text, the viewer is too old for a protocol 2 client. If four clients are already connected, the viewer sends `error: too many control clients`, and then closes the connection.
+
+These rules apply to the replies:
+
+- The first line of a reply is `ok`, `ok: <text>`, or `error: <text>`. The only exception is `quit`.
+- The `streams`, `selected`, and `help` replies have a header line `ok: <N> <noun>`, then exactly N lines. There is no end marker. If there are no streams, the reply is `ok: 0 streams` and nothing more.
+- In the `status` reply, `file=` is always the last field. The path continues to the end of the line, and it can contain spaces. Split the text before `file=` on spaces, then take all the text after `file=` as the path.
+- In the `get` header, the name continues to the end of the line, and it can contain spaces. If `get` fails, the reply is one `error:` line and no data.
+- The `select`, `filename`, `set`, `start`, and `stop` replies are the same as in protocol 1, for compatibility with LabRecorder remote control clients.
+
+The `select`, `start`, and `stop` commands must go through the viewer. They do not reply until the viewer has done the work, thus the reply gives the result: `ok: recording -> /path/file.xdf`, or `error: no streams connected`. A `status` that comes after such a reply always shows the new state. If the viewer does not answer in 2 seconds, the reply is `error: the viewer did not respond`, and the command is discarded. Thus set the read timeout of your client to more than 2 seconds. For `get`, use a longer timeout, because a large file takes more time.
 
 ### Discovery
 
-The viewer also announces the control endpoint through LSL, with the type `ViewerControl`. Resolve it to get the host and the port instead of writing `22345` in your code. The `source_id` has the form `lsl-viewer-rc:<host>:<pid>:<port>`, thus the port is the text after the last colon. The host and the process ID make the identifier different for each viewer, because LSL uses `source_id` as the identity of a stream.
+The viewer also announces the control endpoint through LSL, with the type `ViewerControl`. The client libraries do this for you: `rc.discover()` in Python (needs `pylsl`) and `lslrc.discover()` in MATLAB or Octave (needs liblsl-Matlab). To do it yourself, resolve it to get the host and the port instead of writing `22345` in your code. The `source_id` has the form `lsl-viewer-rc:<host>:<pid>:<port>`, thus the port is the text after the last colon. The host and the process ID make the identifier different for each viewer, because LSL uses `source_id` as the identity of a stream.
 
 ```python
 from pylsl import resolve_byprop, StreamInlet
 
 for info in resolve_byprop("type", "ViewerControl", timeout=5.0):
     port = int(info.source_id().rsplit(":", 1)[1])
-    desc = StreamInlet(info).info(timeout=3).desc()      # port, pid, bind, protocol
+    desc = StreamInlet(info).info(timeout=3).desc()      # port, pid, bind, protocol, protocol_version
+    if desc.child_value("protocol_version") != "2":
+        continue                                         # A viewer that this client cannot talk to.
     host = "127.0.0.1" if desc.child_value("bind") == "loopback" else info.hostname()
 ```
+
+The description also has `protocol_version`. Use it to skip a viewer with a different protocol before you connect to it.
 
 Two things to know when you write a client:
 

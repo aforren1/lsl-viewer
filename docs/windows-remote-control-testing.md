@@ -20,7 +20,7 @@ Build is the usual native build (no special flags): `cmake -S . -B build
 
 ---
 
-## 1. Automated check (fastest — actually compiles & runs the Winsock code)
+## 1. Automated check (fastest: actually compiles & runs the Winsock code)
 
 There's a self-contained test, `remote/roundtrip`, that starts the real server,
 connects a loopback client built on the **same** `rc_socket_t` layer, and asserts the
@@ -37,12 +37,13 @@ cmake --build build-test --config Release
 `-DCMAKE_BUILD_TYPE` and picks the config at build time via `--config`, so the exe lands
 in a per-config subfolder.)
 
-Pass = `[tests] 1/1 passed`. (Drop the `remote` filter to run the whole suite.)
-This needs no streams, no GUI interaction, and no external client — if it passes,
+Pass = `[tests] 3/3 passed` (`remote/roundtrip`, `remote/beacon_source_id`,
+`remote/second_instance`). (Drop the `remote` filter to run the whole suite.)
+This needs no streams, no GUI interaction, and no external client. If it passes,
 `WSAStartup`, bind/listen/accept, send/recv, and teardown all work on Windows.
 
 > Note: the test binds port **22456** (the live server uses 22345), so the two don't
-> collide. A Firewall prompt may still appear the first time — allow it (or it binds
+> collide. A Firewall prompt may still appear the first time; allow it (or it binds
 > loopback-only, which is enough for the test).
 
 ---
@@ -61,7 +62,7 @@ $env:LSL_RC_PORT = "22345"
 
 (Equivalently: launch normally and tick **Remote control** in the Streams rail.)
 
-The server binds **loopback (127.0.0.1) only by default** — there is no authentication, so
+The server binds **loopback (127.0.0.1) only by default**. There is no authentication, so
 it is not exposed on the network unless you ask for it. To let a client elsewhere on the LAN
 reach it, tick **Allow LAN access** in the Recording panel (it re-binds the running server),
 or set `LSL_RC_BIND=all` before launching:
@@ -71,7 +72,7 @@ $env:LSL_RC_PORT = "22345"; $env:LSL_RC_BIND = "all"
 .\build\lsl_viewer.exe
 ```
 
-Either way the first exposure triggers a **Windows Firewall** dialog — allow access on private
+Either way the first exposure triggers a **Windows Firewall** dialog; allow access on private
 networks. For the loopback client below you do not need it.
 
 Have at least one stream on the network (from a machine with Python + the venv):
@@ -84,7 +85,7 @@ uv run tools\lsl_test_streams.py --streams eeg,sine
 
 - **ncat** (ships with Nmap): `ncat 127.0.0.1 22345`
 - **telnet** (enable "Telnet Client" Windows feature): `telnet 127.0.0.1 22345`
-- **PowerShell only** (no extra tools) — paste this:
+- **PowerShell only** (no extra tools): paste this:
 
 ```powershell
 $c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 22345)
@@ -95,29 +96,32 @@ function rc($cmd) {
   $out=''; while ($ns.DataAvailable) { $out += [char]$ns.ReadByte() }
   $out
 }
-rc $null                 # banner
-rc 'help'
-rc 'streams'             # one line per discovered stream; '[rec]' = connected
-rc 'select mock-eeg'     # connect just EEG (use a key from `streams`)
+rc $null                 # banner: ok: lsl-viewer remote control, protocol 2. ...
+rc 'help'                # ok: <N> lines, then N lines of help
+rc 'streams'             # ok: <N> streams, then one line per stream; '[rec]' = connected
+rc 'select mock-eeg|MockEEG'   # connect just EEG (use a key from `streams`)
 rc 'streams'             # MockEEG should now show  [rec]
-rc 'selected'            # -> the connected keys
-rc 'status'              # recording=false ... (until you `start`)
+rc 'selected'            # ok: 1 selected, then the key
+rc 'status'              # ok: recording=false ... file=<path> (until you `start`)
 rc 'select all'          # connect everything
 rc 'select none'         # disconnect everything
 rc 'start'               # begin recording the connected set
-rc 'status'              # recording=true ... bytes climbing
+rc 'status'              # ok: recording=true ... bytes climbing
 rc 'stop'
-rc 'quit'
+rc 'get'                 # ok: <bytes> <name>, then the raw file (shows as noise here)
+rc 'quit'                # bye
 $c.Close()
 ```
 
 ### What to expect / pass criteria
 
-- [ ] Connecting prints the banner `lsl-viewer remote control. type `help`.`
-- [ ] `streams` lists each discovered stream as `key | name | type | Nch | rate`
+- [ ] Connecting prints the banner ``ok: lsl-viewer remote control, protocol 2. type `help`.``
+- [ ] `streams` replies `ok: <N> streams`, then N lines `key | name | type | <C>ch | <rate>`
+      (`ok: 0 streams` and nothing more when no stream is visible)
+- [ ] `help` replies `ok: <N> lines`, then exactly N lines
 - [ ] `select <key>` replies `ok: connected 1 stream(s)` and the stream gains `[rec]` in
       `streams` **and** appears as a plot in the viewer window (connection IS the
-      record selector now — recording captures all connected streams)
+      record selector now; recording captures all connected streams)
 - [ ] `select all` / `select none` connect / disconnect everything
 - [ ] a bogus key (`select nope`) is refused whole: `error: unknown stream(s): nope`,
       and `selected` is unchanged
@@ -127,11 +131,14 @@ $c.Close()
 - [ ] `start` then `stop` produces a `.xdf` (default is the BIDS template
       `sub-{subject}/ses-{session}/{modality}/..._{modality}.xdf` under
       `~/Documents/lsl-recordings`; `status` shows the resolved path); `status` shows
-      `recording=true` with growing `bytes` while active
+      `ok: recording=true` with growing `bytes` while active, and `file=<path>` last
+- [ ] `get` after `stop` replies `ok: <bytes> <name>`, then exactly `<bytes>` of XDF
+      (starts with `XDF:`); during a recording it replies
+      ``error: stop the recording before `get` ``
 - [ ] the written file opens in pyxdf (`python -c "import pyxdf; print(len(pyxdf.load_xdf('...')[0]))"`)
-- [ ] **Stop is instant** — the "Stop recording" button (or `stop`) returns without a
+- [ ] **Stop is instant**: the "Stop recording" button (or `stop`) returns without a
       visible UI freeze (the worker joins happen on a background closer thread)
-- [ ] closing the viewer flushes the file (no truncation — pyxdf still reads it)
+- [ ] closing the viewer flushes the file (no truncation; pyxdf still reads it)
 
 ### Discovery (optional)
 
@@ -142,14 +149,16 @@ endpoint without knowing it in advance. Verified on this machine with `pylsl`:
 
 ```
 resolved 1
-  name=LSLViewerControl host=MWPF4RADY3 source_id=lsl-viewer-rc:MWPF4RADY3:16956:22345
-  desc: port=22345 pid=16956 bind=loopback
-  connect 127.0.0.1:22345 -> 'lsl-viewer remote control. type `help`.'
+  name=LSLViewerControl host=MWPF4RADY3 source_id=lsl-viewer-rc:MWPF4RADY3:23840:22420
+  desc: port=22420 pid=23840 bind=loopback protocol=tcp-text-lines protocol_version=2
+  connect 127.0.0.1:22420 -> 'ok: lsl-viewer remote control, protocol 2. type `help`.'
 ```
 
+(That run used `LSL_RC_PORT=22420`; with the default the port is 22345.)
+
 Note that `info.hostname()` is the machine name even when the server is bound to
-loopback — connect to `127.0.0.1` unless the beacon's `bind` field says `all`. Reading
-`bind`/`port`/`pid` needs an inlet on the beacon (`StreamInlet(info).info().desc()`);
+loopback. Connect to `127.0.0.1` unless the beacon's `bind` field says `all`. Reading
+`bind`/`port`/`pid`/`protocol_version` needs an inlet on the beacon (`StreamInlet(info).info().desc()`);
 `source_id` alone is enough for the port.
 
 ### Second instance (optional)
@@ -157,7 +166,7 @@ loopback — connect to `127.0.0.1` unless the beacon's `bind` field says `all`.
 Start a second viewer **without** `LSL_RC_PORT` and tick **Remote control**: 22345 is
 taken, so it binds an ephemeral port and announces that one (the label next to the
 checkbox shows it, and two beacons now resolve). With `LSL_RC_PORT` set, the second
-viewer instead logs `remote control unavailable: bind() failed (port in use?)` — a
+viewer instead logs `remote control unavailable: bind() failed (port in use?)`: a
 pinned port is never silently exchanged for another. The `remote/second_instance` test
 covers both paths, including the Windows-specific bind semantics.
 
@@ -165,13 +174,13 @@ covers both paths, including the Windows-specific bind semantics.
 
 ## If something fails
 
-- **Build/link error on `ws2_32`** — confirm the `if(WIN32)` block in `CMakeLists.txt`
+- **Build/link error on `ws2_32`**: confirm the `if(WIN32)` block in `CMakeLists.txt`
   links `ws2_32` (and `onecore`); reconfigure from scratch if the cache is stale.
-- **`socket() failed` / nothing listens** — `WSAStartup` didn't run; check that
+- **`socket() failed` / nothing listens**: `WSAStartup` didn't run; check that
   `RcWsaInit` (the function-local static in `start()`) isn't being optimized away.
-- **Client can't connect from another machine** — Windows Firewall is blocking the
+- **Client can't connect from another machine**: Windows Firewall is blocking the
   bind; allow `lsl_viewer.exe` on private networks. Loopback (`127.0.0.1`) is unaffected.
-- **`bind() failed (port in use?)`** — another process holds 22345; set
+- **`bind() failed (port in use?)`**: another process holds 22345; set
   `LSL_RC_PORT` to a free port.
 
 Report back which boxes pass; the only thing that can't be exercised from Linux is the

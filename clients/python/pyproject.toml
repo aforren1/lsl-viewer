@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lsl-viewer-rc"
+version = "0.1.0"
+description = "Client for the lsl-viewer TCP remote-control protocol"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+discover = ["pylsl"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["lsl_viewer_rc.py"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["lsl_viewer_rc.py", "tests", "README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

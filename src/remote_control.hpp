@@ -1,24 +1,33 @@
 #pragma once
-// Simple TCP remote-control server for recording. A client (telnet/nc/script)
-// connects and sends newline-terminated commands; replies are human-readable lines.
+// Simple TCP remote-control server for recording, protocol 2 (kRcProtocol). A client
+// (telnet/nc/script) connects and sends newline-terminated commands ("\r\n" is fine too).
+// On connect the server sends one banner line,
+//   "ok: lsl-viewer remote control, protocol 2. type `help`."
+// and a client reads the version from "protocol <N>"; a banner without it is protocol 1.
+// A full server sends "error: too many control clients" instead and closes.
 //
-//   help                      list commands
-//   status                    recording? + file/seconds/MB/streams
-//   streams                   one resolved stream per line: key | name | type | Nch | rate
-//   selected                  the keys currently connected (= what gets recorded)
+//   help                      "ok: <N> lines", then N lines of help text
+//   status                    "ok: recording=<true|false> seconds=<f> streams=<n> bytes=<n> file=<path>"
+//   streams                   "ok: <N> streams", then N lines: key | name | type | <C>ch | <rate>[  [rec]]
+//   selected                  "ok: <N> selected", then the N connected keys (= what gets recorded)
 //   select all|none|k1,k2,..  connect/disconnect streams (recording captures all connected)
 //   filename <path>           set the output .xdf path
+//   set <field> <value>       fill a filename template field (subject/session/task/run/acq/modality)
 //   start [path]              begin recording (optional path)
 //   stop                      stop recording
-//   get                       stream the last completed recording to the client: a header
-//                             line "OK <bytes> <filename>" then <bytes> of raw file data
-//   quit                      close the connection
+//   get                       "ok: <bytes> <name>", then exactly <bytes> of raw file data
+//   quit                      "bye", then the server closes
 //
-// Replies: one line, either "ok: ..." or "error: ...", except `streams` (one line per
-// stream, fields separated by " | ", first field is the key) and `get` (below). Commands
-// that the main loop has to carry out -- select/start/stop -- do not answer until it has,
-// so the reply carries the real outcome ("ok: recording -> file" / "error: no streams
-// connected") and a `status` after one of them cannot report the state from before it.
+// Replies: the first line is always "ok", "ok: ..." or "error: ...", so a client can tell
+// the outcome without knowing the command. Multi-line replies are counted rather than
+// terminated: a sentinel line can collide with data, and an empty list ("ok: 0 streams")
+// still answers, so a client reading lines never blocks until its timeout. `file=` is last
+// in `status` because a path can hold spaces: everything after it is the path, verbatim.
+// select/filename/set/start/stop keep their protocol-1 replies byte for byte, because
+// LabRecorder RCS clients drive us with them. Commands that the main loop has to carry
+// out -- select/start/stop -- do not answer until it has, so the reply carries the real
+// outcome ("ok: recording -> file" / "error: no streams connected") and a `status` after
+// one of them cannot report the state from before it.
 //
 // Security: `get` only serves the viewer's own last completed recording, never a
 // client-supplied path, so it is not an arbitrary-file read. The listener binds
@@ -32,7 +41,9 @@
 // Discovery: while running we also publish an LSL outlet (name "LSLViewerControl",
 // type "ViewerControl"); a client resolves it, takes the host from info.hostname() and
 // the port from the last field of source_id "lsl-viewer-rc:<host>:<pid>:<port>", then
-// connects over TCP. No mDNS. The host and pid are in there because LSL treats source_id
+// connects over TCP. No mDNS. desc() also carries port, pid, bind (loopback|all), protocol
+// (tcp-text-lines) and protocol_version, so a client can refuse a server it cannot talk to
+// before it connects. The host and pid are in there because LSL treats source_id
 // as the identity of a logical stream: with the port alone, two viewers on two machines
 // that both use 22345 would publish the same id and a resolver could conflate them.
 //
@@ -47,7 +58,7 @@
 // threads only touch a mutex-guarded RemoteState: they queue requests and read snapshots
 // that the main loop publishes each frame. The main loop owns the Recorder/Discovery and
 // applies the requests, so there are no cross-thread races on the recorder. TCP via BSD
-// sockets (Linux/macOS) or Winsock (Windows) — the socket layer is abstracted below so
+// sockets (Linux/macOS) or Winsock (Windows); the socket layer is abstracted below so
 // the server logic is shared.
 
 #include <lsl_cpp.h>
@@ -134,8 +145,63 @@ inline std::string rc_beacon_source_id(int port) {
            std::to_string(port);
 }
 
+// Bump on any reply change a parser could trip over; clients refuse a version they don't know.
+inline constexpr int kRcProtocol = 2;
+
+// The discovery beacon's stream_info. Separate from start() so a test can check desc()
+// without the network round trip that resolving a live outlet needs.
+inline lsl::stream_info rc_beacon_info(int port, bool bindAll) {
+    lsl::stream_info ai("LSLViewerControl", "ViewerControl", 1, lsl::IRREGULAR_RATE,
+                        lsl::cf_string, rc_beacon_source_id(port));
+    ai.desc().append_child_value("port", std::to_string(port));
+    ai.desc().append_child_value("pid", std::to_string(rc_pid()));
+    ai.desc().append_child_value("protocol", "tcp-text-lines");
+    ai.desc().append_child_value("protocol_version", std::to_string(kRcProtocol));
+    // Resolving gives a client info.hostname(), which does NOT connect while we are on
+    // loopback: it has to use 127.0.0.1 instead, and only if it is on this machine at all.
+    // Say which, so a client can tell "not exposed" from "wrong address". (In desc, so it
+    // needs an inlet: it is a hint, not a credential, and the cheap resolve-only path
+    // doesn't need it.)
+    ai.desc().append_child_value("bind", bindAll ? "all" : "loopback");
+    return ai;
+}
+
+// The published reply bodies are rebuilt several times a second, so these append into
+// the caller's string (whose capacity survives the rebuild) instead of returning new ones.
+// A '\n' inside a stream name or a path would split its line and break the framing, so
+// rc_flatten turns CR/LF from `from` on into spaces.
+inline void rc_flatten(std::string& s, std::size_t from) {
+    for (std::size_t i = from; i < s.size(); ++i) if (s[i] == '\n' || s[i] == '\r') s[i] = ' ';
+}
+inline void rc_append_line(std::string& s, const std::string& text) {
+    const std::size_t from = s.size();
+    s += text; rc_flatten(s, from); s += '\n';
+}
+// One `streams` body line: "key | name | type | <C>ch | <rate>[  [rec]]".
+inline void rc_append_stream_line(std::string& s, const std::string& key, const std::string& name,
+                                  const std::string& type, int channels, double srate, bool rec) {
+    const std::size_t from = s.size();
+    s += key; s += " | "; s += name; s += " | "; s += type;
+    rc_flatten(s, from);
+    char tail[64];
+    if (srate > 0) std::snprintf(tail, sizeof tail, " | %dch | %d%s\n", channels, (int)srate, rec ? "  [rec]" : "");
+    else           std::snprintf(tail, sizeof tail, " | %dch | irregular%s\n", channels, rec ? "  [rec]" : "");
+    s += tail;
+}
+// The `status` body (the server adds "ok: "). file= is last: the path may hold spaces, and
+// the client takes the rest of the line as the path.
+inline void rc_status_text(std::string& out, bool recording, double seconds, int streams,
+                           std::uint64_t bytes, const std::string& file) {
+    char head[128];
+    std::snprintf(head, sizeof head, "recording=%s seconds=%.1f streams=%d bytes=%llu file=",
+                  recording ? "true" : "false", seconds, streams, (unsigned long long)bytes);
+    out = head;
+    const std::size_t from = out.size();
+    out += file; rc_flatten(out, from);
+}
+
 // One command that only the main loop can carry out. The session thread queues it and
-// blocks until the main loop fills in `msg`, then sends that back verbatim — so the
+// blocks until the main loop fills in `msg`, then sends that back verbatim, so the
 // client learns whether the recording actually started instead of "ok, poll status".
 struct RcRequest {
     enum class Kind { Start, Stop, Select };
@@ -150,9 +216,9 @@ struct RemoteState {
     std::mutex              mtx;
     std::condition_variable cv;       // main loop -> sessions: a queued request is done
     // published by the main loop (kept fresh each frame, and right after any request):
-    std::string streamsText;          // `streams` reply body
-    std::string statusText;           // `status` reply body
-    std::string selectedText = "none";// `selected` reply body
+    std::string streamsText;          // `streams` reply body: one '\n'-terminated line per stream
+    std::string statusText = "recording=false seconds=0.0 streams=0 bytes=0 file=";  // `status` body
+    std::string selectedText;         // `selected` reply body: one '\n'-terminated key per line
     bool        recording   = false;  // a recording is in progress (can't `get` mid-record)
     std::string lastFile;             // path of the last completed + flushed recording ("" = none)
     bool        closePending = false; // stopped, but the writer is still flushing (`get` waits)
@@ -181,7 +247,7 @@ public:
     }
 
     // portFallback: if `port` is taken, bind an ephemeral one instead of failing. Off by
-    // default — only pass true when the port is our own default, never when the user
+    // default: only pass true when the port is our own default, never when the user
     // pinned one (see the header comment).
     bool start(int port, RemoteState* state, bool bindAll = false, bool portFallback = false) {
         if (up_) return true;
@@ -227,24 +293,12 @@ public:
         up_.store(true, std::memory_order_release);
         th_ = jthread([this](stop_token s) { serve(s); });
         // LSL announcement so clients DISCOVER the control endpoint without knowing
-        // host:port — they resolve type "ViewerControl"; LSL supplies the hostname, and
+        // host:port: they resolve type "ViewerControl"; LSL supplies the hostname, and
         // the TCP port is the last field of source_id ("lsl-viewer-rc:<host>:<pid>:<port>")
         // so it's readable from the resolve result alone (desc isn't, without opening an
         // inlet). The outlet stays resolvable while we're up.
         try {
-            const std::string sid = rc_beacon_source_id(port_);
-            lsl::stream_info ai("LSLViewerControl", "ViewerControl", 1,
-                                lsl::IRREGULAR_RATE, lsl::cf_string, sid);
-            ai.desc().append_child_value("port", std::to_string(port_));
-            ai.desc().append_child_value("pid", std::to_string(rc_pid()));
-            ai.desc().append_child_value("protocol", "tcp-text-lines");
-            // Resolving gives a client info.hostname(), which does NOT connect while we
-            // are on loopback — it has to use 127.0.0.1 instead, and only if it is on
-            // this machine at all. Say which, so a client can tell "not exposed" from
-            // "wrong address". (In desc, so it needs an inlet: it is a hint, not a
-            // credential, and the cheap resolve-only path doesn't need it.)
-            ai.desc().append_child_value("bind", bindAll ? "all" : "loopback");
-            announce_ = std::make_unique<lsl::stream_outlet>(ai);
+            announce_ = std::make_unique<lsl::stream_outlet>(rc_beacon_info(port_, bindAll));
         } catch (...) { /* discovery is best-effort */ }
         return true;
     }
@@ -294,7 +348,8 @@ private:
     }
 
     void session(rc_socket_t fd) {
-        ::send(fd, kHello, (int)(sizeof(kHello) - 1), 0);
+        reply(fd, "ok: lsl-viewer remote control, protocol " + std::to_string(kRcProtocol) +
+                  ". type `help`.\n");
         std::string buf;
         char tmp[1024];
         bool open = true;
@@ -330,6 +385,14 @@ private:
     }
 
     void reply(rc_socket_t fd, const std::string& s) { ::send(fd, s.data(), (int)s.size(), 0); }
+    // "ok: <N> <noun>" then the body's N lines, in one send. N is counted from the body as
+    // sent rather than kept beside it, so the header cannot disagree with what follows.
+    void replyCounted(rc_socket_t fd, const std::string& body, const char* noun) {
+        std::string out = body;
+        if (!out.empty() && out.back() != '\n') out += '\n';   // an unterminated last line still counts
+        reply(fd, "ok: " + std::to_string(std::count(out.begin(), out.end(), '\n')) + " " + noun +
+                  "\n" + out);
+    }
 
     // Hand a request to the main loop and wait for it to be applied; returns the reply
     // line it produced. Waiting in slices (rather than one long wait) is what lets a
@@ -348,7 +411,7 @@ private:
     }
 
     // Stream the last completed recording to the client: a header line
-    // "OK <bytes> <filename>\n" followed by exactly <bytes> of raw file data. Blocking, on a
+    // "ok: <bytes> <filename>\n" followed by exactly <bytes> of raw file data. Blocking, on a
     // session thread (not the recording/UI thread); only the state mutex is held, briefly, to
     // read the path. The client reads the header, then reads <bytes> and saves them.
     // The path is always the viewer's own lastFile, never client-supplied, so this cannot
@@ -373,8 +436,11 @@ private:
         const std::uint64_t size = (std::uint64_t)f.tellg();
         f.seekg(0);
         const std::size_t slash = path.find_last_of("/\\");
-        reply(fd, "OK " + std::to_string(size) + " " +
-                  (slash == std::string::npos ? path : path.substr(slash + 1)) + "\n");
+        std::string head = "ok: " + std::to_string(size) + " ";
+        const std::size_t from = head.size();
+        head += slash == std::string::npos ? path : path.substr(slash + 1);
+        rc_flatten(head, from);                          // the name must not end the header early
+        reply(fd, head + "\n");
         char buf[65536];
         while (f) {
             f.read(buf, sizeof buf);
@@ -393,18 +459,13 @@ private:
         if (v == "get") { sendFile(fd); return true; }   // binary transfer; locks only briefly
         std::unique_lock<std::mutex> lk(st_->mtx);
         if (v == "help") {
-            reply(fd, "commands: help status streams selected select filename set start stop get quit\n"
-                      "  filename <template>   e.g. sub-{subject}_task-{task}_run-{run}_eeg.xdf\n"
-                      "  set <field> <value>   subject|session|task|run  (also {datetime}/{date}/{time})\n"
-                      "  get                   stream the last recording: 'OK <bytes> <name>' + raw data\n"
-                      "select/start/stop reply only once the viewer has applied them.\n");
+            replyCounted(fd, kHelp, "lines");
         } else if (v == "status") {
-            reply(fd, st_->statusText + "\n");
+            reply(fd, "ok: " + st_->statusText + "\n");
         } else if (v == "streams") {
-            // Never an empty reply: a client reading a line would block until timeout.
-            reply(fd, st_->streamsText.empty() ? "(none)\n" : st_->streamsText);
+            replyCounted(fd, st_->streamsText, "streams");
         } else if (v == "selected") {
-            reply(fd, st_->selectedText + "\n");
+            replyCounted(fd, st_->selectedText, "selected");
         } else if (v == "select") {                 // connect/disconnect (recording = connected set)
             auto req = std::make_shared<RcRequest>();
             req->kind = RcRequest::Kind::Select;
@@ -426,7 +487,7 @@ private:
             else { st_->setVars.emplace_back(key, val); reply(fd, "ok\n"); }
         } else if (v == "start") {
             // The path lands in setFilename, which the main loop applies before it drains
-            // the queue — so this request already sees it.
+            // the queue, so this request already sees it.
             if (!arg.empty()) st_->setFilename = arg;
             auto req = std::make_shared<RcRequest>();
             req->kind = RcRequest::Kind::Start;
@@ -456,7 +517,18 @@ private:
         return out;
     }
 
-    static constexpr char kHello[] = "lsl-viewer remote control. type `help`.\n";
+    // Every line ends in '\n': replyCounted counts them for the header.
+    static constexpr char kHelp[] =
+        "commands: help status streams selected select filename set start stop get quit\n"
+        "  status                ok: recording=<bool> seconds=<s> streams=<n> bytes=<n> file=<path>\n"
+        "  streams               ok: <N> streams, then N lines: key | name | type | <C>ch | <rate>\n"
+        "  selected              ok: <N> selected, then N lines: the connected keys\n"
+        "  select all|none|k,..  connect these streams; a recording captures all connected\n"
+        "  filename <template>   e.g. sub-{subject}_task-{task}_run-{run}_eeg.xdf\n"
+        "  set <field> <value>   subject|session|task|run|acq|modality  (also {datetime}/{date}/{time})\n"
+        "  start [path], stop    begin and end the recording\n"
+        "  get                   ok: <bytes> <name>, then <bytes> of the last recording\n"
+        "select/start/stop reply only once the viewer has applied them.\n";
     static constexpr char kBusy[]  = "error: too many control clients\n";
     static constexpr std::size_t kMaxLine = 64 * 1024;   // reject an unterminated line past this
     static constexpr std::size_t kMaxClients = 4;        // concurrent control connections
