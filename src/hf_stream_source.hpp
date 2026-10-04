@@ -27,6 +27,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <numeric>
@@ -206,8 +208,13 @@ public:
         double off = gapBase_;
         for (auto& g : gaps_) {
             // Real-time position of this gap's far edge = g.first + off + g.second.
-            if (realT >= g.first + off + g.second) off += g.second;
-            else break;
+            if (realT >= g.first + off + g.second) { off += g.second; continue; }
+            // Inside the dropout no sample exists, so clamp to the first one after it.
+            // Subtracting only the earlier gaps would land up to one gap length past it, in
+            // data recorded later: a marker a microsecond before the resumption would be
+            // matched to samples taken seconds after it.
+            if (realT > g.first + off) return g.first;
+            break;
         }
         return realT - off;
     }
@@ -234,8 +241,101 @@ public:
     }
     float hpR() const { return hpR_.load(std::memory_order_relaxed); }  // for on-the-fly filtering
 
+    // --- replay breaks ---------------------------------------------------------
+    // A replay's seek or loop wrap joins two parts of a recording that were not adjacent,
+    // and its stamps go on without a gap (see XdfPlayer::breaks). Without a mark the plot
+    // would show the join as continuous data; and a dropout check against the previous
+    // sample would paint the time between the two parts red, although nothing is missing
+    // from the recording. The worker places each break at the first sample whose stamp
+    // reaches `stamp` and checks for missing data against the break stamp instead.
+    struct BreakMark { double t; char label[24]; };   // t: display time (see breakTimes)
+    void markBreak(double stamp, const char* label) {   // render thread
+        if (irregular_) return;   // resampled on the local clock: no stamps to place it by
+        std::lock_guard<std::mutex> lk(brkMtx_);
+        if (brkPending_.size() >= 64) brkPending_.erase(brkPending_.begin());   // no data for a long time
+        PendingBreak b{stamp, {}};
+        std::snprintf(b.label, sizeof(b.label), "%s", label);
+        brkPending_.push_back(b);
+        brkFlag_.store(true, std::memory_order_release);
+    }
+    // A recorded dropout or a placed replay break between absolute samples i0 and i1 (the
+    // window [i0, i1)). The ring is indexed without the gaps, so a run of samples read across
+    // one joins data that was not adjacent in time: an ERP epoch cut there would fold
+    // misaligned data into the average. Both lists keep the old-frame time of the first
+    // sample after the discontinuity, t0 + idx * dt, so the window's interior is (i0, i1).
+    bool discontinuityIn(std::uint64_t i0, std::uint64_t i1) const {
+        const double t0 = t0_.load(std::memory_order_acquire);
+        const double a  = t0 + ((double)i0 + 0.5) * dt_, b = t0 + ((double)i1 - 0.5) * dt_;
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        for (const auto& g : gaps_)   if (g.first > a && g.first < b) return true;
+        for (const auto& m : breaks_) if (m.t > a && m.t < b)         return true;
+        return false;
+    }
+    // A break was posted and no data at or after it has arrived yet.
+    bool breakPending() const { return brkFlag_.load(std::memory_order_acquire); }
+    // Placed breaks in display time, oldest first. `out` is reused (no allocation once grown).
+    void breakTimes(std::vector<BreakMark>& out) const {
+        out.clear();
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        double off = gapBase_;
+        std::size_t gi = 0;
+        // Strictly earlier gaps only: a seek into a part with no data records its dropout at
+        // the same index, and the mark belongs at the start of that red band, not its end.
+        for (const BreakMark& b : breaks_) {
+            while (gi < gaps_.size() && gaps_[gi].first < b.t) off += gaps_[gi++].second;
+            out.push_back(b);
+            out.back().t = b.t + off;
+        }
+    }
+
     // --- stream health (lock-free reads) -------------------------------------
-    double        measuredRate() const { return measuredRate_.load(std::memory_order_relaxed); }   // EMA samples/s
+    // Samples per second of the stream's own timestamps, over the last ~5 s (see the worker).
+    double        measuredRate() const { return shownRate_.load(std::memory_order_relaxed); }
+    // Timestamp seconds delivered per wall second over the same window: about 1 live, the
+    // speed during a replay that keeps the recorded spacing.
+    double        deliverySpeed() const { return deliverySpeed_.load(std::memory_order_relaxed); }
+    double        chunkSpan()    const { return chunkSpan_.load(std::memory_order_relaxed); }      // data s per delivery
+    double        recentRate()   const { return recentRate_.load(std::memory_order_relaxed); }     // samples/s, last ~0.3 s
+    // Wall seconds between deliveries (bursts): a high percentile of the recent ones, so a
+    // stall does not count as an interval.
+    double        arrivalGap()   const { return arrivalGap_.load(std::memory_order_relaxed); }
+
+    // The data's trajectory: the newest data time (display time) as a function of the local
+    // clock, from the delivery times, linearly interpolated between them and flat outside.
+    // Averaged over [tA, tB]: `value`, and `slope`, the average's rate of change as the window
+    // moves (data seconds per wall second). A plot edge that follows this a little in the past
+    // moves exactly as the data arrived, speed changes included, with no speed estimate to wait
+    // for; the averaging smooths delivery jitter and turns a change of speed into a short ramp.
+    // False before the first delivery.
+    bool trajectory(double tA, double tB, double& value, double& slope) const {
+        std::lock_guard<std::mutex> lk(markMtx_);
+        if (markCount_ == 0 || !(tB > tA)) return false;
+        const std::size_t cap = marks_.size(), first = (markHead_ + cap - markCount_) % cap;
+        auto at = [&](std::size_t i) -> const Mark& { return marks_[(first + i) % cap]; };
+        auto valueAt = [&](double t) {             // N(t)
+            if (t <= at(0).wall) return at(0).newest;
+            const Mark& last = at(markCount_ - 1);
+            if (t >= last.wall) return last.newest;
+            std::size_t lo = 0, hi = markCount_ - 1;   // at(lo).wall <= t < at(hi).wall
+            while (hi - lo > 1) { const std::size_t mid = (lo + hi) / 2; (at(mid).wall <= t ? lo : hi) = mid; }
+            const Mark& a = at(lo); const Mark& b = at(hi);
+            return a.newest + (b.newest - a.newest) * (t - a.wall) / (b.wall - a.wall);
+        };
+        // Integral of the piecewise-linear N over [tA, tB]: trapezoids between the knots inside.
+        double area = 0.0, t = tA, v = valueAt(tA);
+        for (std::size_t i = 0; i < markCount_; ++i) {
+            const Mark& m = at(i);
+            if (m.wall <= tA) continue;
+            if (m.wall >= tB) break;
+            area += 0.5 * (v + m.newest) * (m.wall - t);
+            t = m.wall; v = m.newest;
+        }
+        const double vB = valueAt(tB);
+        area += 0.5 * (v + vB) * (tB - t);
+        value = area / (tB - tA);
+        slope = (vB - valueAt(tA)) / (tB - tA);
+        return true;
+    }
     double        clockOffset()  const { return clockOffset_.load(std::memory_order_relaxed); }     // remote->local (s)
     std::uint64_t dropouts()     const { return dropouts_.load(std::memory_order_relaxed); }        // recorded gaps
 
@@ -372,22 +472,78 @@ private:
             std::vector<float>  refBuf(chunkSamples_ * (std::size_t)channels_);  // re-reference scratch
 
             while (!st.stop_requested()) {
-                const std::size_t got = inlet.pull_chunk_multiplexed(
-                    buf.data(), ts.data(), buf.size(), ts.size(), 0.1);
-                if (got == 0) continue;
+                // Block only for the first sample, then collect for a few ms. With a timeout,
+                // pull_chunk waits until the buffer is full or the timeout has run out (see
+                // liblsl's stream_inlet_impl::pull_chunk_multiplexed), so the 0.1 s timeout this
+                // used delivered every stream in 100 ms batches: added latency, a scroll that
+                // moved in steps, and rate and block-size estimates that measured the batching
+                // instead of the sender. The short window bounds the pull rate for a sender that
+                // pushes one sample at a time.
+                constexpr double kCollect = 0.004;   // s
+                const double first = inlet.pull_sample(buf.data(), channels_, 0.1);
+                if (first == 0.0) continue;
+                ts[0] = first;
+                const std::size_t got = (std::size_t)channels_ + inlet.pull_chunk_multiplexed(
+                    buf.data() + channels_, ts.data() + 1, buf.size() - (std::size_t)channels_,
+                    ts.size() - 1, kCollect);
                 const std::size_t n = got / (std::size_t)channels_;
                 if (n == 0) continue;
                 const double tnow = lsl::local_clock();
                 lastData_.store(tnow, std::memory_order_relaxed);
-                // Measured incoming rate (EMA samples/s) — the actual delivery rate, which
-                // a quick glance against nominal exposes a misconfigured or struggling source.
-                if (lastChunkT_ > 0.0) {
-                    const double dtc = tnow - lastChunkT_;
-                    if (dtc > 1e-6) {
-                        const double inst = (double)n / dtc;
-                        const double cur  = measuredRate_.load(std::memory_order_relaxed);
-                        measuredRate_.store(cur <= 0.0 ? inst : cur + 0.1 * (inst - cur),
-                                            std::memory_order_relaxed);
+                // Data seconds per delivery. A sender block larger than one pull arrives as
+                // back-to-back pulls, so pulls a few ms apart count as one burst. The plot edge
+                // trails the newest data by about this much; less, and it overtakes the data
+                // between blocks and paints that wait as a dropout. Rises at once, decays over
+                // ~10 s, so one large block holds the margin through the next few.
+                if (tnow - lastChunkT_ > 0.005) burst_ = 0.0;
+                burst_ += (double)n * dt_;
+                {
+                    const double prev = chunkSpan_.load(std::memory_order_relaxed);
+                    const double decayed = lastChunkT_ > 0.0 ? prev * std::exp(-(tnow - lastChunkT_) / 10.0) : 0.0;
+                    chunkSpan_.store(std::max(burst_, decayed), std::memory_order_relaxed);
+                }
+                // Samples per second over at least the last kRateWindow s: from this pull back to
+                // the newest earlier pull that is that old. The plot edge glides at this rate, so it
+                // must notice a slowdown (a replay going from 5x to 1x) within a fraction of a
+                // second; a per-pull moving average took about half a second to get halfway.
+                // A sender of large blocks spans whole blocks, so it reads steady, not 0 or a burst.
+                arrivedTotal_ += n;
+                arrivals_[arrivalHead_] = {tnow, arrivedTotal_};
+                arrivalHead_ = (arrivalHead_ + 1) % arrivals_.size();
+                arrivalCount_ = std::min(arrivalCount_ + 1, arrivals_.size());
+                {
+                    const Arrival* from = nullptr;
+                    for (std::size_t k = 2; k <= arrivalCount_; ++k) {   // k = 1 is this pull
+                        const Arrival& a = arrivals_[(arrivalHead_ + arrivals_.size() - k) % arrivals_.size()];
+                        from = &a;
+                        if (tnow - a.t >= kRateWindow) break;
+                    }
+                    if (from && tnow > from->t)
+                        recentRate_.store((double)(arrivedTotal_ - from->total) / (tnow - from->t),
+                                          std::memory_order_relaxed);
+                }
+                // The rate shown to the user (Info panel): samples per second of the stream's own
+                // timestamps over the last ~kShownRateWindow s, refreshed 4 times a second. Its own
+                // clock, so a replay shows its recorded rate at any speed, while missing samples
+                // or a device off its declared rate still show. A long window, so 1 kHz reads as
+                // a steady 1000.0 instead of the per-delivery jitter. The delivery speed (wall
+                // clock against timestamps) is kept beside it for a replay's "5.00x".
+                if (tnow - lastSnapT_ >= 0.25) {
+                    lastSnapT_ = tnow;
+                    rateSnaps_[rateSnapHead_] = {tnow, ts[n - 1], arrivedTotal_};
+                    rateSnapHead_ = (rateSnapHead_ + 1) % rateSnaps_.size();
+                    rateSnapCount_ = std::min(rateSnapCount_ + 1, rateSnaps_.size());
+                    const RateSnap* old = nullptr;
+                    for (std::size_t k = 2; k <= rateSnapCount_; ++k) {   // k = 1 is this snapshot
+                        old = &rateSnaps_[(rateSnapHead_ + rateSnaps_.size() - k) % rateSnaps_.size()];
+                        if (tnow - old->wall >= kShownRateWindow) break;
+                    }
+                    if (old && arrivedTotal_ > old->total) {
+                        const double samples = (double)(arrivedTotal_ - old->total);
+                        const double spanTs = ts[n - 1] - old->lastTs, spanWall = tnow - old->wall;
+                        if (spanTs > 0.0) shownRate_.store(samples / spanTs, std::memory_order_relaxed);
+                        if (spanTs > 0.0 && spanWall > 0.0)
+                            deliverySpeed_.store(spanTs / spanWall, std::memory_order_relaxed);
                     }
                 }
                 lastChunkT_ = tnow;
@@ -411,22 +567,31 @@ private:
                 // render never sees the resumed data without its gap — otherwise the live
                 // red would briefly mask the just-arrived samples for a frame.
                 if (dt_ > 0.0 && anchored_.load(std::memory_order_relaxed)) {
+                    brkHere_.clear();
+                    if (brkFlag_.load(std::memory_order_acquire)) placeBreaks(ts.data(), n, headBefore);
+                    std::size_t bk = 0;
+                    // After a break, the samples before it are from another part of the
+                    // recording: data is missing only if the first sample comes later than
+                    // the break stamp, the start of the new part.
+                    // Before the first sample there is nothing to compare: an inlet that
+                    // subscribes late misses what was sent before, and that is not missing data.
+                    const bool brk0 = !brkHere_.empty() && brkHere_[0].first == 0;
+                    const double expect = brk0 ? brkHere_[bk++].second : lastTs_ + dt_;
                     if (lastTsValid_) {
-                        const double g = ts[0] - (lastTs_ + dt_);
-                        if (g > 0.25) {   // s; above jitter, below real dropouts
-                            const double oldTime = t0_.load(std::memory_order_acquire)
-                                                 + (double)headBefore * dt_;
-                            dropouts_.fetch_add(1, std::memory_order_relaxed);
-                            std::lock_guard<std::mutex> lk(gapMtx_);
-                            gaps_.push_back({oldTime, g});
-                            // Fold gaps far older than any visible window into a constant
-                            // base (a gap offsets ALL later times), so the per-frame walk in
-                            // realTime/applyGaps stays bounded over an hours-long session.
-                            const double cutoff = oldTime - 120.0;   // > max history + ring reach
-                            std::size_t k = 0;
-                            while (k < gaps_.size() && gaps_[k].first < cutoff) gapBase_ += gaps_[k++].second;
-                            if (k > 0) gaps_.erase(gaps_.begin(), gaps_.begin() + k);
-                        }
+                        const double g = ts[0] - expect;
+                        if (g > 0.25) recordGap(headBefore, g);   // s; above jitter, below real dropouts
+                    }
+                    // Within the pull as well: a pull that spans a dropout (the viewer fell
+                    // behind by more than the gap, or the sender pushed both sides at once) has
+                    // the jump between two of its samples, and checking only its first sample
+                    // would join the two sides as if no time had passed. One pass in sample
+                    // order keeps gaps_ sorted; at a replay break the new part is measured from
+                    // the break stamp, not from the sample before it.
+                    for (std::size_t i = 1; i < n; ++i) {
+                        double g;
+                        if (bk < brkHere_.size() && brkHere_[bk].first == i) g = ts[i] - brkHere_[bk++].second;
+                        else                                                  g = ts[i] - (ts[i - 1] + dt_);
+                        if (g > 0.25) recordGap(headBefore + i, g);
                     }
                     lastTs_ = ts[n - 1];
                     lastTsValid_ = true;
@@ -434,6 +599,40 @@ private:
 
                 // Conditioned chain + publish (derived structures first, raw head last).
                 publishChunk(buf.data(), n, refBuf.data(), hpBuf.data());
+
+                // Record the delivery for trajectory(). Pulls a few ms apart are one delivery (a
+                // block split across pulls): update its knot rather than add a near-vertical one.
+                if (dt_ > 0.0 && anchored_.load(std::memory_order_relaxed)) {
+                    const double nw = newestTime();
+                    std::lock_guard<std::mutex> lk(markMtx_);
+                    const std::size_t cap = marks_.size();
+                    if (markCount_ > 0 && tnow - lastPullT_ <= 0.005) {
+                        marks_[(markHead_ + cap - 1) % cap] = {tnow, nw};
+                        if (gapCount_ == 0) arrivalGap_.store(burst_, std::memory_order_relaxed);   // first delivery, still arriving
+                    } else {
+                        if (markCount_ > 0) {
+                            // The 80th percentile of the last gaps, not a running max: a stall is not
+                            // a delivery interval, and counting one stretched the edge's delay to
+                            // several seconds, freezing the scroll until it caught up.
+                            burstGaps_[gapHead_] = tnow - lastPullT_;
+                            gapHead_ = (gapHead_ + 1) % burstGaps_.size();
+                            gapCount_ = std::min(gapCount_ + 1, burstGaps_.size());
+                            std::array<double, 16> g{};
+                            std::copy_n(burstGaps_.begin(), gapCount_, g.begin());
+                            // (count - 1): with few gaps, a plain 80% index would pick the largest.
+                            const std::size_t k = ((gapCount_ - 1) * 8) / 10;
+                            std::nth_element(g.begin(), g.begin() + (std::ptrdiff_t)k, g.begin() + (std::ptrdiff_t)gapCount_);
+                            arrivalGap_.store(g[k], std::memory_order_relaxed);
+                        }
+                        // Before any gap is known, guess one from the first delivery: at 1x a block
+                        // of data arrives about as often as it lasts.
+                        if (markCount_ == 0) arrivalGap_.store(burst_, std::memory_order_relaxed);
+                        marks_[markHead_] = {tnow, nw};
+                        markHead_ = (markHead_ + 1) % cap;
+                        markCount_ = std::min(markCount_ + 1, cap);
+                    }
+                    lastPullT_ = tnow;
+                }
 
                 const double now = lsl::local_clock();
                 if (now - lastCorr > 5.0) {        // refresh for cross-stream align
@@ -578,6 +777,52 @@ private:
         if (carIdx_.empty()) carIncludeAll();
     }
 
+    // Record a dropout of `g` seconds before absolute sample `idx`. Producer-only.
+    void recordGap(std::uint64_t idx, double g) {
+        const double oldTime = t0_.load(std::memory_order_acquire) + (double)idx * dt_;
+        dropouts_.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        gaps_.push_back({oldTime, g});
+        // Fold gaps far older than any visible window into a constant
+        // base (a gap offsets ALL later times), so the per-frame walk in
+        // realTime/applyGaps stays bounded over an hours-long session.
+        const double cutoff = oldTime - 120.0;   // > max history + ring reach
+        std::size_t k = 0;
+        while (k < gaps_.size() && gaps_[k].first < cutoff) gapBase_ += gaps_[k++].second;
+        if (k > 0) gaps_.erase(gaps_.begin(), gaps_.begin() + k);
+        // breakTimes counts only the gaps still listed; a break before a folded gap would
+        // be placed without it.
+        std::erase_if(breaks_, [&](const BreakMark& b) { return b.t < cutoff; });
+    }
+
+    // Moves the pending breaks this chunk reaches into breaks_ (old-frame time) and lists
+    // them in brkHere_ as (sample index in the chunk, break stamp). Breaks that land on
+    // the same sample (two seeks with no data between) collapse into the last one: only
+    // it says where the data now comes from. Producer-only.
+    void placeBreaks(const double* ts, std::size_t n, std::uint64_t headBefore) {
+        std::lock_guard<std::mutex> lk(brkMtx_);
+        std::size_t used = 0, i = 0;
+        for (; used < brkPending_.size(); ++used) {
+            const PendingBreak& p = brkPending_[used];
+            while (i < n && ts[i] < p.stamp) ++i;
+            if (i == n) break;                                   // a later chunk reaches it
+            const double oldT = t0_.load(std::memory_order_acquire) + (double)(headBefore + i) * dt_;
+            std::lock_guard<std::mutex> gl(gapMtx_);
+            if (!brkHere_.empty() && brkHere_.back().first == i) {
+                brkHere_.back().second = p.stamp;
+                std::snprintf(breaks_.back().label, sizeof(breaks_.back().label), "%s", p.label);
+                continue;
+            }
+            brkHere_.push_back({i, p.stamp});
+            BreakMark b{oldT, {}};
+            std::snprintf(b.label, sizeof(b.label), "%s", p.label);
+            breaks_.push_back(b);
+            std::erase_if(breaks_, [&](const BreakMark& m) { return m.t < oldT - 120.0; });
+        }
+        brkPending_.erase(brkPending_.begin(), brkPending_.begin() + (std::ptrdiff_t)used);
+        brkFlag_.store(!brkPending_.empty(), std::memory_order_release);
+    }
+
     // CAR over every channel (the default before types are known, and the fallback when
     // no channel qualifies as EEG).
     void carIncludeAll() { carIdx_.resize(channels_); std::iota(carIdx_.begin(), carIdx_.end(), 0); }
@@ -633,10 +878,36 @@ private:
     std::atomic<double> lastData_{0.0};   // local_clock of the last chunk received
 
     // Stream health (producer-written, render-read).
-    std::atomic<double>        measuredRate_{0.0};   // EMA of incoming samples/s
+    // For measuredRate(): a snapshot every 0.25 s (producer-only), a fixed ring of ~8 s.
+    static constexpr double    kShownRateWindow = 5.0;   // s
+    struct RateSnap { double wall = 0.0, lastTs = 0.0; std::uint64_t total = 0; };
+    std::array<RateSnap, 32>   rateSnaps_{};
+    std::size_t                rateSnapHead_ = 0, rateSnapCount_ = 0;
+    double                     lastSnapT_ = 0.0;
+    std::atomic<double>        shownRate_{0.0};
+    std::atomic<double>        deliverySpeed_{0.0};
     std::atomic<double>        clockOffset_{0.0};    // last remote->local time_correction (s)
     std::atomic<std::uint64_t> dropouts_{0};         // count of recorded gaps
     double                     lastChunkT_ = 0.0;    // producer-only: local time of previous chunk
+    double                     burst_ = 0.0;         // producer-only: data seconds in the current burst
+    std::atomic<double>        chunkSpan_{0.0};      // decaying max of data seconds per burst
+    // Recent pulls for recentRate_ (producer-only), a fixed ring: no allocation per pull.
+    static constexpr double    kRateWindow = 0.3;    // s
+    struct Arrival { double t = 0.0; std::uint64_t total = 0; };
+    std::array<Arrival, 64>    arrivals_{};
+    std::size_t                arrivalHead_ = 0, arrivalCount_ = 0;
+    std::uint64_t              arrivedTotal_ = 0;
+    std::atomic<double>        recentRate_{0.0};     // samples/s over the last >= kRateWindow s
+    // Deliveries for trajectory(): (local clock, newest data time after it). A fixed ring that
+    // covers a few seconds at the highest pull rate the 4 ms collection window allows.
+    struct Mark { double wall = 0.0, newest = 0.0; };
+    std::array<Mark, 1024>     marks_{};
+    std::size_t                markHead_ = 0, markCount_ = 0;
+    mutable std::mutex         markMtx_;
+    double                     lastPullT_ = 0.0;    // producer-only: local clock at the last pull
+    std::array<double, 16>     burstGaps_{};         // producer-only: recent wall gaps between bursts
+    std::size_t                gapHead_ = 0, gapCount_ = 0;
+    std::atomic<double>        arrivalGap_{0.0};     // their 80th percentile
 
     // Dropout tracking. gaps_ is producer-appended / render-read under gapMtx_;
     // lastTs_/lastTsValid_ are producer-only.
@@ -645,6 +916,14 @@ private:
     double                                      gapBase_ = 0.0;   // folded offset of pruned gaps
     double                                      lastTs_ = 0.0;
     bool                                        lastTsValid_ = false;
+    std::vector<BreakMark>                      breaks_;   // placed replay breaks (old-frame time), under gapMtx_
+
+    // Replay breaks posted by the render thread, not yet reached by the data.
+    struct PendingBreak { double stamp; char label[24]; };
+    std::mutex                                  brkMtx_;
+    std::vector<PendingBreak>                   brkPending_;
+    std::atomic<bool>                           brkFlag_{false};   // brkPending_ is not empty
+    std::vector<std::pair<std::size_t, double>> brkHere_;          // producer-only scratch, see placeBreaks
 
     jthread        worker_;
     std::atomic<bool>   finished_{false};   // worker has exited -> safe to reap (instant join)

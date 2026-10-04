@@ -45,6 +45,7 @@ Name: firewall\public; Description: "Also allow on public networks (an isolated 
 [Files]
 Source: "..\build\Release\lsl_viewer.exe";  DestDir: "{app}"; Flags: ignoreversion
 Source: "..\build\Release\xdf_record.exe";  DestDir: "{app}"; Flags: ignoreversion
+Source: "..\build\Release\xdf_replay.exe";  DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE";                       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY_LICENSES";          DestDir: "{app}"; Flags: ignoreversion
 

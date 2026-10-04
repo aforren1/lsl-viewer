@@ -15,6 +15,8 @@
 #include "filter.hpp"
 #include "fft.hpp"               // Psd (KissFFT-backed) under test
 #include "remote_control.hpp"   // TCP control server under test (+ its rc_socket_t layer)
+#include "xdf_player.hpp"       // XdfPlayer::State, for the replay test
+#include "xdf_writer.hpp"       // writes the replay test's file
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,6 +27,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <random>
 #include <thread>
 #include <vector>
 #if !defined(_WIN32)
@@ -98,6 +101,125 @@ static RcTestCounted rcTestCounted(rc_socket_t fd) {
         r.lines.push_back(buf.substr(at, nl - at));
     r.rest = buf.substr(at);
     return r;
+}
+
+// Replay hooks in main.cpp: open a file the way the Tools > Replay XDF file dialog does,
+// and read back the replay's state, its streams, and the dropouts and break marks of the
+// streams it shows.
+extern void lslViewerRequestReplay(const char* path);
+extern void lslViewerReplayProbe(int& state, double& position, double& length, int& streams, int& shown,
+                                 unsigned long long& dropouts, int& breakMarks, std::size_t& breaks);
+struct ReplayProbeView {
+    int state = -1; double position = 0.0, length = 0.0; int streams = 0, shown = 0;
+    unsigned long long dropouts = 0; int breakMarks = 0; std::size_t breaks = 0;
+};
+static ReplayProbeView replayProbe() {
+    ReplayProbeView p;
+    lslViewerReplayProbe(p.state, p.position, p.length, p.streams, p.shown, p.dropouts, p.breakMarks, p.breaks);
+    return p;
+}
+
+// A 30 s recording: a 2-channel 100 Hz sine and a string marker every 2 s. Small enough to
+// write in a few milliseconds, long enough to seek in.
+static void writeReplayTestFile(const std::string& path) {
+    xdf::Writer w(path);
+    w.stream_header(1, "<?xml version=\"1.0\"?><info><name>ReplayTestSine</name><type>EEG</type>"
+                       "<channel_count>2</channel_count><nominal_srate>100</nominal_srate>"
+                       "<channel_format>float32</channel_format><source_id>replaytest-sine</source_id></info>");
+    w.stream_header(2, "<?xml version=\"1.0\"?><info><name>ReplayTestMarkers</name><type>Markers</type>"
+                       "<channel_count>1</channel_count><nominal_srate>0</nominal_srate>"
+                       "<channel_format>string</channel_format><source_id>replaytest-markers</source_id></info>");
+    const double t0 = 1000.0;
+    std::vector<double> ts(100);
+    std::vector<float>  v(200);
+    for (int c = 0; c < 30; ++c) {
+        for (int i = 0; i < 100; ++i) {
+            const int k = c * 100 + i;
+            ts[i] = t0 + k / 100.0;
+            v[2 * i]     = 50.0f * std::sin(6.2831853f * 5.0f * (float)k / 100.0f);
+            v[2 * i + 1] = 30.0f * std::sin(6.2831853f * 11.0f * (float)k / 100.0f);
+        }
+        w.data_chunk(1, ts, v.data(), 100, 2);
+        if (c % 2 == 0) {
+            const std::vector<double> mts{t0 + c};
+            const std::string m = "m" + std::to_string(c);
+            w.data_chunk(2, mts, &m, 1, 1);
+        }
+        if (c % 10 == 0) { w.clock_offset(1, t0 + c, 0.0); w.clock_offset(2, t0 + c, 0.0); w.boundary(); }
+    }
+    w.stream_footer(1, "<?xml version=\"1.0\"?><info><first_timestamp>1000</first_timestamp>"
+                       "<last_timestamp>1029.99</last_timestamp><sample_count>3000</sample_count></info>");
+    w.stream_footer(2, "<?xml version=\"1.0\"?><info><first_timestamp>1000</first_timestamp>"
+                       "<last_timestamp>1028</last_timestamp><sample_count>15</sample_count></info>");
+}
+
+// ERP hook in main.cpp: the newest ERP window's id, its bound streams, the events its
+// trigger stream has received, and the epochs it averaged or left out.
+extern void lslViewerErpProbe(int& id, std::string& stream, std::string& trigger, std::size_t& markerEvents,
+                              int& count, int& rejected);
+struct ErpProbeView { int id = 0, count = 0, rejected = 0; std::size_t markerEvents = 0; std::string stream, trigger; };
+static ErpProbeView erpProbe() {
+    ErpProbeView p;
+    lslViewerErpProbe(p.id, p.stream, p.trigger, p.markerEvents, p.count, p.rejected);
+    return p;
+}
+
+// A 20 s recording with a 2 s dropout, for the ERP: a 100 Hz sine with no samples in
+// [8, 10) s, and markers placed to test each way an epoch can meet the gap. With the default
+// epoch (-100 ms, +500 ms):
+//   4, 5, 6, 7, 11 ... 18   clear of the gap: averaged (12)
+//   7.7                     runs into the gap (data ends at 7.99): left out
+//   9.5                     inside the gap: maps to the first sample after it, so its baseline
+//                           lies before the gap: left out. Mapped as if no gap followed, it would
+//                           land on data recorded 1.5 s after the resumption and be averaged.
+// No marker before 4 s, so the test can bind the ERP before the trigger stream has any event.
+static constexpr int kErpGapAveraged = 12, kErpGapLeftOut = 2;
+static void writeErpGapFile(const std::string& path) {
+    xdf::Writer w(path);
+    w.stream_header(1, "<?xml version=\"1.0\"?><info><name>ReplayErpSine</name><type>EEG</type>"
+                       "<channel_count>1</channel_count><nominal_srate>100</nominal_srate>"
+                       "<channel_format>float32</channel_format><source_id>replayerp-sine</source_id></info>");
+    w.stream_header(2, "<?xml version=\"1.0\"?><info><name>ReplayErpMarkers</name><type>Markers</type>"
+                       "<channel_count>1</channel_count><nominal_srate>0</nominal_srate>"
+                       "<channel_format>string</channel_format><source_id>replayerp-markers</source_id></info>");
+    const double t0 = 2000.0;
+    auto marker = [&](double t) {
+        const std::vector<double> mts{t0 + t};
+        const std::string m = "e";
+        w.data_chunk(2, mts, &m, 1, 1);
+    };
+    std::vector<double> ts(100);
+    std::vector<float>  v(100);
+    for (int c = 0; c < 20; ++c) {
+        if (c % 10 == 0) { w.clock_offset(1, t0 + c, 0.0); w.clock_offset(2, t0 + c, 0.0); w.boundary(); }
+        if (c == 8 || c == 9) continue;                 // the dropout
+        for (int i = 0; i < 100; ++i) {
+            const int k = c * 100 + i;
+            ts[i] = t0 + k / 100.0;
+            v[i]  = 50.0f * std::sin(6.2831853f * 5.0f * (float)k / 100.0f);
+        }
+        w.data_chunk(1, ts, v.data(), 100, 1);
+        if (c >= 4 && c <= 7) marker(c);
+        if (c == 7)           { marker(7.7); marker(9.5); }
+        if (c >= 11 && c <= 18) marker(c);
+    }
+    w.stream_footer(1, "<?xml version=\"1.0\"?><info><first_timestamp>2000</first_timestamp>"
+                       "<last_timestamp>2019.99</last_timestamp><sample_count>1800</sample_count></info>");
+    w.stream_footer(2, "<?xml version=\"1.0\"?><info><first_timestamp>2004</first_timestamp>"
+                       "<last_timestamp>2018</last_timestamp><sample_count>14</sample_count></info>");
+}
+
+// Stream hooks in main.cpp: connect a stream by source_id, and read a connected stream's
+// state by name (false if it is not connected).
+extern void lslViewerRequestConnect(const char* sourceId);
+extern bool lslViewerStreamProbe(const char* name, bool& anchored, unsigned long long& dropouts, double& gapSec,
+                                 double& edge, double& newest, double& dt, double& rate, double& speed);
+struct StreamProbeView { bool found = false, anchored = false; unsigned long long dropouts = 0; double gapSec = 0.0;
+                         double edge = 0.0, newest = 0.0, dt = 0.0, rate = 0.0, speed = 0.0; };
+static StreamProbeView streamProbe(const char* name) {
+    StreamProbeView p;
+    p.found = lslViewerStreamProbe(name, p.anchored, p.dropouts, p.gapSec, p.edge, p.newest, p.dt, p.rate, p.speed);
+    return p;
 }
 
 void RegisterAppTests(ImGuiTestEngine* e) {
@@ -744,5 +866,323 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->MouseMoveToPos(ImVec2(5, 5));       // park cursor off the controls (no hover tooltip)
         ctx->Yield(3);
         ctx->CaptureScreenshotWindow("//ERP 1", ImGuiCaptureFlags_HideMouseCursor);  // 3) channels x time raster
+    };
+
+    // Tools > Replay XDF file, end to end on a file it writes itself: the streams connect, a
+    // seek from the panel moves playback and is marked as a break (not a dropout), a replay
+    // pause leaves no dropout either, and Stop removes the streams. Needs no other streams.
+    t = IM_REGISTER_TEST(e, "replay", "replay_open_seek");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        using State = XdfPlayer::State;
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "lsl_viewer_replay_test.xdf";
+        writeReplayTestFile(file.string());
+        lslViewerRequestReplay(file.string().c_str());
+        // Wall-clock waits: in fast mode the engine's sleeps run on simulated time, and the
+        // replay, LSL, and the inlets all run on the real clock.
+        auto waitFor = [&](auto pred, double seconds) {
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        auto sleepReal = [&](double seconds) { waitFor([] { return false; }, seconds); };
+        IM_CHECK(waitFor([] { const auto p = replayProbe(); return p.state == (int)State::playing && p.shown == 2; }, 15.0));
+        ReplayProbeView p = replayProbe();
+        IM_CHECK_EQ(p.streams, 2);
+        IM_CHECK_GT(p.length, 25.0);
+        IM_CHECK(ctx->GetWindowByRef("//ReplayTestSine") != nullptr);
+        sleepReal(1.0);                                  // some data before the seek
+        // Seek at 20x, where one push period of the player spans 0.4 s of recording: a seek
+        // that dropped what was already due, or a dropout check against the previous sample,
+        // would show the join as missing data. Back to 1x right after, so the rest of the
+        // file lasts through the pause below.
+        ctx->SetRef("//Replay");
+        ctx->ComboClick("##replayspeed/20x");
+        sleepReal(0.3);
+        const double before = replayProbe().position;
+        ctx->ItemInputValue("##replaypos", 15.0f);       // Ctrl+click the slider, type, Enter
+        ctx->ComboClick("##replayspeed/1x");
+        IM_CHECK(waitFor([] { return replayProbe().breakMarks >= 1; }, 5.0));
+        p = replayProbe();
+        ctx->LogInfo("seek: %.2f s -> %.2f s, breaks %zu, marks %d, dropouts %llu",
+                     before, p.position, p.breaks, p.breakMarks, p.dropouts);
+        IM_CHECK_GE(p.position, 15.0);
+        IM_CHECK_LT(p.position, 25.0);
+        IM_CHECK_EQ(p.breaks, (std::size_t)1);
+        IM_CHECK_EQ(p.dropouts, 0ull);                   // the join is not missing data
+
+        // A replay pause sends nothing for a while, which must not read as a dropout either.
+        ctx->ItemClick("Pause replay");
+        IM_CHECK(waitFor([] { return replayProbe().state == (int)State::paused; }, 2.0));
+        sleepReal(1.5);
+        ctx->ItemClick("Resume replay");
+        sleepReal(1.5);
+        p = replayProbe();
+        IM_CHECK_EQ(p.state, (int)State::playing);
+        IM_CHECK_EQ(p.dropouts, 0ull);
+
+        // Stop closes the outlets and removes the replay's plots.
+        ctx->ItemClick("Stop");
+        IM_CHECK(waitFor([] { return replayProbe().shown == 0; }, 3.0));
+        IM_CHECK_EQ(replayProbe().state, (int)State::stopped);
+        ctx->Yield(3);
+        IM_CHECK(ctx->GetWindowByRef("//ReplayTestSine") == nullptr || !ctx->GetWindowByRef("//ReplayTestSine")->Active);
+        ctx->WindowClose("//Replay");                    // and the session with it
+        ctx->Yield(3);
+        IM_CHECK_EQ(replayProbe().state, -1);
+        std::error_code ec; std::filesystem::remove(file, ec);
+    };
+
+    // ERP across a dropout, on a replayed file (see writeErpGapFile): epochs that touch the gap
+    // are left out and counted, a marker inside the gap is not matched to data recorded after
+    // it, and the first marker of a trigger stream that had no events when the ERP was bound
+    // is averaged, not swallowed by the ERP's first sync pass.
+    t = IM_REGISTER_TEST(e, "replay", "replay_erp_gap");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        using State = XdfPlayer::State;
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "lsl_viewer_erp_gap_test.xdf";
+        writeErpGapFile(file.string());
+        lslViewerRequestReplay(file.string().c_str());
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock, as in replay_open_seek
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        IM_CHECK(waitFor([] { const auto p = replayProbe(); return p.state == (int)State::playing && p.shown == 2; }, 15.0));
+
+        // Bind a new ERP to the replay's streams by name: other streams may be connected too.
+        ctx->MenuClick("//##MainMenuBar/View/New ERP (marker average)");
+        ctx->Yield(2);
+        const int id = erpProbe().id;
+        char ref[32];
+        std::snprintf(ref, sizeof ref, "//ERP %d", id);
+        IM_CHECK(ctx->GetWindowByRef(ref) != nullptr);
+        ctx->WindowFocus(ref);
+        ctx->Yield(2);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo((std::string(ref) + "/cfg").c_str());
+        IM_CHECK(cfg.Window != nullptr);
+        ctx->SetRef(cfg.Window);
+        ctx->ComboClick("stream/ReplayErpSine");
+        ctx->ComboClick("trigger/ReplayErpMarkers");
+        ctx->Yield(2);
+        ErpProbeView p = erpProbe();
+        IM_CHECK_STR_EQ(p.stream.c_str(), "ReplayErpSine");
+        IM_CHECK_STR_EQ(p.trigger.c_str(), "ReplayErpMarkers");
+        // The first-event case needs a trigger stream with no events yet at the bind. The first
+        // marker is 4 s into the file; if the UI was slower than that, say so, not a false pass.
+        IM_CHECK_EQ(p.markerEvents, (std::size_t)0);
+
+        // The rest at 10x, then wait for the end of the file. The ERP docks as a tab beside the
+        // Replay panel: bring each to the front to use it, and leave the ERP showing while the
+        // file plays, since it collects epochs as it draws.
+        ctx->WindowFocus("//Replay");
+        ctx->SetRef("//Replay");
+        ctx->ComboClick("##replayspeed/10x");
+        ctx->WindowFocus(ref);
+        IM_CHECK(waitFor([] { return replayProbe().state == (int)State::finished; }, 20.0));
+        // Not asserted: if an epoch went missing this times out, and the counts below say which.
+        waitFor([] { return erpProbe().count + erpProbe().rejected >= kErpGapAveraged + kErpGapLeftOut; }, 3.0);
+        p = erpProbe();
+        ctx->LogInfo("ERP %d: %d averaged, %d left out, %zu trigger events", id, p.count, p.rejected, p.markerEvents);
+        IM_CHECK_EQ(p.markerEvents, (std::size_t)(kErpGapAveraged + kErpGapLeftOut));
+        IM_CHECK_EQ(p.count, kErpGapAveraged);
+        IM_CHECK_EQ(p.rejected, kErpGapLeftOut);
+
+        ctx->WindowFocus("//Replay");
+        ctx->ItemClick("Stop");
+        IM_CHECK(waitFor([] { return replayProbe().shown == 0; }, 3.0));
+        ctx->WindowClose("//Replay");
+        ctx->WindowClose(ref);
+        ctx->Yield(3);
+        std::error_code ec; std::filesystem::remove(file, ec);
+    };
+
+    // A dropout inside one pull. The sender pushes the samples on both sides of a 1.5 s gap
+    // as one chunk, so the viewer reads them in a single pull: the jump is between two samples
+    // of the pull, not at its start, and must still be recorded as a dropout of that length.
+    t = IM_REGISTER_TEST(e, "stream", "dropout_within_pull");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock: LSL runs on the real one
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        const char* kName = "GapInPullTest";
+        lsl::stream_outlet out(lsl::stream_info(kName, "EEG", 1, 100.0, lsl::cf_float32, "gaptest-inpull"));
+        lslViewerRequestConnect("gaptest-inpull");
+        // Data pushed before the inlet subscribes is not delivered, so wait for it first.
+        IM_CHECK(waitFor([&] { return streamProbe(kName).found && out.have_consumers(); }, 15.0));
+
+        const double base = lsl::local_clock();
+        std::vector<float>  v;
+        std::vector<double> ts;
+        auto add = [&](double from, int n) {
+            for (int i = 0; i < n; ++i) { ts.push_back(base + from + i / 100.0); v.push_back((float)i); }
+        };
+        add(0.0, 100);                                   // 1 s of continuous data anchors the stream
+        out.push_chunk_multiplexed(v.data(), ts.data(), v.size(), true);
+        IM_CHECK(waitFor([&] { return streamProbe(kName).anchored; }, 5.0));
+        v.clear(); ts.clear();
+        add(1.0, 50);                                    // 1.00 .. 1.49 s
+        add(3.0, 50);                                    // 3.00 .. 3.49 s: 1.5 s after 1.49 + 1/100
+        out.push_chunk_multiplexed(v.data(), ts.data(), v.size(), true);
+        waitFor([&] { return streamProbe(kName).dropouts > 0; }, 3.0);
+        const StreamProbeView p = streamProbe(kName);
+        ctx->LogInfo("%s: %llu dropouts, %.3f s missing", kName, p.dropouts, p.gapSec);
+        IM_CHECK_EQ(p.dropouts, 1ull);
+        IM_CHECK(p.gapSec > 1.45 && p.gapSec < 1.55);
+
+        ctx->WindowClose("//GapInPullTest");             // disconnect before the outlet goes
+        ctx->Yield(3);
+    };
+
+    // Changing the replay speed must scroll smoothly: the plot edge may slow down or speed up,
+    // but must not jump back, and must not run past the newest data (that strip is painted as a
+    // live dropout). Measured frame by frame across a 5x -> 1x and a 1x -> 5x change.
+    t = IM_REGISTER_TEST(e, "replay", "replay_speed_change");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        using State = XdfPlayer::State;
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "lsl_viewer_speed_test.xdf";
+        writeReplayTestFile(file.string());
+        lslViewerRequestReplay(file.string().c_str());
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock, as in replay_open_seek
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        IM_CHECK(waitFor([] { const auto p = replayProbe(); return p.state == (int)State::playing && p.shown == 2; }, 15.0));
+        const char* kName = "ReplayTestSine";
+        ctx->WindowFocus("//Replay");
+        ctx->SetRef("//Replay");
+        ctx->ComboClick("##replayspeed/5x");
+        waitFor([] { return false; }, 1.5);              // settle at 5x (7.5 s of data)
+
+        // Record every new edge for `seconds` of wall time after a speed change.
+        // Every frame: the edge's step and its velocity (data seconds per wall second, from the
+        // frame's own time). Judder is the velocity jumping from frame to frame; a stall is a
+        // frame where the edge stops while data keeps coming.
+        struct Stats { int frames = 0, back = 0, ahead = 0, stalls = 0, jolts = 0;
+                       double maxBack = 0.0, maxStep = 0.0, maxAhead = 0.0, maxDv = 0.0; };
+        auto record = [&](double seconds) {
+            Stats st;
+            double prev = streamProbe(kName).edge, prevV = -1.0;
+            int frame = ImGui::GetFrameCount();
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (std::chrono::steady_clock::now() < end) {
+                ctx->Yield();
+                if (ImGui::GetFrameCount() == frame) continue;
+                frame = ImGui::GetFrameCount();
+                const StreamProbeView p = streamProbe(kName);
+                const double step = p.edge - prev, dt = std::max(1e-4, p.dt);   // the step's own frame time
+                const double v = step / dt;
+                ++st.frames;
+                if (step < 0.0) { ++st.back; st.maxBack = std::max(st.maxBack, -step); }
+                st.maxStep = std::max(st.maxStep, step);
+                if (v < 0.2) ++st.stalls;
+                if (prevV >= 0.0) {
+                    const double dv = std::fabs(v - prevV);
+                    st.maxDv = std::max(st.maxDv, dv);
+                    if (dv > 0.5) ++st.jolts;
+                }
+                const double ahead = p.edge - p.newest;
+                if (ahead > 0.05) { ++st.ahead; st.maxAhead = std::max(st.maxAhead, ahead); }
+                prev = p.edge; prevV = v;
+            }
+            return st;
+        };
+        auto report = [&](const char* what, const Stats& st) {
+            ctx->LogInfo("%s: %d frames, %d stalls, %d jolts (max dv %.2f), %d back (max %.3f s), max step %.3f s, "
+                         "%d ahead of the data (max %.3f s)",
+                         what, st.frames, st.stalls, st.jolts, st.maxDv, st.back, st.maxBack, st.maxStep,
+                         st.ahead, st.maxAhead);
+        };
+        ctx->ComboClick("##replayspeed/1x");
+        const Stats down = record(2.5);
+        report("5x -> 1x", down);
+        ctx->ComboClick("##replayspeed/5x");
+        const Stats up = record(1.5);
+        report("1x -> 5x", up);
+        // Smooth: never back, never ahead of the data, never stopping while data comes, and
+        // no frame-to-frame jump in speed (a change of speed is a ramp over ~20 frames).
+        for (const Stats* st : {&down, &up}) {
+            IM_CHECK_LT(st->maxBack, 0.001);
+            IM_CHECK_EQ(st->ahead, 0);
+            IM_CHECK_EQ(st->stalls, 0);
+            IM_CHECK_EQ(st->jolts, 0);
+        }
+        // The shown rate is in the stream's own clock, so a replay at 5x still reads its
+        // recorded 100 Hz; a wall-clock rate would read about 500.
+        {
+            const StreamProbeView p = streamProbe(kName);
+            ctx->LogInfo("measured %.2f Hz, arriving at %.2fx", p.rate, p.speed);
+            IM_CHECK(std::fabs(p.rate - 100.0) < 1.0);
+        }
+
+        ctx->ItemClick("Stop");
+        IM_CHECK(waitFor([] { return replayProbe().shown == 0; }, 3.0));
+        ctx->WindowClose("//Replay");
+        ctx->Yield(3);
+        std::error_code ec; std::filesystem::remove(file, ec);
+    };
+
+    // The measured rate must be readable: steady to a fraction of a percent although the sender
+    // delivers chunks of varying size at jittered times (a per-delivery rate bounces by several
+    // percent around 1 kHz).
+    t = IM_REGISTER_TEST(e, "stream", "measured_rate_steady");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock: LSL runs on the real one
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        const char* kName = "RateTest";
+        lsl::stream_outlet out(lsl::stream_info(kName, "EEG", 1, 1000.0, lsl::cf_float32, "ratetest-1k"));
+        lslViewerRequestConnect("ratetest-1k");
+        IM_CHECK(waitFor([&] { return streamProbe(kName).found && out.have_consumers(); }, 15.0));
+        // Real-time 1 kHz in chunks of 10..30 samples, pushed whenever they are due.
+        std::mt19937 rng(7);
+        std::uniform_int_distribution<int> chunk(10, 30);
+        std::vector<float> v(30, 0.0f);
+        std::vector<double> ts(30);
+        const double base = lsl::local_clock();
+        long long sent = 0;
+        int next = chunk(rng);
+        double lo = 1e9, hi = 0.0;
+        const auto start = std::chrono::steady_clock::now();
+        for (;;) {
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            if (el > 9.0) break;
+            while ((double)(sent + next) / 1000.0 <= el) {
+                for (int i = 0; i < next; ++i) ts[(std::size_t)i] = base + (double)(sent + i) / 1000.0;
+                out.push_chunk_multiplexed(v.data(), ts.data(), (std::size_t)next, true);
+                sent += next;
+                next = chunk(rng);
+            }
+            ctx->Yield();
+            if (el > 7.0) {                               // past the 5 s window: sample the shown rate
+                const double r = streamProbe(kName).rate;
+                lo = std::min(lo, r); hi = std::max(hi, r);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ctx->LogInfo("%s: shown rate %.2f .. %.2f Hz", kName, lo, hi);
+        IM_CHECK(lo > 998.0 && hi < 1002.0);              // within 0.2% of 1 kHz
+        IM_CHECK_LT(hi - lo, 1.0);                        // and steady to read
+        ctx->WindowClose("//RateTest");
+        ctx->Yield(3);
     };
 }

@@ -94,7 +94,7 @@ jobs:
 
       - name: Strip binaries (Unix)
         if: runner.os != 'Windows'
-        run: strip ${{ matrix.bindir }}/lsl_viewer ${{ matrix.bindir }}/xdf_record
+        run: strip ${{ matrix.bindir }}/lsl_viewer ${{ matrix.bindir }}/xdf_record ${{ matrix.bindir }}/xdf_replay
 
       # Flat portable package: binaries + licenses + a portable.txt marker, so unzipping and
       # running keeps config/recordings beside the executable (see docs/building.md).
@@ -102,7 +102,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "${{ matrix.bindir }}/lsl_viewer${{ matrix.ext }}" "${{ matrix.bindir }}/xdf_record${{ matrix.ext }}" dist/
+          cp "${{ matrix.bindir }}/lsl_viewer${{ matrix.ext }}" "${{ matrix.bindir }}/xdf_record${{ matrix.ext }}" "${{ matrix.bindir }}/xdf_replay${{ matrix.ext }}" dist/
           cp LICENSE THIRD_PARTY_LICENSES packaging/portable.txt dist/
 
       # Provenance attestation: ties each binary's hash to this repo + workflow run + commit
@@ -116,6 +116,7 @@ jobs:
           subject-path: |
             dist/lsl_viewer${{ matrix.ext }}
             dist/xdf_record${{ matrix.ext }}
+            dist/xdf_replay${{ matrix.ext }}
 
       - name: Upload portable package
         uses: actions/upload-artifact@v7
@@ -177,6 +178,7 @@ jobs:
           cp -R "$APP" dmgroot/
           ln -s /Applications dmgroot/Applications     # drag-to-install target
           cp build/xdf_record dmgroot/                 # headless recorder CLI, beside the app
+          cp build/xdf_replay dmgroot/                 # XDF replay CLI, beside the recorder
           cp LICENSE THIRD_PARTY_LICENSES dmgroot/
           hdiutil create -volname "LSL Viewer" -srcfolder dmgroot -ov -format UDZO LSL-Viewer.dmg
 
@@ -232,8 +234,8 @@ jobs:
       - name: Assemble AppDir
         run: |
           mkdir -p AppDir/usr/bin AppDir/usr/share/doc/lsl_viewer
-          cp build/lsl_viewer build/xdf_record AppDir/usr/bin/
-          strip AppDir/usr/bin/lsl_viewer AppDir/usr/bin/xdf_record
+          cp build/lsl_viewer build/xdf_record build/xdf_replay AppDir/usr/bin/
+          strip AppDir/usr/bin/lsl_viewer AppDir/usr/bin/xdf_record AppDir/usr/bin/xdf_replay
           cp LICENSE THIRD_PARTY_LICENSES AppDir/usr/share/doc/lsl_viewer/
 
       - name: Package AppImage
@@ -299,16 +301,17 @@ jobs:
             -DCMAKE_C_COMPILER_AR="$PWD/z/zar"        -DCMAKE_CXX_COMPILER_AR="$PWD/z/zar" \
             -DCMAKE_C_COMPILER_RANLIB="$PWD/z/zranlib" -DCMAKE_CXX_COMPILER_RANLIB="$PWD/z/zranlib" \
             -DCMAKE_EXE_LINKER_FLAGS="-static"
-          cmake --build build --target xdf_record --parallel
-          strip build/xdf_record
+          cmake --build build --target xdf_record xdf_replay --parallel
+          strip build/xdf_record build/xdf_replay
       - name: Verify fully static
         run: |
-          file build/xdf_record
+          file build/xdf_record build/xdf_replay
           ldd build/xdf_record || true        # expect: "not a dynamic executable"
+          ldd build/xdf_replay || true
       - name: Stage
         run: |
           mkdir -p dist
-          cp build/xdf_record LICENSE THIRD_PARTY_LICENSES dist/
+          cp build/xdf_record build/xdf_replay LICENSE THIRD_PARTY_LICENSES dist/
           # musl is statically linked, so its MIT notice must ship too. Take it from the zig
           # install so the text always matches the musl version that zig links.
           cp "$(dirname "$ZIG")/lib/libc/musl/COPYRIGHT" dist/musl-COPYRIGHT
@@ -316,7 +319,9 @@ jobs:
         if: github.event_name == 'push' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: dist/xdf_record
+          subject-path: |
+            dist/xdf_record
+            dist/xdf_replay
       - name: Upload
         uses: actions/upload-artifact@v7
         with:

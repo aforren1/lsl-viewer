@@ -27,10 +27,10 @@ option(LSL_VIEWER_TRACY "Enable the Tracy frame profiler" OFF)
 option(LSL_VIEWER_TESTS "Build with the Dear ImGui Test Engine and UI tests" OFF)
 option(LSL_VIEWER_STATIC "Static-link SDL3 + liblsl (+ static MSVC CRT) into one self-contained binary" OFF)
 # CLI-only skips every GUI dependency (SDL3/ImGui/ImPlot/KissFFT) and builds just the headless
-# xdf_record. Combined with LSL_VIEWER_STATIC + -static it yields a fully-static recorder (no glibc/GPU
+# xdf_record and xdf_replay. Combined with LSL_VIEWER_STATIC + -static it yields a fully-static recorder (no glibc/GPU
 # deps) — e.g. under musl/Alpine — that runs on any Linux. The viewer needs the GPU/display stack
 # and can't be fully static, so it's excluded here.
-option(LSL_CLI_ONLY "Build only the headless xdf_record CLI (no GUI deps)" OFF)
+option(LSL_CLI_ONLY "Build only the headless xdf_record and xdf_replay CLIs (no GUI deps)" OFF)
 
 # Static linking: fold SDL3 and liblsl into the executable so distribution is a
 # single file (no SDL3.dll/lsl.dll alongside; on Windows also no VC++ redist).
@@ -157,7 +157,7 @@ if(LSL_VIEWER_TESTS)
 endif()
 
 if(LSL_CLI_ONLY)
-  FetchContent_MakeAvailable(liblsl spdlog)              # xdf_record only needs these
+  FetchContent_MakeAvailable(liblsl spdlog)              # the CLIs only need these
 else()
   FetchContent_MakeAvailable(SDL3 liblsl imgui implot spdlog kissfft)
 endif()
@@ -247,7 +247,7 @@ endif()
 endif()  # NOT LSL_CLI_ONLY
 
 # Headless XDF recorder CLI (no GUI deps) — same Recorder/xdf_writer as the viewer. Always built;
-# the only target in an LSL_CLI_ONLY configure.
+# one of the two targets of an LSL_CLI_ONLY configure (with xdf_replay).
 add_executable(xdf_record tools/xdf_record.cpp)
 target_include_directories(xdf_record PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(xdf_record PRIVATE lsl spdlog::spdlog)
@@ -256,6 +256,24 @@ if(WIN32 AND NOT LSL_VIEWER_STATIC)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_RUNTIME_DLLS:xdf_record> $<TARGET_FILE_DIR:xdf_record>
     COMMAND_EXPAND_LISTS)
+endif()
+
+# XDF replay CLI (port of tools/xdf_replay.py). The engine is header-only (src/xdf_reader.hpp,
+# src/xdf_player.hpp) so the viewer can use it too; the CLI needs only liblsl, so it is built in an
+# LSL_CLI_ONLY configure as well.
+find_package(Threads REQUIRED)
+add_executable(xdf_replay tools/xdf_replay.cpp)
+target_include_directories(xdf_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(xdf_replay PRIVATE lsl Threads::Threads)
+if(WIN32 AND NOT LSL_VIEWER_STATIC)
+  add_custom_command(TARGET xdf_replay POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:xdf_replay> $<TARGET_FILE_DIR:xdf_replay>
+    COMMAND_EXPAND_LISTS)
+endif()
+if(LSL_VIEWER_TRACY)
+  target_compile_definitions(xdf_replay PRIVATE LSL_VIEWER_TRACY)
+  target_link_libraries(xdf_replay PRIVATE Tracy::TracyClient)
 endif()
 
 if(LSL_VIEWER_TRACY AND NOT LSL_CLI_ONLY)

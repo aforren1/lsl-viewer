@@ -52,6 +52,8 @@ You can apply the filter stages in any combination. The spectrum, spectrogram, a
 - XDF recording of all connected streams. The files are compatible with LabRecorder, which was checked against LabRecorder output with `pyxdf`. The viewer keeps the raw timestamps and the clock-offset chunks, thus an importer can align the streams to a common clock.
 - Filename templates, such as `sub-{subject}_task-{task}_run-{run}_eeg.xdf`.
 - A headless CLI, `xdf_record`, that records without the GUI.
+- **Replay XDF file** (Tools menu) plays a recording back as live streams in the viewer, at 0.5 to 20 times real time. Use it to check a recording right after you make it: all streams are present, there are no dropouts, and the markers are in the correct positions. The **Replay** panel has a position slider, pause, speed, loop, and stop. It also lists the warnings for a damaged file and the samples sent for each stream. A seek or a loop shows in the plots as a dashed blue line. The viewer does not show it as a dropout.
+- A CLI, `xdf_replay`, that replays an XDF file as live LSL streams, also faster than real time. Use it at the rig to check a recording right after you make it, for example with `xdf_replay rec.xdf --speed 10` and the viewer. Run `xdf_replay --help` for the options.
 
 ### Other
 
@@ -169,7 +171,7 @@ The viewer renders through **SDL_GPU**, the GPU abstraction of SDL3. Thus it nee
 
 **Network:** LSL finds and reads the streams on the local network. It uses UDP broadcast and multicast to resolve the streams, and TCP to transfer the data. Thus the sources must be on the same subnet, and you can be required to permit the viewer through the firewall. The Windows installer adds the firewall rules for you. See [docs/network.md](docs/network.md) for the ports, for the portable build, and for what to do when the viewer finds no streams.
 
-**Headless recorder:** `xdf_record` has no GPU or display requirements. It links only to liblsl, and the static musl build for Linux runs on all Linux distributions.
+**Headless tools:** `xdf_record` and `xdf_replay` have no GPU or display requirements. They link only to liblsl, and the static musl builds for Linux run on all Linux distributions.
 
 ## Documentation
 

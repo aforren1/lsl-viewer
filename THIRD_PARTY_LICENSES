@@ -1,12 +1,13 @@
 Third-party licenses
 ====================
 
-The lsl_viewer and xdf_record binaries (and the static / AppImage builds)
-incorporate the third-party components listed below. Their copyright notices
-and license texts are reproduced here as required by their licenses.
+The lsl_viewer, xdf_record, and xdf_replay binaries (and the static / AppImage
+builds) incorporate the third-party components listed below. Their copyright
+notices and license texts are reproduced here as required by their licenses.
 xdf_record contains only liblsl, pugixml, spdlog, and the App-LabRecorder
-xdfwriter adaptation. The fully static Linux (musl) xdf_record also contains
-musl libc; its notices are in the musl-COPYRIGHT file that ships beside it.
+xdfwriter adaptation. xdf_replay contains only liblsl, pugixml, and the pyxdf
+algorithm port. The fully static Linux (musl) xdf_record and xdf_replay also
+contain musl libc; its notices are in the musl-COPYRIGHT file beside them.
 
   SDL3            Zlib          (C) 1997-2026 Sam Lantinga        https://libsdl.org
     yuv2rgb       BSD-3-Clause  (C) 2016 Adrien Descamps          (bundled in SDL3)
@@ -24,6 +25,10 @@ musl libc; its notices are in the musl-COPYRIGHT file that ships beside it.
   KissFFT         BSD-3-Clause  (C) 2003-2010 Mark Borgerding     https://github.com/mborgerding/kissfft
   App-LabRecorder MIT           (C) 2012 Christian Kothe          https://github.com/labstreaminglayer/App-LabRecorder
                   (src/xdf_writer.hpp is adapted from its xdfwriter)
+  pyxdf           BSD-2-Clause  (C) 2015-2024 Syntrogi Inc.,      https://github.com/xdf-modules/pyxdf
+                                Chad Boulay, Tristan Stenner,
+                                Clemens Brunner
+                  (src/xdf_reader.hpp ports its clock sync and dejitter)
   Roboto (font)   OFL-1.1       (C) 2011 The Roboto Project       https://github.com/googlefonts/roboto-classic
                                 Authors
 
@@ -292,3 +297,35 @@ INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
 DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
+
+
+================================================================================
+BSD 2-Clause License  -  pyxdf (clock sync and dejitter, ported in
+                         src/xdf_reader.hpp)
+================================================================================
+
+Copyright (c) 2015-2024, Syntrogi Inc. dba Intheon
+Copyright (c) 2018-2024, Chad Boulay
+Copyright (c) 2018-2024, Tristan Stenner
+Copyright (c) 2018-2024, Clemens Brunner
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

@@ -15,6 +15,8 @@
 //   LSL_NOVSYNC=1     start with VSync off (uncapped — measure real render cost)
 //   LSL_BENCH=1       print FPS / frame-time stats to stdout once a second
 //   LSL_PROFILE=1     print a per-zone CPU table (count/total/avg/max/%frame) every 3 s
+//   LSL_REPLAY=<file> replay an XDF file at launch, as if picked in Tools > Replay XDF file
+//                     (for scripted runs: the native dialog cannot be driven)
 //   SPDLOG_LEVEL=...  log verbosity (e.g. debug, info, warn)
 
 #include "imgui.h"
@@ -29,8 +31,10 @@
 #include "mock_streams.hpp"
 #include "recorder.hpp"
 #include "remote_control.hpp"
+#include "xdf_player.hpp"
 #include <cctype>
 #include <ctime>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -53,6 +57,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -308,6 +313,7 @@ struct PlotScratch {
     std::vector<int>         pmap;    // raster: pixel-column -> summary-bin index
     std::vector<float>       ampScratch;  // reorderable copy for on-demand Auto-gain amplitude
     std::vector<double>      xShared;      // raw-path time axis, built once per frame (same for every channel)
+    std::vector<HfStreamSource::BreakMark> breaks;   // replay seek / loop marks in view
 };
 
 struct DisplayOpts {
@@ -411,6 +417,79 @@ static ImPlotSpec lineSpec(int c, float w) {
     return sp;
 }
 
+// Data seconds per wall second, for a source that sends faster than real time (an XDF replay
+// at 10x). Gliding at wall rate behind it leaves the plot edge about (speed - 1) / (0.02 * fps)
+// s behind the newest data, and the plot then reads past what the ring holds and draws only
+// its newest few seconds. Only speeds above real time count: a live device that drops samples
+// also measures below nominal, but its dropouts already advance the axis as gaps, so wall rate
+// is right for it. The margin keeps measurement noise from wobbling a live scroll.
+static double dataSpeedOf(const HfStreamSource& s) {
+    const double nom = s.srate(), meas = s.recentRate();   // short window: reacts to a slowdown quickly
+    if (nom <= 0.0 || meas <= 0.0) return 1.0;
+    const double v = meas / nom;
+    return v > 1.15 ? std::min(v, 1000.0) : 1.0;
+}
+// How far the plot edge trails the newest data. Between deliveries the edge glides on while
+// the newest sample stands still; if the edge passes it, the wait for the next block is
+// painted as a live dropout. A source that sends in large blocks (or a fast replay) therefore
+// needs a lag of most of one block. The base lag is 0.15 s of wall time, so data seconds scale
+// with the speed: at 5x it is 0.75 s of data. That is the room the edge needs to slow down when
+// the data does (a replay going from 5x to 1x); with 0.15 s of data it caught up with the newest
+// sample within a few frames and had to stop dead. The lag then shrinks with the speed estimate,
+// which moves the target forward exactly while the edge decelerates.
+static double edgeLagOf(const HfStreamSource& s) {
+    return std::max(0.15 * dataSpeedOf(s), 0.75 * s.chunkSpan() + 0.05);
+}
+// No data for longer than `base` seconds AND longer than this source normally waits between
+// deliveries. A fixed threshold flags a source that sends 1 s blocks as "no data" before
+// every block.
+static bool overdue(const HfStreamSource& s, double base) {
+    return s.staleSeconds() > std::max(base, s.chunkSpan() / dataSpeedOf(s) + 0.1);
+}
+
+// Moves a scrolling plot edge toward `target` (a little behind the newest data). The edge has
+// a velocity of its own: a critically damped follower with the data's speed as feed-forward.
+// The velocity therefore changes smoothly, so a change of speed (a replay going from 5x to 1x)
+// bends the scroll instead of stepping it. A first-order ease on position, with the velocity
+// recomputed every frame from a speed estimate that updates per chunk, jumped whenever the
+// estimate did or the edge hit a limit, and showed as judder. Never moves back, never past
+// `upper` (the live-dropout strip starts there). Long frames are sub-stepped to stay stable.
+// `omega` sets how closely it tracks: stiff when the target is the data's own smooth trajectory
+// (edgeTarget), soft when the feed-forward is only an estimate that lags the data.
+struct EdgeState { double pos = 0.0, vel = 1.0; };   // data seconds; data seconds per wall second
+// Stiff: tracks edgeTarget's ramps to about acceleration / omega^2 (15 ms of data while a
+// replay slows from 5x to 1x), so no lag builds up to be paid back as a dip in speed; it still
+// smooths a real jump of the target (data resuming after a stall) over about 0.1 s.
+constexpr double kEdgeStiff = 30.0;
+constexpr double kEdgeSoft  = 3.0;    // settles an estimated speed change in about a second
+
+// Where a stream's edge should be at local-clock time `now`: the data's own trajectory (see
+// HfStreamSource::trajectory), a little in the past and averaged, with its slope as the exact
+// speed. The delay covers the wall time between deliveries, so the averaging window lies within
+// delivered data and the edge never waits for the next block; the window (at least 0.15 s)
+// smooths delivery jitter and ramps a change of speed. False before the first delivery.
+static bool edgeTarget(const HfStreamSource& s, double now, double& target, double& slope) {
+    const double gapW = s.arrivalGap();
+    const double w    = std::max(0.15, 0.6 * gapW);
+    const double D    = w + 1.2 * gapW + 0.03;
+    return s.trajectory(now - D - w, now - D + w, target, slope);
+}
+static void followEdge(EdgeState& e, double target, double feedForward, double upper, double dt,
+                       double kOmega) {   // rad/s
+    const int    steps = std::max(1, (int)std::ceil(dt * 120.0));   // omega * h < 0.3: stable
+    const double h     = dt / steps;
+    for (int i = 0; i < steps; ++i) {
+        e.vel += (kOmega * kOmega * (target - e.pos) + 2.0 * kOmega * (feedForward - e.vel)) * h;
+        e.vel  = std::max(0.0, e.vel);
+        double next = e.pos + e.vel * h;
+        if (next > upper) {           // a backstop: the follower should rarely reach it
+            next  = std::max(e.pos, upper);
+            e.vel = h > 0.0 ? (next - e.pos) / h : 0.0;
+        }
+        e.pos = next;
+    }
+}
+
 // Missing-data red, OPAQUE so the hue is identical regardless of what's underneath
 // (time-series plot background vs the spectrogram's dark colormap floor) — they must
 // match across views.
@@ -425,7 +504,8 @@ static constexpr ImU32 kDropoutRed = IM_COL32(200, 45, 45, 255);
 // real data between two dropouts rather than masking it). Producer records the gap
 // before publishing samples, so resumed data is never transiently covered by the red.
 // Call inside an active plot, after the data. Spans the full Y extent.
-static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap) {
+static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap,
+                           std::uint64_t headFreeze = 0, double frozenEdge = 0.0) {
     const ImPlotRect lim = ImPlot::GetPlotLimits();
     std::vector<std::pair<double, double>> iv;
     auto [base, gv] = s.gapSnapshot();    // {folded base offset, recent gaps}, one lock
@@ -435,8 +515,16 @@ static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap) 
         prior += g.second;
         iv.push_back({a, a + g.second + extraEnd});   // recorded gap (display time)
     }
-    const double live = s.newestTime();               // live edge gap, if the edge ran ahead
-    if (lim.X.Max - live > 0.05) iv.push_back({live, lim.X.Max});
+    // Live edge gap, if the edge ran ahead. A paused display shows the moment it froze: red
+    // only where the frozen edge had run past the frozen data, and none beyond that edge when
+    // the view is panned or zoomed out (data arriving since is not drawn, but not missing).
+    if (headFreeze) {
+        const double frozen = s.realTime(s.time0() + (double)headFreeze * s.dt());
+        if (frozenEdge - frozen > 0.05) iv.push_back({frozen, frozenEdge});
+    } else {
+        const double live = s.newestTime();
+        if (lim.X.Max - live > 0.05) iv.push_back({live, lim.X.Max});
+    }
     if (iv.empty()) return;
 
     ImDrawList* dl = ImPlot::GetPlotDrawList();
@@ -452,6 +540,35 @@ static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap) 
         else { flush(cs, ce); cs = iv[i].first; ce = iv[i].second; }
     }
     flush(cs, ce);
+}
+
+// A replay's seeks and loop wraps (see HfStreamSource::markBreak). Blue and dashed, so it
+// reads as neither a marker event (solid, the stream's color) nor missing data (red): the
+// data on each side is complete, it just comes from two different parts of the recording.
+// The label sits at the bottom, clear of the marker labels at the top.
+static constexpr ImU32 kBreakBlue = IM_COL32(70, 160, 255, 255);
+static void drawBreaks(const HfStreamSource& s, std::vector<HfStreamSource::BreakMark>& marks) {
+    s.breakTimes(marks);
+    if (marks.empty()) return;
+    const ImPlotRect lim = ImPlot::GetPlotLimits();
+    ImDrawList*      dl  = ImPlot::GetPlotDrawList();
+    const float yTop = ImPlot::PlotToPixels(lim.X.Min, lim.Y.Max).y;
+    const float yBot = ImPlot::PlotToPixels(lim.X.Min, lim.Y.Min).y;
+    const float lh   = ImGui::GetTextLineHeight();
+    const float dash = uiScaled(6.0f), w = uiScaled(2.0f);
+    ImPlot::PushPlotClipRect();
+    for (const auto& b : marks) {
+        if (b.t < lim.X.Min || b.t > lim.X.Max) continue;
+        const float x = ImPlot::PlotToPixels(b.t, lim.Y.Max).x;
+        for (float y = yTop; y < yBot; y += 2.0f * dash)
+            dl->AddLine(ImVec2(x, y), ImVec2(x, std::min(y + dash, yBot)), kBreakBlue, w);
+        const float  tw = ImGui::CalcTextSize(b.label).x;
+        const float  xr = ImPlot::GetPlotPos().x + ImPlot::GetPlotSize().x;
+        const ImVec2 p(x + 3.0f + tw > xr ? x - 3.0f - tw : x + 3.0f, yBot - lh - 3.0f);   // flip near the right edge
+        dl->AddRectFilled(ImVec2(p.x - 1.0f, p.y), ImVec2(p.x + tw + 1.0f, p.y + lh), IM_COL32(0, 0, 0, 170));
+        dl->AddText(p, kBreakBlue, b.label);
+    }
+    ImPlot::PopPlotClipRect();
 }
 
 // Y axis of the stacked + raster montages. Its limits are pinned every frame, so ImPlot's axis
@@ -845,7 +962,18 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 const double pct = (nom > 0.0) ? (meas - nom) / nom * 100.0 : 0.0;
                 const bool bad = std::fabs(pct) > 5.0;
                 ImGui::TextColored(bad ? warn : ImGui::GetStyleColorVec4(ImGuiCol_Text),
-                                   "measured: %.1f Hz (%+.1f%%)", meas, pct);
+                                   "measured: %.1f Hz (%+.2f%%)", meas, pct);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Samples per second of the stream's own timestamps, over the last 5 s.\n"
+                                      "Missing samples or a device off its declared rate show here.\n"
+                                      "A replay shows its recorded rate at any replay speed.");
+                // Data arriving faster or slower than its timestamps advance: a replay.
+                const double speed = s.deliverySpeed();
+                if (speed > 0.0 && std::fabs(speed - 1.0) > 0.05) {
+                    ImGui::Text("arriving at %.2fx real time", speed);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Timestamp seconds delivered per second, over the last 5 s.");
+                }
             } else {
                 ImGui::TextDisabled("measured: --");
             }
@@ -855,7 +983,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip("LSL time_correction (remote -> local clock)");
         ImGui::Text("dropouts: %llu", (unsigned long long)s.dropouts());
         const double st = s.staleSeconds();
-        if (st > 0.5) ImGui::TextColored(warn, "no data for %.1f s", st);
+        if (overdue(s, 0.5)) ImGui::TextColored(warn, "no data for %.1f s", st);
     }
 
     // Merge the enabled streams' events into one time-sorted list for decluttered
@@ -894,13 +1022,22 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     const int    B  = s.binSamples();
     // Paused: anchor the summary read to the bin holding the frozen head.
     const std::uint64_t endBin = headFreeze ? headFreeze / (std::uint64_t)B : 0;
-    const float  histW         = lock.on ? *lock.history : o.history;  // window width (s): shared when locked
-    const double viewSamples   = (histW + 0.5) * rate;      // read past both edges
+    // Samples to read so the data covers the plot's whole x range: from its left limit to the
+    // end of the read (the newest sample, or the frozen head while paused), plus a margin so
+    // the trace runs past the edge. Taken from the actual limits, not the history width: the
+    // edge trails the newest data by up to a block of samples, and a paused plot can be
+    // panned or zoomed out. Capped at the ring, which also bounds the scratch buffers.
+    // Only valid inside the plot (after its axes are set up), where every read happens.
+    auto viewSamples = [&]() -> double {
+        const double endIdx = (double)(headFreeze ? headFreeze : s.head());
+        const double idx0   = (s.oldFrameTime(ImPlot::GetPlotLimits().X.Min) - t0) / dt;
+        return std::clamp(endIdx - idx0 + 0.5 * rate, 0.5 * rate, (double)s.ring().capacity());
+    };
     // Show the conditioned (filtered) signal when ANY stage is enabled, else raw.
     const bool   filtered = o.highpass || o.notch || o.lowpass || (o.refMode != 0);
     MinMaxSummary& summ = filtered ? s.summaryHp() : s.summary();
     auto envelopeBins = [&]() {
-        return std::max<std::size_t>(1, (std::size_t)(viewSamples / B) + 4);
+        return std::max<std::size_t>(1, (std::size_t)(viewSamples() / B) + 4);
     };
 
     // Fill xs (real time) + ys (raw, or high-pass filtered on the fly) for one
@@ -919,7 +1056,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             // high-pass -> notch -> low-pass), else the raw ring. Both rings share indices
             // (written in lockstep), so no per-frame filtering or warm-up is needed.
             InterleavedRing& rg = filtered ? s.ringHp() : s.ring();
-            const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples, rg.capacity());
+            const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples(), rg.capacity());
             std::size_t count = 0;
             rawP   = readWindow(rg, headFreeze, want, count, rawStart);
             rawVis = (int)count;
@@ -943,11 +1080,6 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         const double secPerPx = (double)o.history / (double)o.lastPlotPx;
         xedge = std::round(edge / secPerPx) * secPerPx;
     }
-    // Visible x window. Locked: the shared (caller-maintained / link-updated) range. Unlocked:
-    // this plot's own [edge-history, edge]. Used for the raster pixel grid + the scale-bar anchor.
-    const double visX1 = lock.on ? *lock.xMax : xedge;
-    const double visX0 = lock.on ? *lock.xMin : (xedge - o.history);
-
     // Arm the overlay Y auto-fit while we're in a non-overlay mode, so switching INTO
     // overlay fits once before the axis is left free (the overlay branch consumes it).
     if (o.stacked) o.overlayYFit = true;
@@ -981,8 +1113,11 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             // scrolls (the native ~0.03 s summary bins are ~2 px wide -> sub-pixel drift).
             const std::size_t maxBins = envelopeBins();
             const float  inv      = (o.gainUv > 0.0f) ? 1.0f / o.gainUv : 0.0f;
-            const double bMin     = visX0, bMax = visX1;                    // visible (locked-aware) range
-            const double secPerPx = (visX1 - visX0) / (double)px;
+            // The plot's actual range: the follow window or the locked range while live, and
+            // wherever a pan or zoom put it while paused.
+            const ImPlotRect blim  = ImPlot::GetPlotLimits();
+            const double bMin     = blim.X.Min, bMax = blim.X.Max;
+            const double secPerPx = (bMax - bMin) / (double)px;
             sc.x.resize(maxBins); sc.mn.resize(maxBins); sc.mx.resize(maxBins);
             // Channel 0 also builds the pixel-column -> summary-bin resample map (the bin
             // grid is shared by all channels, so it's computed once).
@@ -1009,7 +1144,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImPlot::PushColormap(ImPlotColormap_Plasma);
                 ImPlot::PlotHeatmap("##r", sc.raster.data(), show, px, 0.0, 1.0, nullptr,
                                     ImPlotPoint(bMin, 0.0), ImPlotPoint(bMax, (double)show));
-                drawDropoutRed(s, 0.0, 0.0);
+                drawDropoutRed(s, 0.0, 0.0, headFreeze, edge);
+                drawBreaks(s, sc.breaks);
                 if (hlRow >= 0) {   // a heatmap row can't be dimmed per-row, so outline it instead
                     const double yc = hlC0 - hlRow;
                     ImPlot::PushPlotClipRect();
@@ -1161,7 +1297,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                                    ? units[c0].c_str() : "a.u.";
             ImPlot::Annotation(xbar, 0.0, ImGui::ColorConvertU32ToFloat4(col), ImVec2(6, 0),
                                false, "%.0f %s", o.gainUv, unit);
-            drawDropoutRed(s, 0.0, 0.0);
+            drawDropoutRed(s, 0.0, 0.0, headFreeze, edge);
+            drawBreaks(s, sc.breaks);
             drawMarkers(sc.markers);
             ImPlot::EndPlot();
         }
@@ -1214,7 +1351,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImPlot::PlotLine(label, sc.x.data(), sc.y.data(), n, lineSpec(c, o.lineWidth));
             }
         }
-        drawDropoutRed(s, 0.0, 0.0);
+        drawDropoutRed(s, 0.0, 0.0, headFreeze, edge);
+        drawBreaks(s, sc.breaks);
         drawMarkers(sc.markers);
         ImPlot::EndPlot();
     }
@@ -1261,6 +1399,7 @@ struct Spectro {
     double             lastGapInserted = -1e18; // oldTime of the last dropout already blanked in
     double             colNewestTime = 0.0;     // real time of the newest column (data is pinned here)
     double             smoothNow     = 0.0;     // continuously-advancing view edge (smooth scroll)
+    double             smoothVel     = 1.0;     // its velocity (see followEdge)
     bool               smoothInit    = false;
     ImGuiTextFilter    chanFilter;              // searchable channel dropdown
     ImGuiTextFilter    streamFilter;            // searchable stream dropdown
@@ -1386,12 +1525,13 @@ struct Erp {
     std::vector<float>              taxis;      // ms, -pre .. +post
     std::vector<double>            sumv;        // running sum, nchan x nbins row-major (double for accuracy)
     int                            count = 0;   // epochs folded
+    int                            rejected = 0; // epochs left out: they span a dropout or replay seek
     std::vector<std::vector<float>> epochs;     // recent SINGLE-channel epochs (capped) for spaghetti
     std::vector<float>             avg;         // scratch: sum/count, nchan x nbins row-major
 
     std::vector<double>  pending;               // event display-times awaiting post-data
     std::vector<double>  stillScratch;          // erpUpdate: events not yet ready (reused, not per-frame allocated)
-    std::uint64_t        lastSeq = 0;
+    std::uint64_t        nextSeq = 0;           // first event seq not yet ingested
     bool                 seqInit = false;
     std::string          sUid, mUid;            // identity (auto-reset on change)
     float                yHalf = 50.0f;         // robust Y half-range (excludes spike outliers)
@@ -1408,6 +1548,7 @@ static void erpClear(Erp& e) {
     e.sumv.assign((std::size_t)e.nchan * e.nbins, 0.0);
     e.avg.assign((std::size_t)e.nchan * e.nbins, 0.0f);
     e.count = 0;
+    e.rejected = 0;
     e.epochs.clear();
     e.pending.clear();
 }
@@ -1429,7 +1570,7 @@ static void erpReset(Erp& e, HfStreamSource& s, const std::string& mUid) {
     }
     e.nchan = (int)e.chans.size();
     erpClear(e);
-    e.lastSeq = 0; e.seqInit = false;
+    e.nextSeq = 0; e.seqInit = false;
     e.sUid = s.uid(); e.mUid = mUid;
 }
 
@@ -1478,11 +1619,13 @@ static bool erpLabelMatches(const char* filter, const std::string& text) {
 
 static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
     // 1) ingest new trigger events (by stable seq) into the pending queue. The first
-    // pass after a reset only SYNCS lastSeq (no backfill) so we accumulate from now on.
+    // pass after a reset only SYNCS nextSeq (no backfill) so we accumulate from now on.
+    // Marker seqs start at 0, so this tracks the next unseen seq: a last-seen seq of 0 could
+    // not tell "saw event 0" from "saw nothing", and the first event of a fresh stream was lost.
     const bool firstPass = !e.seqInit;
     for (const auto& ev : mk.cachedEvents()) {   // const-ref to source cache (no per-frame copy)
-        if (e.seqInit && ev.seq <= e.lastSeq) continue;
-        e.lastSeq = std::max(e.lastSeq, ev.seq);
+        if (e.seqInit && ev.seq < e.nextSeq) continue;
+        e.nextSeq = std::max(e.nextSeq, ev.seq + 1);
         if (firstPass) continue;
         if (!erpLabelMatches(e.labelFilter.InputBuf, ev.text)) continue;
         e.pending.push_back(ev.t);
@@ -1505,6 +1648,14 @@ static void erpUpdate(Erp& e, HfStreamSource& s, MarkerSource& mk) {
         if (start < 0) continue;                                         // before stream start: drop
         if (head > cap && (std::uint64_t)start < head - cap) continue;   // scrolled out of ring: drop
         if ((std::uint64_t)start + (std::uint64_t)e.nbins > head) { still.push_back(T); continue; }
+        // An epoch across a dropout or a replay seek would join samples that were not
+        // adjacent (the ring has no gaps), shifting part of it in time. An event inside a
+        // dropout maps to the first sample after it, so its baseline would come from before.
+        // Leave such epochs out of the average, and count them so the window can say so.
+        if (s.discontinuityIn((std::uint64_t)start, (std::uint64_t)start + (std::uint64_t)e.nbins)) {
+            ++e.rejected;
+            continue;
+        }
         const float* p = s.ring().windowAt((std::uint64_t)start);
         // Fold this epoch into every active channel's running sum (baseline-corrected
         // per channel). One window read, strided by channel.
@@ -1566,6 +1717,10 @@ static char g_recDir[512]  = "";                          // output directory ("
 // the optional acq entity is left out of the default — add `{acq}` to the template if needed).
 static char g_recTmpl[512] =
     "sub-{subject}/ses-{session}/{modality}/sub-{subject}_ses-{session}_task-{task}_run-{run}_{modality}.xdf";
+// Tools > Replay XDF file: the folder of the last replayed file (the dialog opens there) and
+// the last speed, because a session is usually checked at the same speed every time.
+static char  g_replayDir[512] = "";
+static float g_replaySpeed    = 1.0f;
 
 // Rewrite '/' to the OS-native separator ('\' on Windows, no-op on POSIX) so the recording-name
 // field reads naturally per platform. '/' is still accepted everywhere (recFullPath make_preferred's
@@ -1585,6 +1740,8 @@ static void SettingsReadLine(ImGuiContext*, ImGuiSettingsHandler*, void*, const 
     else if (std::sscanf(line, "scale=%f", &fv) == 1)  g_uiScale = std::clamp(fv, 0.5f, 2.0f);
     else if (std::strncmp(line, "recdir=", 7) == 0)    std::snprintf(g_recDir,  sizeof(g_recDir),  "%s", line + 7);
     else if (std::strncmp(line, "rectmpl=", 8) == 0)   { std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", line + 8); toNativeSeparators(g_recTmpl); }
+    else if (std::strncmp(line, "replaydir=", 10) == 0) std::snprintf(g_replayDir, sizeof(g_replayDir), "%s", line + 10);
+    else if (std::sscanf(line, "replayspeed=%f", &fv) == 1) g_replaySpeed = std::clamp(fv, 0.5f, 20.0f);
     else if (std::sscanf(line, "streamkind=%d %511[^\n]", &v, b) == 2) g_streamKind[b] = (v != 0);
 }
 static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBuffer* buf) {
@@ -1593,6 +1750,8 @@ static void SettingsWriteAll(ImGuiContext*, ImGuiSettingsHandler* h, ImGuiTextBu
     buf->appendf("scale=%.3f\n", g_uiScale);
     buf->appendf("recdir=%s\n",  g_recDir);
     buf->appendf("rectmpl=%s\n", g_recTmpl);
+    buf->appendf("replaydir=%s\n", g_replayDir);
+    buf->appendf("replayspeed=%.2f\n", g_replaySpeed);
     // skip an empty key: it would serialize as "streamkind=0 \n", which the "%d %511[^\n]" read can't
     // round-trip (no chars before the newline). streamKey is never empty in practice (LSL uid is set).
     for (const auto& [k, kind] : g_streamKind) if (!k.empty()) buf->appendf("streamkind=%d %s\n", kind ? 1 : 0, k.c_str());
@@ -1611,6 +1770,130 @@ static void onFolderPicked(void*, const char* const* list, int) {
         g_folderPickReady.store(true, std::memory_order_release);
     }
 }
+
+// Tools > Replay XDF file: the picked file, handed over the same way as the folder above.
+// requestReplay() is also the entry point for LSL_REPLAY and the UI test, so they exercise
+// the path a real pick takes.
+static std::mutex        g_replayPickMtx;
+static std::string       g_replayPicked;
+static std::atomic<bool> g_replayPickReady{false};
+static void requestReplay(const char* path) {
+    std::lock_guard<std::mutex> lk(g_replayPickMtx);
+    g_replayPicked = path;
+    g_replayPickReady.store(true, std::memory_order_release);
+}
+static void onReplayPicked(void*, const char* const* list, int) {
+    if (list && list[0]) requestReplay(list[0]);
+}
+
+// One replay of one file. XdfPlayer::prepare() blocks for seconds on a large file (scan,
+// dejitter pre-pass), so it runs on `prep`; everything else, play() included, stays on the
+// UI thread, so the player's own threads are never started or joined from two threads.
+struct ReplaySession {
+    XdfPlayer         player;
+    std::thread       prep;
+    std::atomic<bool> prepDone{false};
+    bool              prepOk  = false;        // valid once prepDone
+    bool              started = false;        // play() was called
+    bool              stopped = false;        // Stop, or the prepare was cancelled
+    double            loadAt  = 0.0;          // ImGui time the file was picked
+    double            readyAt = 0.0;          // ImGui time prepare() returned
+    std::string       path, file;             // full path, file name
+    std::string       error;
+    // Identity of its outlets, from the headers once prepare() returned: the source_id
+    // and name of each, and the stream key (source_id|name) the viewer files them under.
+    std::vector<std::string> sids, names, keys;
+    XdfPlayer::Status            st;          // refreshed every frame; reuses its buffers
+    std::vector<std::string>     warnings;    // grows only when the player reports more
+    std::vector<XdfPlayer::Break> brk;        // scratch for new breaks
+    std::size_t                  brkSeen = 0;
+    bool   seeking = false;                   // the position slider is held
+    double seekPos = 0.0;
+    bool   warnOpened = false;                // the warnings list was opened for the first one
+
+    ~ReplaySession() { shutdown(); }
+    void shutdown() {
+        // prepare() clears the cancel flag when it starts, so a cancel can arrive too early
+        // and be lost; repeat it until prepare() has returned.
+        while (prep.joinable() && !prepDone.load(std::memory_order_acquire)) {
+            player.cancel();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (prep.joinable()) prep.join();
+        player.stop();   // joins the reader and player threads, closes the outlets
+    }
+    bool owns(const HfStreamSource& s) const {
+        for (std::size_t i = 0; i < sids.size(); ++i)
+            if (s.sourceId() == sids[i] && s.name() == names[i]) return true;
+        return false;
+    }
+};
+
+// m:ss.s, or h:mm:ss for a long recording.
+// SDL hands over UTF-8; a std::string path on Windows would be read in the ANSI code page.
+static std::filesystem::path pathFromUtf8(const std::string& s) {
+    return std::filesystem::path(std::u8string(s.begin(), s.end()));
+}
+static std::string utf8Of(const std::filesystem::path& p) {
+    const std::u8string u = p.u8string();
+    return std::string(u.begin(), u.end());
+}
+
+static void fmtClock(char* buf, std::size_t n, double s) {
+    s = std::round(std::max(0.0, s) * 10.0) / 10.0;   // else 59.96 s prints as "0:60.0"
+    const int h = (int)(s / 3600.0), m = (int)(std::fmod(s, 3600.0) / 60.0);
+    const double sec = std::fmod(s, 60.0);
+    if (h > 0) std::snprintf(buf, n, "%d:%02d:%02d", h, m, (int)sec);
+    else       std::snprintf(buf, n, "%d:%04.1f", m, sec);
+}
+
+#ifdef LSL_VIEWER_TESTS
+// For tests/ui_tests.cpp: open a file the way the dialog does, and read back the replay.
+void lslViewerRequestReplay(const char* path) { requestReplay(path); }
+struct ReplayProbe { int state = -1; double position = 0.0, length = 0.0; int shown = 0, streams = 0;
+                     unsigned long long dropouts = 0; int breakMarks = 0; std::size_t breaks = 0; };
+static ReplayProbe g_replayProbe;
+void lslViewerReplayProbe(int& state, double& position, double& length, int& streams, int& shown,
+                          unsigned long long& dropouts, int& breakMarks, std::size_t& breaks) {
+    const ReplayProbe& p = g_replayProbe;
+    state = p.state; position = p.position; length = p.length; streams = p.streams; shown = p.shown;
+    dropouts = p.dropouts; breakMarks = p.breakMarks; breaks = p.breaks;
+}
+// Connect a stream by source_id once discovery lists it, as a click on its Streams rail row
+// does (a test's own outlet is not a demo or replay stream, so nothing auto-connects it).
+static std::mutex        g_testConnectMtx;
+static std::string       g_testConnectSid;
+static std::atomic<bool> g_testConnectReq{false};
+void lslViewerRequestConnect(const char* sourceId) {
+    std::lock_guard<std::mutex> lk(g_testConnectMtx);
+    g_testConnectSid = sourceId;
+    g_testConnectReq.store(true, std::memory_order_release);
+}
+// Per connected data stream, refreshed every frame: whether it is anchored (has data), its
+// dropout count, and the total length of its recorded gaps.
+struct StreamProbe { std::string name; bool anchored = false; unsigned long long dropouts = 0; double gapSec = 0.0;
+                     double edge = 0.0, newest = 0.0, dt = 0.0, rate = 0.0, speed = 0.0; };   // edge: the plot's right edge last frame,
+static double g_probeFrameDt = 0.0;                                     // and dt: that frame's step time
+static std::vector<StreamProbe> g_streamProbes;
+bool lslViewerStreamProbe(const char* name, bool& anchored, unsigned long long& dropouts, double& gapSec,
+                          double& edge, double& newest, double& dt, double& rate, double& speed) {
+    for (const auto& p : g_streamProbes)
+        if (p.name == name) { anchored = p.anchored; dropouts = p.dropouts; gapSec = p.gapSec;
+                              edge = p.edge; newest = p.newest; dt = p.dt; rate = p.rate; speed = p.speed;
+                              return true; }
+    return false;
+}
+// The newest ERP window (an earlier test may have opened others): its id, the streams it is
+// bound to, the events its trigger stream has received, and what it averaged or left out.
+struct ErpProbe { int id = 0, count = 0, rejected = 0; std::size_t markerEvents = 0; std::string stream, trigger; };
+static ErpProbe g_erpProbe;
+void lslViewerErpProbe(int& id, std::string& stream, std::string& trigger, std::size_t& markerEvents,
+                       int& count, int& rejected) {
+    const ErpProbe& p = g_erpProbe;
+    id = p.id; stream = p.stream; trigger = p.trigger; markerEvents = p.markerEvents;
+    count = p.count; rejected = p.rejected;
+}
+#endif
 
 // Rate-limit per-frame work: returns true at most once per `period` seconds,
 // advancing `last`. (`last` starts at a large negative so the first call fires.)
@@ -1819,6 +2102,15 @@ int main(int argc, char** argv) {
     Discovery discovery;   // resolves streams continuously in the background
     MockStreams mockStreams;   // built-in demo: publishes synthetic streams on loopback
     if (std::getenv("LSL_DEMO")) mockStreams.start();   // auto-emit on launch (also via the UI toggle)
+    std::unique_ptr<ReplaySession> replay;   // Tools > Replay XDF file; kept after Stop for its panel
+    bool showReplay = false, focusReplay = false;
+    bool replayStopReq = false;              // the panel's Stop, applied where streams can be dropped
+    // Streams of a stopped replay still to drop: not while recording, which fixes the set.
+    std::vector<std::string> replayDropKeys;
+    // Outlets of the last stopped replay stay in discovery for a few seconds. A new replay of
+    // the same file has the same stream keys, so skip these by uid.
+    std::unordered_set<std::string> replayDeadUids;
+    if (const char* rp = std::getenv("LSL_REPLAY")) requestReplay(rp);
     std::vector<std::unique_ptr<HfStreamSource>> sources;
     std::vector<std::unique_ptr<HfStreamSource>> closing;  // disconnected, awaiting worker exit
     std::vector<std::unique_ptr<MarkerSource>>   markerSources;  // string/event streams
@@ -1885,7 +2177,7 @@ int main(int argc, char** argv) {
     // + erased) the first time that stream's dispOpts is touched, so it works whether the
     // stream is already connected at load time or reconnects later.
     std::unordered_map<std::string, DisplayOpts>          savedOpts;
-    std::unordered_map<const HfStreamSource*, double>      edgeMap;   // smoothed X right-edge
+    std::unordered_map<const HfStreamSource*, EdgeState>   edgeMap;   // smoothed X right-edge (+ velocity)
     std::unordered_map<const HfStreamSource*, std::uint64_t> pauseHead; // frozen head at pause
     bool showPerf     = false;   // Performance overlay (View menu; hidden by default)
     // Tools > Lock time axes: share ONE x (time) range across every time-series plot so their
@@ -1894,6 +2186,7 @@ int main(int argc, char** argv) {
     bool   lockTimeAxes = false;
     double lockXMin = 0.0, lockXMax = 0.0;
     double lockEdge = 0.0;       // smoothed shared right-edge (glides like the per-stream edges)
+    double lockVel  = 1.0;       // its velocity (see followEdge)
     float  lockHistory = 10.0f;
     bool showSpectrum = true;    // Spectrum window (View menu)
     // Spectrogram and ERP are multi-instance: "New ..." in the View menu adds a window;
@@ -2122,7 +2415,10 @@ int main(int argc, char** argv) {
 
             if (ImGui::BeginMainMenuBar()) {
                 if (ImGui::BeginMenu("App")) {
-                    ImGui::MenuItem("Pause", "P", &paused);
+                    ImGui::MenuItem("Pause display", "P", &paused);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Freeze the plots to inspect them. Data keeps arriving,\n"
+                                          "and a replay keeps playing (pause it in the Replay panel).");
                     ImGui::Separator();
                     if (ImGui::MenuItem("Light theme", nullptr, &g_light)) {
                         applyTheme(g_light); ImGui::MarkIniSettingsDirty();
@@ -2177,6 +2473,18 @@ int main(int argc, char** argv) {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Synthetic EEG (+EOG), a 1->40 Hz chirp, a 48 kHz stereo\n"
                                           "tone, and an evoked-response stream with markers.");
+                    if (ImGui::MenuItem("Replay XDF file...")) {
+                        // SDL reads the filters until the callback runs, after this frame.
+                        static const SDL_DialogFileFilter kXdf[] = {{"XDF recordings (*.xdf)", "xdf"}};
+                        // Default to where recordings go: the usual check is of the file just recorded.
+                        const char* from = g_replayDir[0] ? g_replayDir : g_recDir;
+                        std::error_code ec;
+                        if (!from[0] || !std::filesystem::is_directory(from, ec)) from = nullptr;
+                        SDL_ShowOpenFileDialog(onReplayPicked, nullptr, window, kXdf, 1, from, false);
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Play a recording back as live streams, to check it:\n"
+                                          "all streams present, no dropouts, markers in place.");
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("View")) {
@@ -2364,6 +2672,201 @@ int main(int argc, char** argv) {
                     if (fi.sourceId.rfind("mock-", 0) == 0 &&
                         !dismissed.count(fi.key) && !connected(fi))
                         connectStream(fi);
+
+            // ---- XDF replay (Tools > Replay XDF file) --------------------------------
+            // Drop a stream without marking it dismissed, so the next replay of the file shows
+            // it again. Used for the streams of a stopped replay: their outlets are gone, and a
+            // window left behind would only scroll into a dropout that is not in the file.
+            auto releaseKey = [&](const std::string& key) {
+                dockPending.erase(key); dockForce.erase(key);
+                for (auto it = sources.begin(); it != sources.end();) {
+                    if (streamKeyOf(**it) != key) { ++it; continue; }
+                    edgeMap.erase(it->get()); pauseHead.erase(it->get()); dispOpts.erase(it->get());
+                    (*it)->requestStop(); closing.push_back(std::move(*it)); it = sources.erase(it);
+                }
+                for (auto it = markerSources.begin(); it != markerSources.end();) {
+                    if (streamKeyOf(**it) != key) { ++it; continue; }
+                    (*it)->requestStop(); closingMrk.push_back(std::move(*it)); it = markerSources.erase(it);
+                }
+            };
+            // Is stream i of the replay shown? Compares the cached ids: streamKeyOf would build a
+            // string per stream per frame.
+            auto replayShown = [&](const ReplaySession& r, std::size_t i) {
+                for (auto& s : sources)       if (s->sourceId() == r.sids[i] && s->name() == r.names[i]) return true;
+                for (auto& m : markerSources) if (m->sourceId() == r.sids[i] && m->name() == r.names[i]) return true;
+                return false;
+            };
+            auto stopReplay = [&]() {
+                if (!replay || replay->stopped) return;
+                // The panel keeps showing where it stopped and what it sent; a status taken
+                // after stop() would report the position of the last seek instead.
+                if (replay->prepDone.load(std::memory_order_acquire) && replay->prepOk) replay->player.status(replay->st);
+                replay->shutdown();
+                replay->stopped = true;
+                replay->st.state = XdfPlayer::State::stopped;
+                if (!replay->prepOk) replay->error = replay->player.error();   // "cancelled" during a load
+                replayDeadUids.clear();
+                for (auto& fi : found)
+                    if (std::find(replay->keys.begin(), replay->keys.end(), fi.key) != replay->keys.end())
+                        replayDeadUids.insert(fi.uid);
+                replayDropKeys.insert(replayDropKeys.end(), replay->keys.begin(), replay->keys.end());
+                spdlog::info("replay stopped: {}", replay->file);
+            };
+            if (replayStopReq) {
+                replayStopReq = false;
+                stopReplay();
+                if (!showReplay) replay.reset();   // the panel was closed: nothing left to show
+            }
+            if (g_replayPickReady.exchange(false, std::memory_order_acquire)) {
+                std::string picked;
+                { std::lock_guard<std::mutex> lk(g_replayPickMtx); picked = g_replayPicked; }
+                stopReplay();
+                replay.reset();
+                const std::filesystem::path fp = pathFromUtf8(picked);
+                std::snprintf(g_replayDir, sizeof g_replayDir, "%s", utf8Of(fp.parent_path()).c_str());
+                ImGui::MarkIniSettingsDirty();
+                auto r = std::make_unique<ReplaySession>();
+                r->path = picked;
+                r->file = utf8Of(fp.filename());
+                r->loadAt = ImGui::GetTime();
+                XdfPlayer::Options opt;
+                opt.speed = g_replaySpeed;
+                opt.holdStampsWhilePaused = true;   // a paused replay is not missing data
+                opt.onWarning = [](const std::string& m) { spdlog::warn("replay: {}", m); };
+                ReplaySession* rs = r.get();
+                r->prep = std::thread([rs, opt, fp] {
+                    rs->prepOk = rs->player.prepare(fp, opt);
+                    rs->prepDone.store(true, std::memory_order_release);
+                });
+                replay = std::move(r);
+                showReplay = focusReplay = wantBottom = true;
+                spdlog::info("replay: loading {}", picked);
+            }
+            if (replay && !replay->stopped && replay->prepDone.load(std::memory_order_acquire)) {
+                ReplaySession& r = *replay;
+                if (r.prep.joinable()) {   // the first frame after prepare() returned
+                    r.prep.join();
+                    r.readyAt = ImGui::GetTime();
+                    if (!r.prepOk) {
+                        r.error = r.player.error();
+                        r.stopped = true;
+                        spdlog::error("replay of {} failed: {}", r.file, r.error);
+                    } else {
+                        // headers() and selected() are read-only once prepare() has returned.
+                        for (std::size_t k : r.player.selected()) {
+                            const auto& h = r.player.headers()[k];
+                            r.sids.push_back("replay-" + (h.sourceId.empty() ? h.name : h.sourceId));
+                            r.names.push_back(h.name);
+                            r.keys.push_back(r.sids.back() + "|" + h.name);
+                        }
+                    }
+                }
+                if (!r.stopped) {
+                    // Auto-connect its streams, as the demo does: honor a manual disconnect,
+                    // and keep the connected set fixed while recording.
+                    if (!recorder.active())
+                        for (auto& fi : found)
+                            if (!dismissed.count(fi.key) && !replayDeadUids.count(fi.uid) && !connected(fi) &&
+                                std::find(r.keys.begin(), r.keys.end(), fi.key) != r.keys.end())
+                                connectStream(fi);
+                    // An inlet gets only what is sent after it subscribes, so play() waits until
+                    // every stream is shown; otherwise the start of the recording would be missing
+                    // from the plots. The time-out covers a stream that discovery does not find
+                    // (discovery alone can take a few seconds).
+                    if (!r.started) {
+                        bool all = true;
+                        for (std::size_t i = 0; i < r.keys.size() && all; ++i)
+                            all = dismissed.count(r.keys[i]) || replayShown(r, i);
+                        if (all || recorder.active() || ImGui::GetTime() - r.readyAt > 10.0) {
+                            r.player.play();
+                            r.started = true;
+                        }
+                    }
+                }
+            }
+            if (replay) {
+                ReplaySession& r = *replay;
+                // Safe during prepare() too: the warnings have their own lock.
+                for (auto& w : r.player.warnings(r.warnings.size())) r.warnings.push_back(std::move(w));
+                if (!r.stopped && r.prepDone.load(std::memory_order_acquire) && r.prepOk) {   // status() reads what prepare() built
+                    r.player.status(r.st);
+                    if (r.st.breaks > r.brkSeen) {
+                        r.brk.clear();
+                        r.brkSeen = r.player.breaks(r.brk, r.brkSeen);
+                        for (const auto& b : r.brk) {
+                            char at[24], lab[24];
+                            fmtClock(at, sizeof at, b.position);
+                            std::snprintf(lab, sizeof lab, "%s %s",
+                                          b.kind == XdfPlayer::Break::Kind::seek    ? "seek to" :
+                                          b.kind == XdfPlayer::Break::Kind::restart ? "restart at" : "loop to", at);
+                            for (auto& s : sources) if (r.owns(*s)) s->markBreak(b.stamp, lab);
+                        }
+                    }
+                }
+            }
+            if (!replayDropKeys.empty() && !recorder.active()) {
+                for (auto& k : replayDropKeys) releaseKey(k);
+                replayDropKeys.clear();
+            }
+            // A replay that is not playing sends nothing, and that is not missing data: its
+            // streams hold their plot edge instead of gliding into the live dropout red. So
+            // does a stream between a seek and its first new sample (the reader's lead time).
+            const char* replayHoldWhy = nullptr;
+            if (replay && replay->prepDone.load(std::memory_order_acquire) && replay->prepOk && !replay->stopped) {
+                if (!replay->started) replayHoldWhy = "replay starting";
+                else if (replay->st.state == XdfPlayer::State::paused)   replayHoldWhy = "replay paused";
+                else if (replay->st.state == XdfPlayer::State::finished) replayHoldWhy = "replay finished";
+            }
+            auto replayHeld = [&](const HfStreamSource& s) {
+                if (!replay || replay->stopped || !replay->owns(s)) return false;
+                return replayHoldWhy != nullptr || (s.breakPending() && s.staleSeconds() < 2.0);
+            };
+#ifdef LSL_VIEWER_TESTS
+            g_replayProbe = {};
+            if (replay) {
+                ReplaySession& r = *replay;
+                ReplayProbe& p = g_replayProbe;
+                p.state = r.started ? (int)r.st.state : !r.prepDone.load() ? -2 : !r.prepOk ? -3 : r.stopped ? (int)XdfPlayer::State::stopped : -4;
+                p.position = r.st.position; p.length = r.st.length; p.breaks = r.st.breaks;
+                p.streams = (int)r.keys.size();
+                for (std::size_t i = 0; i < r.keys.size(); ++i) p.shown += replayShown(r, i) ? 1 : 0;
+                for (auto& s : sources)
+                    if (r.owns(*s)) { p.dropouts += s->dropouts(); s->breakTimes(scratch.breaks); p.breakMarks += (int)scratch.breaks.size(); }
+            }
+            if (g_testConnectReq.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lk(g_testConnectMtx);
+                for (auto& fi : found)
+                    if (fi.sourceId == g_testConnectSid) {
+                        if (!connected(fi)) connectStream(fi);
+                        g_testConnectReq.store(false, std::memory_order_release);
+                        break;
+                    }
+            }
+            g_streamProbes.clear();
+            for (auto& s : sources) {
+                StreamProbe sp;
+                sp.name = s->name(); sp.anchored = s->anchored(); sp.dropouts = s->dropouts();
+                if (auto it = edgeMap.find(s.get()); it != edgeMap.end()) sp.edge = it->second.pos;
+                if (sp.anchored) sp.newest = s->newestTime();
+                sp.dt = g_probeFrameDt;
+                sp.rate = s->measuredRate(); sp.speed = s->deliverySpeed();
+                auto [base, gv] = s->gapSnapshot();
+                sp.gapSec = base;
+                for (const auto& g : gv) sp.gapSec += g.second;
+                g_streamProbes.push_back(std::move(sp));
+            }
+            g_erpProbe = {};
+            if (!erps.empty()) {
+                const Erp& e = *erps.back();
+                ErpProbe& p = g_erpProbe;
+                p.id = e.id; p.count = e.count; p.rejected = e.rejected;
+                if (e.streamIdx >= 0 && e.streamIdx < (int)sources.size()) p.stream = sources[(std::size_t)e.streamIdx]->name();
+                if (e.markerIdx >= 0 && e.markerIdx < (int)markerSources.size()) {
+                    p.trigger      = markerSources[(std::size_t)e.markerIdx]->name();
+                    p.markerEvents = markerSources[(std::size_t)e.markerIdx]->count();
+                }
+            }
+#endif
 
             // Workspace restore: connect each required stream the FIRST time it appears (once,
             // so a later manual disconnect isn't fought). connectStream() clears `dismissed`.
@@ -2825,7 +3328,7 @@ int main(int argc, char** argv) {
                     HfStreamSource* csrc = nullptr;
                     for (auto& s : sources)
                         if (sameStream(*s, fi)) { csrc = s.get(); break; }
-                    const bool  stale = csrc && csrc->staleSeconds() > 1.0;
+                    const bool  stale = csrc && overdue(*csrc, 1.0) && !replayHeld(*csrc);
                     const char* tag   = !csrc ? "" : (stale ? "[no data] " : "[on] ");
                     // Whole entry is clickable: connect (or focus its plot if connected).
                     char rate[24];
@@ -2906,6 +3409,10 @@ int main(int argc, char** argv) {
 
             // ---- One scrolling plot per connected stream ----------------
             const double frameDtSec = (double)frameMs / 1000.0;
+            const double nowLsl     = lsl::local_clock();   // the clock deliveries are stamped with
+#ifdef LSL_VIEWER_TESTS
+            g_probeFrameDt = frameDtSec;   // read by next frame's probe, with the edge this frame sets
+#endif
             const bool   justPaused = paused && !pausedPrev;
             HfStreamSource* toRemove = nullptr;
             int winIdx = 0;
@@ -2913,18 +3420,47 @@ int main(int argc, char** argv) {
             // Lock time axes: maintain the shared x window before drawing the plots. While live,
             // slide it to follow the newest data across all streams; while paused, leave it so the
             // ImPlot axis-links let the user pan/zoom one plot and have every other follow. The edge
-            // is SMOOTHED the same way the per-stream edges are (glide at wall-clock rate + ease
+            // is SMOOTHED the same way the per-stream edges are (glide at the data's rate + ease
             // toward the chunky newestTime), else the scroll snaps per chunk. (Re)init if empty.
             if (lockTimeAxes) {
-                double gNewest = 0.0;
-                for (auto& s : sources) if (s->anchored()) gNewest = std::max(gNewest, s->newestTime());
+                double gNewest = 0.0, gSpeed = 1.0;
+                double gTarget = std::numeric_limits<double>::infinity();
+                double gUpper  = std::numeric_limits<double>::infinity();   // just behind the least advanced
+                bool   anyLive = false;                 // a stream not held by a replay pause
+                for (auto& s : sources)
+                    if (s->anchored()) {
+                        gNewest = std::max(gNewest, s->newestTime());
+                        if (replayHeld(*s)) continue;
+                        anyLive = true;
+                        if (!overdue(*s, 0.5)) {
+                            // Follow the least advanced flowing stream's trajectory (see
+                            // edgeTarget), so none of them shows its wait for the next block as
+                            // a dropout; its slope is the speed to glide at.
+                            const double nw = s->newestTime();
+                            double tgt = nw - edgeLagOf(*s), ff = dataSpeedOf(*s);
+                            edgeTarget(*s, nowLsl, tgt, ff);
+                            if (tgt < gTarget) { gTarget = tgt; gSpeed = ff; }
+                            gUpper = std::min(gUpper, nw - 0.05);
+                        }
+                    }
                 const double w = std::clamp(lockHistory, 1.0f, 60.0f);
                 if (!paused && gNewest > 0.0) {
-                    const double target = gNewest - 0.15;
-                    lockEdge += frameDtSec;                 // glide at wall-clock rate
-                    const double gap = target - lockEdge;
-                    if (lockEdge <= 0.0 || gap > w || gap < -0.25) lockEdge = target;  // init / resync
-                    else                                           lockEdge += 0.02 * gap;  // ease
+                    const bool   flowing = std::isfinite(gTarget);
+                    const double target  = flowing ? gTarget : gNewest - 0.15;
+                    if (lockEdge <= 0.0 || target - lockEdge > w) {                     // init / far behind
+                        lockEdge = target; lockVel = gSpeed;
+                    } else if (!anyLive) {                                               // held: no live red
+                        lockEdge = std::min(lockEdge, target + 0.05); lockVel = 0.0;
+                    } else if (!flowing) {                                               // all stale: red grows
+                        lockVel = 1.0;
+                        lockEdge = std::min(lockEdge + frameDtSec, target + w);
+                    } else {
+                        // As a stream's own edge (see followEdge): never back, never into a
+                        // live-dropout strip, and smooth through speed changes.
+                        EdgeState es{lockEdge, lockVel};
+                        followEdge(es, target, gSpeed, gUpper, frameDtSec, kEdgeStiff);
+                        lockEdge = es.pos; lockVel = es.vel;
+                    }
                     lockXMax = lockEdge;
                     lockXMin = lockEdge - w;
                 } else if (lockXMax <= lockXMin && gNewest > 0.0) {   // first-frame init while paused
@@ -2951,35 +3487,48 @@ int main(int argc, char** argv) {
                 if (!paused && s->frozen()) s->unfreeze();   // pause ended -> back to the live ring
                 if (s->anchored()) {
                     auto it = edgeMap.find(s.get());
-                    const double target = s->newestTime() - 0.15;  // slightly behind newest
-                    const bool   stale  = s->staleSeconds() > 0.5;
+                    const double target = s->newestTime() - edgeLagOf(*s);  // behind newest
+                    const bool   stale  = overdue(*s, 0.5);
                     if (paused) {
                         // Freeze the edge AND snapshot the data so nothing scrolls or scrolls
                         // out of the (live, still-filling) ring while paused. freeze() also on a
                         // stream that connects mid-pause. Reads anchor on the snapshot's head.
-                        edge = (it != edgeMap.end()) ? it->second : target;
+                        edge = (it != edgeMap.end()) ? it->second.pos : target;
                         if (!s->frozen()) s->freeze();
                         pauseHead[s.get()] = s->snapHead();
                         headFreeze = s->snapHead();
                     } else if (it == edgeMap.end()) {
                         edge = target;
-                        edgeMap[s.get()] = edge;
+                        edgeMap[s.get()] = EdgeState{edge, dataSpeedOf(*s)};
+                    } else if (replayHeld(*s)) {
+                        // No glide, and stop short of the newest data (drawDropoutRed paints
+                        // anything past it): the replay is paused, not dropping data.
+                        EdgeState& es = it->second;
+                        es.pos = std::min(es.pos, target + 0.05);
+                        es.vel = 0.0;               // resume from rest
+                        edge = es.pos;
                     } else {
-                        // Constant, refresh-paced velocity keeps the scroll smooth.
-                        edge = it->second + frameDtSec;
-                        const double gap = target - edge;   // +: behind data; -: ahead
+                        EdgeState& es = it->second;
                         if (stale) {
-                            // Let the edge run past the (frozen) newest data — that growing
+                            // Glide at wall rate past the (frozen) newest data — that growing
                             // margin is the live dropout, painted red by drawDropoutRed — but
                             // cap it at one window so a dead stream keeps the last data on
                             // screen instead of scrolling into all-red.
-                            if (edge - target > (double)o.history) edge = target + (double)o.history;
-                        } else if (gap > (double)o.history || gap < -0.25) {
-                            edge = target;          // resync after a stall / big drift
+                            es.vel  = 1.0;
+                            es.pos += frameDtSec;
+                            if (es.pos - target > (double)o.history) es.pos = target + (double)o.history;
                         } else {
-                            edge += 0.02 * gap;     // gentle alignment, ~constant velocity
+                            double tgt = target, ff = dataSpeedOf(*s);   // before the first delivery
+                            edgeTarget(*s, nowLsl, tgt, ff);
+                            if (tgt - es.pos > (double)o.history) {
+                                es = EdgeState{tgt, ff};                 // far behind (after a stall)
+                            } else {
+                                // The newest data never moves back, so neither does the edge: a
+                                // slowdown ramps the scroll down instead of snapping it back.
+                                followEdge(es, tgt, ff, s->newestTime() - 0.05, frameDtSec, kEdgeStiff);
+                            }
                         }
-                        edgeMap[s.get()] = edge;
+                        edge = es.pos;
                     }
                 }
                 // Forced re-dock for a stream that connected but restored floating (see
@@ -3002,7 +3551,10 @@ int main(int argc, char** argv) {
                 std::string title = id;
                 if (s->anchored()) {
                     const double st = s->staleSeconds();
-                    if (st > 0.5) {
+                    if (replayHoldWhy && replayHeld(*s)) {
+                        title += "  -  ";
+                        title += replayHoldWhy;
+                    } else if (overdue(*s, 0.5)) {
                         char buf[48];
                         std::snprintf(buf, sizeof(buf), "  -  no data %.1fs", st);
                         title += buf;
@@ -3370,21 +3922,30 @@ int main(int argc, char** argv) {
                         // live, and while stalled it runs ahead freely so the red gap scrolls
                         // in at the same steady rate.
                         const double dataEdge = bMax;
-                        const bool   stalling = !paused && src->staleSeconds() > 0.4;
+                        // A source that sends in blocks (or a fast replay) goes quiet between
+                        // deliveries: count it as stalled only once the next block is overdue,
+                        // trail the data by the same extra lag as the time series, and glide
+                        // at the data's rate. All three are the old values for a smooth source.
+                        const double speed    = dataSpeedOf(*src);
+                        const double lagX     = edgeLagOf(*src) - 0.15;
+                        const bool   stalling = !paused && overdue(*src, 0.4) && !replayHeld(*src);
                         const double frameDt  = (double)ImGui::GetIO().DeltaTime;
                         if (!spectro.smoothInit) {
-                            spectro.smoothNow = dataEdge; spectro.smoothInit = true;
+                            spectro.smoothNow = dataEdge - lagX; spectro.smoothInit = true;
                         } else if (paused) {
                             // frozen — leave smoothNow as-is
+                        } else if (dataEdge - lagX - spectro.smoothNow > spectro.spanSec) {
+                            spectro.smoothNow = dataEdge - lagX;          // far behind → snap forward
+                            spectro.smoothVel = speed;
+                        } else if (stalling) {
+                            spectro.smoothVel  = 1.0;                     // the red gap scrolls in at wall rate
+                            spectro.smoothNow += frameDt;
                         } else {
-                            spectro.smoothNow += frameDt;                 // constant velocity
-                            const double gap = dataEdge - spectro.smoothNow;
-                            if (gap > spectro.spanSec) {
-                                spectro.smoothNow = dataEdge;             // far behind → snap forward
-                            } else if (!stalling) {
-                                if (gap < -0.25) spectro.smoothNow = dataEdge;   // overshoot → snap
-                                else             spectro.smoothNow += 0.02 * gap; // gentle align
-                            }
+                            // As the time series edge (see followEdge): smooth through speed
+                            // changes, never back, never past the data.
+                            EdgeState es{spectro.smoothNow, spectro.smoothVel};
+                            followEdge(es, dataEdge - lagX, speed, dataEdge, frameDt, kEdgeSoft);
+                            spectro.smoothNow = es.pos; spectro.smoothVel = es.vel;
                         }
                         const double viewNewest = stalling ? spectro.smoothNow
                                                            : std::min(spectro.smoothNow, dataEdge);
@@ -3444,6 +4005,7 @@ int main(int argc, char** argv) {
                             // series; real data between dropouts is shown (not masked).
                             drawDropoutRed(*src,
                                 (double)spectro.nfft * src->dt() - 0.5 * spectro.hopSec, 0.0);
+                            drawBreaks(*src, scratch.breaks);
                             ImPlot::EndPlot();
                         }
                         ImGui::SameLine();
@@ -3554,6 +4116,13 @@ int main(int argc, char** argv) {
                         ImGui::SetTooltip("render the averaged ERP as a channels x time heatmap (color = µV),\none row per channel — the trigger-aligned twin of the time-series raster");
                     ImGui::SameLine();
                     ImGui::TextDisabled("%d epoch%s", erp.count, erp.count == 1 ? "" : "s");
+                    if (erp.rejected > 0) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.20f, 1.0f), "(%d left out)", erp.rejected);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Epochs that span a dropout (or a replay seek) are not averaged:\n"
+                                              "the samples on either side were not adjacent in time.");
+                    }
                     ImGui::EndChild();   // cfg
                     ImGui::SameLine();
 
@@ -3831,6 +4400,185 @@ int main(int argc, char** argv) {
                 markerReveal = nullptr;   // one-shot: consumed whether or not the window was open
             }
 
+            // ---- Replay panel (Tools > Replay XDF file) ----------------------------------
+            // Pause here pauses the replay, the data source. The App menu's "Pause display"
+            // only freezes the plots, so the labels name which one each is.
+            if (showReplay) {
+                ImGui::SetNextWindowDockID(dockBottom, dockCond);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(560), uiScaled(320)), ImGuiCond_FirstUseEver);
+                if (focusReplay) { ImGui::SetNextWindowFocus(); focusReplay = false; }
+                bool open = true;
+                ImGui::Begin("Replay", &open);
+                const ImVec4 green(0.40f, 0.85f, 0.45f, 1.0f), amber(1.0f, 0.72f, 0.20f, 1.0f), red(1.0f, 0.4f, 0.4f, 1.0f);
+                if (!replay) {
+                    ImGui::TextDisabled("Tools > Replay XDF file... plays a recording back as live streams.");
+                } else if (!replay->prepDone.load(std::memory_order_acquire)) {
+                    ImGui::Text("Loading %s... %.0f s", replay->file.c_str(), ImGui::GetTime() - replay->loadAt);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", replay->path.c_str());
+                    ImGui::TextDisabled("Reading the file index and creating the streams.");
+                    if (ImGui::Button("Cancel")) replayStopReq = true;
+                } else {
+                    ReplaySession& r = *replay;
+                    const XdfPlayer::Status& st = r.st;
+                    // Warnings matter most for a damaged file: listed above the streams, and opened
+                    // for the first one.
+                    auto drawWarnings = [&] {
+                        if (!r.warnings.empty() && !r.warnOpened) { ImGui::SetNextItemOpen(true); r.warnOpened = true; }
+                        char wh[48];
+                        std::snprintf(wh, sizeof wh, "Warnings (%zu)###replaywarn", r.warnings.size());
+                        if (ImGui::CollapsingHeader(wh)) {
+                            if (r.warnings.empty()) {
+                                ImGui::TextDisabled("None so far.");
+                            } else {
+                                const ImGuiStyle& gs = ImGui::GetStyle();
+                                const float h = std::min(uiScaled(120), (float)r.warnings.size() * ImGui::GetTextLineHeightWithSpacing() +
+                                                                        2.0f * gs.WindowPadding.y + gs.ScrollbarSize);
+                                ImGui::BeginChild("##replaywarns", ImVec2(0, h), ImGuiChildFlags_Borders,
+                                                  ImGuiWindowFlags_HorizontalScrollbar);
+                                ImGui::PushStyleColor(ImGuiCol_Text, amber);
+                                ImGuiListClipper clip;   // a badly damaged file can report thousands
+                                clip.Begin((int)r.warnings.size());
+                                while (clip.Step())
+                                    for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i)
+                                        ImGui::TextUnformatted(r.warnings[(std::size_t)i].c_str());
+                                ImGui::PopStyleColor();
+                                ImGui::EndChild();
+                            }
+                        }
+                    };
+                    char conn[64];
+                    const char* state = "stopped";
+                    ImVec4 stateCol = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+                    const bool cancelled = r.error == "cancelled";
+                    if (!r.prepOk)            { state = cancelled ? "cancelled" : "failed"; if (!cancelled) stateCol = red; }
+                    else if (!r.started) {
+                        int n = 0;
+                        for (std::size_t i = 0; i < r.keys.size(); ++i) n += replayShown(r, i) ? 1 : 0;
+                        std::snprintf(conn, sizeof conn, "connecting streams (%d of %zu)...", n, r.keys.size());
+                        state = r.stopped ? "stopped" : conn;
+                    }
+                    else switch (st.state) {
+                        case XdfPlayer::State::playing:  state = "playing";  stateCol = green; break;
+                        case XdfPlayer::State::paused:   state = "paused";   stateCol = amber; break;
+                        case XdfPlayer::State::finished: state = "finished"; break;
+                        case XdfPlayer::State::failed:   state = "failed";   stateCol = red;   break;
+                        default: break;
+                    }
+                    ImGui::TextUnformatted(r.file.c_str());
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", r.path.c_str());
+                    ImGui::SameLine();
+                    ImGui::TextColored(stateCol, "\xc2\xb7 %s", state);
+                    if (!r.prepOk) {
+                        if (!cancelled) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, red);
+                            ImGui::TextWrapped("%s", r.error.c_str());
+                            ImGui::PopStyleColor();
+                        }
+                        if (ImGui::Button("Replay again")) requestReplay(r.path.c_str());
+                        drawWarnings();
+                    } else {
+                        const bool live = r.started && !r.stopped;
+                        ImGui::BeginDisabled(!live);
+                        // Position: the value follows playback until the slider is grabbed, and the
+                        // seek happens once on release. A seek per drag frame would restart the
+                        // reader every frame and stack up break marks.
+                        char cur[24], len[24], fmt[64];
+                        double v = r.seeking ? r.seekPos : st.position;
+                        const double lo = 0.0, hi = std::max(st.length, 1e-3);
+                        fmtClock(cur, sizeof cur, v);
+                        fmtClock(len, sizeof len, st.length);
+                        std::snprintf(fmt, sizeof fmt, "%s / %s%s", cur, st.lengthExact ? "" : "~", len);
+                        ImGui::SetNextItemWidth(-1.0f);
+                        ImGui::SliderScalar("##replaypos", ImGuiDataType_Double, &v, &lo, &hi, fmt);
+                        if (ImGui::IsItemActivated()) r.seeking = true;
+                        if (r.seeking) r.seekPos = v;
+                        if (ImGui::IsItemDeactivated()) {
+                            if (ImGui::IsItemDeactivatedAfterEdit()) r.player.seek(r.seekPos);
+                            r.seeking = false;
+                        }
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                            ImGui::SetTooltip("Drag or click to seek; Ctrl+click to type seconds.\n"
+                                              "A seek shows in the plots as a dashed blue line.");
+                        const bool playing = st.state == XdfPlayer::State::playing;
+                        const char* pp = playing || !r.started ? "Pause replay"
+                                       : st.state == XdfPlayer::State::finished ? "Play again" : "Resume replay";
+                        // Sized for the longest label, so the controls after it stay in place.
+                        const float ppW = ImGui::CalcTextSize("Resume replay").x + 2.0f * ImGui::GetStyle().FramePadding.x;
+                        if (ImGui::Button(pp, ImVec2(ppW, 0.0f))) { if (playing) r.player.pause(); else r.player.resume(); }
+                        ImGui::SameLine();
+                        static const double kSpeeds[] = {0.5, 1.0, 2.0, 5.0, 10.0, 20.0};
+                        static const char*  kSpeedNames[] = {"0.5x", "1x", "2x", "5x", "10x", "20x"};
+                        int si = 0;
+                        for (int i = 1; i < 6; ++i)
+                            if (std::fabs(kSpeeds[i] - st.speed) < std::fabs(kSpeeds[si] - st.speed)) si = i;
+                        ImGui::SetNextItemWidth(uiScaled(64));
+                        if (ImGui::Combo("##replayspeed", &si, kSpeedNames, 6)) {
+                            r.player.setSpeed(kSpeeds[si]);
+                            g_replaySpeed = (float)kSpeeds[si];
+                            ImGui::MarkIniSettingsDirty();
+                        }
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Replay speed. The plots keep the recorded time axis.");
+                        ImGui::SameLine();
+                        bool loop = st.loop;
+                        if (ImGui::Checkbox("Loop", &loop)) r.player.setLoop(loop);
+                        ImGui::SameLine();
+                        if (ImGui::Button("Stop")) replayStopReq = true;
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Close the replay's streams and remove their plots.");
+                        ImGui::EndDisabled();
+                        if (r.stopped) {
+                            ImGui::SameLine();
+                            if (ImGui::Button("Replay again")) requestReplay(r.path.c_str());
+                        }
+                        ImGui::SameLine();
+                        if (st.late > 0) ImGui::TextColored(amber, "late chunks: %llu", (unsigned long long)st.late);
+                        else             ImGui::TextDisabled("late chunks: 0");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Chunks read from the file after their time, then sent at once.\n"
+                                              "A few after a seek are normal. A steady count means the\n"
+                                              "disk or CPU cannot keep up at this speed.");
+                        if (paused)
+                            ImGui::TextColored(amber, "Display paused (P): the plots are frozen, the replay goes on.");
+
+                        drawWarnings();
+                        // Streams: what the file holds against what reached the viewer, so a
+                        // missing stream is easy to see.
+                        char sh[48];
+                        std::snprintf(sh, sizeof sh, "Streams (%zu)###replaystreams", st.streams.size());
+                        if (ImGui::CollapsingHeader(sh, ImGuiTreeNodeFlags_DefaultOpen) &&
+                            ImGui::BeginTable("##replaytbl", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                                                ImGuiTableFlags_SizingFixedFit)) {
+                            ImGui::TableSetupColumn("Stream", ImGuiTableColumnFlags_WidthStretch);
+                            // Counts grow every frame; a width fit to last frame's text clips the new digit.
+                            const float numW = ImGui::CalcTextSize("000000000").x;
+                            ImGui::TableSetupColumn("Rate");
+                            ImGui::TableSetupColumn("Sent", ImGuiTableColumnFlags_WidthFixed, numW);
+                            ImGui::TableSetupColumn("In file", ImGuiTableColumnFlags_WidthFixed, numW);
+                            ImGui::TableSetupColumn("Viewer");
+                            ImGui::TableHeadersRow();
+                            for (std::size_t i = 0; i < st.streams.size(); ++i) {
+                                const XdfPlayer::StreamStatus& ss = st.streams[i];
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn(); ImGui::TextUnformatted(ss.name.c_str());
+                                if (ImGui::IsItemHovered())
+                                    ImGui::SetTooltip("%s \xc2\xb7 %d ch \xc2\xb7 %s", ss.type.c_str(), ss.channels, ss.format.c_str());
+                                ImGui::TableNextColumn();
+                                if (ss.srate > 0) ImGui::Text("%g Hz", ss.srate); else ImGui::TextUnformatted("irregular");
+                                ImGui::TableNextColumn(); ImGui::Text("%llu", (unsigned long long)ss.pushed);
+                                ImGui::TableNextColumn(); ImGui::Text("%llu", (unsigned long long)ss.fileSamples);
+                                ImGui::TableNextColumn();
+                                if (i < r.sids.size() && replayShown(r, i)) ImGui::TextColored(green, "shown");
+                                else if (i < r.keys.size() && dismissed.count(r.keys[i])) ImGui::TextDisabled("closed");
+                                else ImGui::TextDisabled("-");
+                            }
+                            ImGui::EndTable();
+                        }
+                    }
+                }
+                ImGui::End();
+                if (!open) { showReplay = false; replayStopReq = true; }
+            }
+
             if (showMetrics) {
                 if (focusMetrics) { ImGui::SetNextWindowFocus(); focusMetrics = false; }
                 ImGui::SetNextWindowDockID(dockBottom, dockCond);
@@ -3999,8 +4747,13 @@ int main(int argc, char** argv) {
 #endif
     for (auto& s : sources)       s->requestStop();  // signal all so joins overlap
     for (auto& m : markerSources) m->requestStop();
+    if (replay) replay->player.cancel();        // a prepare in progress starts to wind down meanwhile
     sources.clear();                            // joins worker threads via ~HfStreamSource
     markerSources.clear();
+    // After the inlets: an inlet whose outlet goes first tries to reconnect, and closing it
+    // then waits for that attempt (seconds). Cancels and joins a prepare in progress, joins
+    // the player's threads, and closes the outlets.
+    replay.reset();
 
     if (io.IniFilename) ImGui::SaveIniSettingsToDisk(io.IniFilename);  // persist theme/path on exit
     if (iBeamCursor) SDL_DestroyCursor(iBeamCursor);

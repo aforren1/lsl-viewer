@@ -6,12 +6,12 @@ Every push builds binaries on CI ([.github/workflows/build.yml](../.github/workf
 grab them from the run's **Artifacts**:
 
 - `lsl-viewer-linux` / `lsl-viewer-linux-aarch64` / `lsl-viewer-macos` / `lsl-viewer-windows`
-  — self-contained (static) `lsl_viewer` + `xdf_record` for each OS/arch, plus `LICENSE`,
+  — self-contained (static) `lsl_viewer` + `xdf_record` + `xdf_replay` for each OS/arch, plus `LICENSE`,
   `THIRD_PARTY_LICENSES`, and `portable.txt` (a [portable](#data-and-config-locations) build).
 - `lsl-viewer-windows-installer` — **`lsl-viewer-setup.exe`**, an Inno Setup installer that
   drops the app into `Program Files` and uses the standard per-user locations.
 - `lsl-viewer-macos-dmg` — **`LSL-Viewer.dmg`**, a drag-to-Applications disk image with an
-  `LSL Viewer.app` bundle (and the `xdf_record` CLI alongside it).
+  `LSL Viewer.app` bundle (and the `xdf_record` and `xdf_replay` CLIs alongside it).
 - `lsl-viewer-appimage-x86_64` / `lsl-viewer-appimage-aarch64` — a portable
   **`LSL-Viewer-<arch>.AppImage`** built on an older glibc and with **both X11 and Wayland**
   backends, so it runs across desktops and distros (the host still provides the GPU driver /
@@ -21,7 +21,7 @@ grab them from the run's **Artifacts**:
   (`ldd` says "not a dynamic executable"), so the single ~1.3 MB binary runs on **any** Linux —
   ancient glibc, Alpine/musl, minimal containers — with nothing to install. The GUI viewer can't
   be fully static (it needs the host's GPU driver + display libraries at runtime), which is why
-  only the recorder ships this way.
+  only the recorder ships this way. The artifact also holds a static `xdf_replay`.
 
 The per-OS `lsl-viewer-linux` artifact and the AppImage are both built on Ubuntu 22.04, so
 both need glibc 2.34 and `GLIBCXX_3.4.30` (GCC 12) or newer on the host: Ubuntu 22.04,
@@ -75,6 +75,61 @@ uv run tools/xdf_replay.py rec.xdf --suffix _replay --loop
 uv run tools/xdf_replay.py rec.xdf --streams type:EEG,type:Markers --start 60 --duration 30
 ```
 
+`xdf_replay` is the same tool as a compiled CLI. It is built with the viewer and in
+an `-DLSL_CLI_ONLY=ON` configure, and it needs no Python. It takes the same options
+and prints the same output. Use it at the rig to check a recording right after you
+make it, for example at 10 times real time with the viewer open:
+
+```bash
+xdf_replay rec.xdf --list
+xdf_replay rec.xdf --speed 10
+```
+
+At a speed other than 1, `--timestamps` sets how the timestamps follow the speed:
+
+- `recording` (default): the timestamps keep the recorded spacing. The viewer then
+  shows recording seconds on its time axis, dropouts with their recorded width, and
+  markers on the correct samples. The timestamps run ahead of `local_clock()`.
+- `scaled`: the spacing is divided by the speed, so the timestamps track
+  `local_clock()`. This is what `tools/xdf_replay.py` does. In the viewer, the
+  dropouts become narrower by the speed factor and the markers move away from
+  their samples.
+
+Each source_id gets the prefix `replay-` (`--source-id-prefix`). Thus a recorder
+or a viewer workspace that matches on the source_id does not take the replay for
+the live device.
+
+The outlets are visible on the whole network, as for any LSL source. A recorder
+that selects streams by name and host (LabRecorder's `RequiredStreams`) also
+selects a replay that runs on the host of the device. To prevent this, add a
+suffix to the names with `--suffix _replay`. The liblsl configuration cannot
+make the outlets local only: `ResolveScope = machine` alone does not hide them
+from other hosts, and `ListenAddress = 127.0.0.1` hides them but also stops a
+resolver on the same machine that uses liblsl 1.17 (such as this viewer) from
+finding more than one of them.
+
+At 10 times real time, the viewer's plot edge moves at the speed of the data, so
+the plots show the full time window while the replay runs.
+
+The viewer can also replay a file itself, with no terminal. Select **Tools >
+Replay XDF file...** and then the file. The viewer creates the streams, shows
+them, and then starts the replay. It uses the same engine as `xdf_replay`, with
+`recording` timestamps. The **Replay** panel has these controls:
+
+- The position slider. Release it to seek, or Ctrl+click it to type the seconds.
+  A seek shows in the plots as a dashed blue line. The viewer does not show a
+  seek as a dropout, because no data is missing from the file.
+- **Pause replay** stops the data until you select **Resume replay**. **Pause
+  display** (App menu, or the P key) only freezes the plots, and the replay
+  continues.
+- The speed (0.5 to 20 times real time) and **Loop**. A loop wrap also shows as a
+  dashed blue line.
+- **Stop** closes the streams and removes their plots.
+- The warnings for a damaged file, and the samples sent for each stream.
+
+To open a file from a script, set `LSL_REPLAY` to its path. The viewer then opens
+the file at launch, as if you selected it in the dialog.
+
 By default the viewer waits for you to connect streams from the **Streams** rail;
 set `LSL_AUTOCONNECT=1` to auto-connect everything it discovers.
 
@@ -112,7 +167,7 @@ uv run tests/compare_labrecorder.py        # all mock streams, incl. 48 kHz audi
 | `-DLSL_VIEWER_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]` |
 | `-DLSL_VIEWER_TRACY=ON`  | enable the [Tracy](https://github.com/wolfpld/tracy) frame profiler (connect the Tracy server to view) |
 | `-DLSL_VIEWER_STATIC=ON` | static-link SDL3 + liblsl into one self-contained binary (see below) |
-| `-DLSL_CLI_ONLY=ON` | build **only** the headless `xdf_record` (skip all GUI deps: SDL3/ImGui/ImPlot/KissFFT). With `-DLSL_VIEWER_STATIC=ON` + a musl toolchain + `-DCMAKE_EXE_LINKER_FLAGS=-static` → a fully-static recorder with no glibc/GPU deps |
+| `-DLSL_CLI_ONLY=ON` | build **only** the headless `xdf_record` and `xdf_replay` (skip all GUI deps: SDL3/ImGui/ImPlot/KissFFT). With `-DLSL_VIEWER_STATIC=ON` + a musl toolchain + `-DCMAKE_EXE_LINKER_FLAGS=-static` → a fully-static recorder with no glibc/GPU deps |
 | `-DSDL_X11=OFF`   | Linux/WSL: build the Wayland backend only |
 
 There's also a lightweight built-in text profiler: run with `LSL_PROFILE=1` for a
@@ -171,13 +226,16 @@ src/                     the viewer — one translation unit + header-only modul
   fft.hpp                  FFT + PSD (spectrum and spectrogram views)
   recorder.hpp             XDF recording driver (records connected streams)
   xdf_writer.hpp           XDF container writer
+  xdf_reader.hpp           XDF scan, chunk index, decoder, pyxdf clock sync and dejitter
+  xdf_player.hpp           XDF replay engine (outlets, playback clock, pause/seek/speed/loop)
   remote_control.hpp       TCP remote-control server (start/stop/status)
   theme.hpp                UI theme + embedded font
   profiler.hpp             zone-profiling macros (text profiler / Tracy / no-op)
 
 tools/                   standalone helpers (not linked into the viewer)
   lsl_test_streams.py      synthetic LSL sources for testing
-  xdf_replay.py            replays an XDF recording as live LSL outlets
+  xdf_replay.py            replays an XDF recording as live LSL outlets (reference implementation)
+  xdf_replay.cpp           the same as a compiled CLI, on src/xdf_player.hpp (no GUI deps)
   xdf_record.cpp           headless XDF recorder CLI (no GUI deps)
 
 tests/                   Dear ImGui Test Engine UI tests + screenshot captures
