@@ -19,7 +19,7 @@ To try all the views without an external source, launch the application and sele
 - To find one channel quickly, hover over its name in the stacked montage or raster. The viewer highlights its lane. Click the name to keep the highlight. To remove it, click the name again or right-click a channel name.
 - A pause control, to examine a frozen window.
 - Dropouts show as gaps on the real timeline. The viewer does not join the data across the missing span.
-- **Lock time axes** (Tools menu) applies one time window to all stream plots. The plots stay aligned, and they pan and zoom together. If a plot becomes difficult to read, **Reset view** in its panel puts it back to the default framing.
+- **Lock time axes** (View menu) applies one time window to all stream plots. The plots stay aligned, and they pan and zoom together. If a plot becomes difficult to read, **Reset view** in its panel puts it back to the default framing.
 - Marker and event streams show as labeled event lines on the time series. The **Marker events** log (View menu) also lists them as a scrolling `time  value` feed. Thus you can see the events when no continuous stream is running.
 
 ### Signal conditioning
@@ -52,22 +52,22 @@ You can apply the filter stages in any combination. The spectrum, spectrogram, a
 - XDF recording of all connected streams. The files are compatible with LabRecorder, which was checked against LabRecorder output with `pyxdf`. The viewer keeps the raw timestamps and the clock-offset chunks, thus an importer can align the streams to a common clock.
 - Filename templates, such as `sub-{subject}_task-{task}_run-{run}_eeg.xdf`.
 - A headless CLI, `xdf_record`, that records without the GUI.
-- **Replay XDF file** (Tools menu) plays a recording back as live streams in the viewer, at 0.5 to 20 times real time. Use it to check a recording right after you make it: all streams are present, there are no dropouts, and the markers are in the correct positions. The **Replay** panel has a position slider, pause, speed, loop, and stop. It also lists the warnings for a damaged file and the samples sent for each stream. A seek or a loop shows in the plots as a dashed blue line. The viewer does not show it as a dropout.
+- **Playback** (at the bottom of the Streams rail) plays a recording back as live streams in the viewer, at 0.5 to 20 times real time. Use it to check a recording right after you make it: all streams are present, there are no dropouts, and the markers are in the correct positions. Select **Open XDF file...** to start. Playback has a position slider, pause, speed, loop, and stop. In the stream list, the rows of the replayed streams show the samples sent and the samples in the file. Playback lists the file streams that are not in the viewer, and the warnings for a damaged file. A seek or a loop shows in the plots as a dashed blue line. The viewer does not show it as a dropout.
 - A CLI, `xdf_replay`, that replays an XDF file as live LSL streams, also faster than real time. Use it at the rig to check a recording right after you make it, for example with `xdf_replay rec.xdf --speed 10` and the viewer. Run `xdf_replay --help` for the options.
 
 ### Other
 
-- A docking layout. The Streams rail is on the left. The plots and the analysis windows are tabs that you arrange.
-- Saved workspaces. A workspace holds the current view: the filters, channels, and gains for each stream, the open analysis windows, and the dock layout. When you load a workspace, the viewer reconnects the streams that the workspace refers to (matched on source ID and name) and lists the streams that are not on the network. It holds the recording until those streams connect or you dismiss the notice.
+- A docking layout. The Streams rail is on the left. It holds the stream list, and below it the Recording and Playback sections, which stay in the same position when streams come and go. The plots and the analysis windows are tabs that you arrange. Each session starts with the default layout. To use a layout again in a different session, save it in a workspace.
+- Saved workspaces. A workspace holds the current view: the filters, channels, and gains for each stream, the open analysis windows, and the dock layout. A workspace does not hold the theme, the UI scale, or the recording settings, so loading a workspace does not change them. When you load a workspace, the viewer reconnects the streams that the workspace refers to (matched on source ID and name) and lists the streams that are not on the network. It holds the recording until those streams connect or you dismiss the notice.
 - Information for each stream: type, source ID, channels, sensor positions, and live counters for the measured rate, the clock offset, and the dropouts.
 - TCP remote control of the recording, with client libraries for Python, MATLAB, and Octave. See [Remote control](#remote-control).
-- A light theme and a dark theme. The viewer keeps the layout between sessions.
+- A light theme and a dark theme. The viewer keeps the theme, the UI scale, and the recording folder and file name template between sessions.
 
 ## Remote control
 
-Enable a control port from the Recording panel, or with `LSL_RC_PORT=22345`. A client then controls the recording over TCP. The commands end with a newline, and the replies are lines of readable text.
+Turn on a control port with **App > Remote control**, or with `LSL_RC_PORT=22345`. While the port is on, the right side of the menu bar shows its address and the number of connected clients. A client then controls the recording over TCP. The commands end with a newline, and the replies are lines of readable text.
 
-The port binds to loopback (127.0.0.1) only. There is no authentication. To use the port from a different machine, turn on **Allow LAN access** in the Recording panel, or set `LSL_RC_BIND=all`. Use trusted networks only. Up to four clients can connect at the same time.
+The port binds to loopback (127.0.0.1) only. There is no authentication. To use the port from a different machine, turn on **App > Allow LAN access**, or set `LSL_RC_BIND=all`. Use trusted networks only. Up to four clients can connect at the same time.
 
 ### Client libraries
 
@@ -188,7 +188,7 @@ The viewer renders through **SDL_GPU**, the GPU abstraction of SDL3. Thus it nee
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The viewer includes third-party components (SDL3, Dear ImGui, ImPlot, liblsl, KissFFT, spdlog, the Roboto font, and the components that they bundle), and it adapts the `xdfwriter` of LabRecorder. Their copyright notices and licenses are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
+MIT. See [LICENSE](LICENSE). The viewer includes third-party components (SDL3, Dear ImGui, ImPlot, liblsl, KissFFT, spdlog, the Roboto font, and the components that they bundle), and it adapts the `xdfwriter` of LabRecorder. Their copyright notices and licenses are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES). To see the version and the licenses in the viewer, select **App > About**.
 
 ## Acknowledgments
 

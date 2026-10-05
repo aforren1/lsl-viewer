@@ -111,21 +111,30 @@ finding more than one of them.
 At 10 times real time, the viewer's plot edge moves at the speed of the data, so
 the plots show the full time window while the replay runs.
 
-The viewer can also replay a file itself, with no terminal. Select **Tools >
-Replay XDF file...** and then the file. The viewer creates the streams, shows
-them, and then starts the replay. It uses the same engine as `xdf_replay`, with
-`recording` timestamps. The **Replay** panel has these controls:
+The viewer can also replay a file itself, with no terminal. In the **Playback**
+section at the bottom of the **Streams** rail, select **Open XDF file...** and
+then the file. The viewer creates the streams, shows them, and then starts the
+replay. It uses the same engine as `xdf_replay`, with `recording` timestamps.
+The **Playback** section has these controls:
 
 - The position slider. Release it to seek, or Ctrl+click it to type the seconds.
   A seek shows in the plots as a dashed blue line. The viewer does not show a
   seek as a dropout, because no data is missing from the file.
 - **Pause replay** stops the data until you select **Resume replay**. **Pause
-  display** (App menu, or the P key) only freezes the plots, and the replay
+  display** (View menu, or the P key) only freezes the plots, and the replay
   continues.
 - The speed (0.5 to 20 times real time) and **Loop**. A loop wrap also shows as a
   dashed blue line.
-- **Stop** closes the streams and removes their plots.
-- The warnings for a damaged file, and the samples sent for each stream.
+- **Stop** closes the streams and removes their plots. After a stop, **Replay
+  again** plays the same file from the start, and the close button (**×**)
+  removes the replay from the section.
+- The warnings for a damaged file. Select the warnings button to see the list.
+
+In the stream list, the rows of the replayed streams have a play mark and show
+two counts: the samples sent and the samples in the file. Hover over a row to
+see the type, the channels, the format, and the rate. Below the controls,
+**Playback** lists the file streams that are not in the viewer: `closed` if you
+disconnected the stream, or `not shown` if it did not connect.
 
 To open a file from a script, set `LSL_REPLAY` to its path. The viewer then opens
 the file at launch, as if you selected it in the dialog.
@@ -248,7 +257,7 @@ run.sh                   WSLg launcher (points SDL at the Wayland runtime dir)
 ```
 
 Build trees (`build*/`), the Python venv (`.venv/`), captured screenshots
-(`output/`), recordings (`*.xdf`), and the persisted ImGui layout (`imgui.ini`)
+(`output/`), recordings (`*.xdf`), and the persisted app settings (`imgui.ini`)
 are generated and git-ignored.
 
 See [DESIGN.md](../DESIGN.md) for the architecture and rationale.

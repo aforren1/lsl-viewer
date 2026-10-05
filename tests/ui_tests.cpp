@@ -25,6 +25,7 @@
 #include <cstring>   // strstr
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <random>
@@ -103,7 +104,7 @@ static RcTestCounted rcTestCounted(rc_socket_t fd) {
     return r;
 }
 
-// Replay hooks in main.cpp: open a file the way the Tools > Replay XDF file dialog does,
+// Replay hooks in main.cpp: open a file the way the Playback > Open XDF file dialog does,
 // and read back the replay's state, its streams, and the dropouts and break marks of the
 // streams it shows.
 extern void lslViewerRequestReplay(const char* path);
@@ -222,8 +223,61 @@ static StreamProbeView streamProbe(const char* name) {
     return p;
 }
 
+// Spectrum windows are numbered as they open and never renumbered, so which ones exist
+// depends on the tests before. Returns how many are open; *newest gets the ref of the
+// highest-numbered one. WasActive, not Active: the test runs after NewFrame clears Active.
+static int openSpectra(std::string* newest = nullptr) {
+    int n = 0, best = 0;
+    for (ImGuiWindow* w : ImGui::GetCurrentContext()->Windows) {
+        // Docked windows are child windows of the dock host, so skip children by name.
+        if (!w->WasActive || std::strncmp(w->Name, "Spectrum ", 9) != 0 || std::strchr(w->Name, '/')) continue;
+        ++n;
+        if (const int id = std::atoi(w->Name + 9); id > best) {
+            best = id;
+            if (newest) *newest = std::string("//") + w->Name;
+        }
+    }
+    return n;
+}
+
+extern std::string lslViewerAppSettingsOnly(const std::string& ini);
+extern std::string lslViewerLayoutOnly(const std::string& ini);
+
 void RegisterAppTests(ImGuiTestEngine* e) {
     ImGuiTest* t = nullptr;
+
+    // Launch reads only the app's own section of imgui.ini, so the layout always starts from
+    // the default while the theme and recording settings persist; workspaces take the rest.
+    // CRLF too: a hand-edited file on Windows. No UI.
+    t = IM_REGISTER_TEST(e, "settings", "launch_skips_layout");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const std::string ini =
+            "[Window][Spectrum]\nPos=10,20\nSize=300,200\nDockId=0x00000002,0\n\n"
+            "[LSLViewer][State]\r\nlight=1\r\nrectmpl=sub-{subject}/x.xdf\r\nstreamkind=1 a|b\r\n\r\n"
+            "[Table][0x1234ABCD,3]\nColumn 0  Width=80\n\n"
+            "[Docking][Data]\nDockSpace ID=0x8B93E3BD Window=0xA787BDB4 Pos=280,19 Size=1000,781 Split=Y\n";
+        const std::string app = lslViewerAppSettingsOnly(ini);
+        IM_CHECK(app.find("[LSLViewer][State]") == 0);
+        IM_CHECK(app.find("light=1") != std::string::npos);
+        IM_CHECK(app.find("rectmpl=sub-{subject}/x.xdf") != std::string::npos);
+        IM_CHECK(app.find("streamkind=1 a|b") != std::string::npos);
+        IM_CHECK(app.find("[Window]") == std::string::npos);
+        IM_CHECK(app.find("DockId=") == std::string::npos);
+        IM_CHECK(app.find("[Table]") == std::string::npos);
+        IM_CHECK(app.find("[Docking]") == std::string::npos);
+        IM_CHECK(app.find("DockSpace") == std::string::npos);
+        IM_CHECK(lslViewerAppSettingsOnly("").empty());
+
+        // The inverse is what a workspace saves and loads: the layout without the app settings.
+        const std::string layout = lslViewerLayoutOnly(ini);
+        IM_CHECK(layout.find("[Window][Spectrum]") == 0);
+        IM_CHECK(layout.find("DockId=0x00000002,0") != std::string::npos);
+        IM_CHECK(layout.find("[Table]") != std::string::npos);
+        IM_CHECK(layout.find("DockSpace") != std::string::npos);
+        IM_CHECK(layout.find("[LSLViewer]") == std::string::npos);
+        IM_CHECK(layout.find("light=") == std::string::npos);
+        IM_CHECK(layout.find("rectmpl=") == std::string::npos);
+    };
 
     // High-pass (DC blocker) correctness: removes DC, preserves passband, and a
     // DC-only input decays to ~0. No UI — pure logic check.
@@ -592,13 +646,16 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         rc3.stop();
     };
 
-    // Performance overlay (off by default; shown via View menu) exposes VSync.
+    // Performance window (off by default; Debug menu) exposes VSync, and floats: a docked
+    // diagnostic would take a slot from the plots.
     t = IM_REGISTER_TEST(e, "ui", "performance_window");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->MenuCheck("//##MainMenuBar/Debug/Performance");
         ctx->Yield(2);
-        ctx->SetRef("//Streams");                  // Performance is a section in the rail now
+        ctx->SetRef("//Performance");
         IM_CHECK(ctx->ItemExists("VSync"));
+        IM_CHECK(!ctx->GetWindowByRef("//Performance")->DockIsActive);
+        ctx->MenuUncheck("//##MainMenuBar/Debug/Performance");
     };
 
     // Marker log "Clear" buttons: the clear is deferred to the end of the frame (the log
@@ -667,12 +724,76 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->CaptureScreenshotWindow("//Marker events", ImGuiCaptureFlags_HideMouseCursor);
     };
 
-    // Screen capture of the browser + performance overlay (SDL_GPU readback).
+    // Screen capture of the rail and the Performance window (SDL_GPU readback).
     t = IM_REGISTER_TEST(e, "ui", "capture_ui");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->MenuCheck("//##MainMenuBar/Debug/Performance");
         ctx->Yield(2);
         ctx->CaptureScreenshotWindow("//Streams", ImGuiCaptureFlags_HideMouseCursor);
+        ctx->CaptureScreenshotWindow("//Performance", ImGuiCaptureFlags_HideMouseCursor);
+        ctx->MenuUncheck("//##MainMenuBar/Debug/Performance");
+    };
+
+    // The rail at its fixed width: idle, during a replay (its rows tagged), with one replay
+    // stream closed (listed under Playback), with more streams than fit (the list scrolls,
+    // Recording and Playback stay put), and after Stop. Needs no other streams: it publishes
+    // its own for the list.
+    t = IM_REGISTER_TEST(e, "ui", "capture_rail");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        using State = XdfPlayer::State;
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock, as in replay_open_seek
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        auto shot = [&] {                                // no tooltip in the shot
+            ctx->MouseMoveToPos(ImVec2(ImGui::GetMainViewport()->WorkSize.x - 5.0f, 5.0f));
+            ctx->Yield(3);
+            ctx->CaptureScreenshotWindow("//Streams", ImGuiCaptureFlags_HideMouseCursor);
+        };
+        shot();
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "lsl_viewer_rail_test.xdf";
+        writeReplayTestFile(file.string());
+        lslViewerRequestReplay(file.string().c_str());
+        IM_CHECK(waitFor([] { const auto p = replayProbe(); return p.state == (int)State::playing && p.shown == 2; }, 15.0));
+        waitFor([] { return false; }, 1.0);
+        shot();
+        ctx->WindowClose("//ReplayTestSine");
+        waitFor([] { return replayProbe().shown == 1; }, 3.0);
+        ctx->MenuCheck("//##MainMenuBar/View/Pause display");
+        shot();
+        ctx->MenuUncheck("//##MainMenuBar/View/Pause display");
+        // Reconnect it: a closed stream stays closed for the next replay of the same file.
+        lslViewerRequestConnect("replay-replaytest-sine");
+        IM_CHECK(waitFor([] { return replayProbe().shown == 2; }, 3.0));
+
+        // Enough outlets to overflow the list on a 1080p screen. Discovery lists them unconnected.
+        const float recY0 = ctx->ItemInfo("//Streams/Record").RectFull.Min.y;
+        std::vector<std::unique_ptr<lsl::stream_outlet>> outs;
+        for (int i = 0; i < 24; ++i) {
+            char name[32], sid[32];
+            std::snprintf(name, sizeof name, "RailTest%02d", i);
+            std::snprintf(sid, sizeof sid, "railtest-%02d", i);
+            outs.push_back(std::make_unique<lsl::stream_outlet>(lsl::stream_info(name, "EEG", 8, 250.0, lsl::cf_float32, sid)));
+        }
+        waitFor([] { return false; }, 4.0);
+        shot();
+        // The pinned block does not move for the stream count.
+        const float recY1 = ctx->ItemInfo("//Streams/Record").RectFull.Min.y;
+        ctx->LogInfo("Record button at y %.0f -> %.0f with 24 more streams", recY0, recY1);
+        IM_CHECK_EQ(recY0, recY1);
+
+        ctx->SetRef("//Streams");
+        ctx->ItemClick("Stop");
+        waitFor([] { return replayProbe().shown == 0; }, 3.0);
+        shot();
+        ctx->ItemClick("###replayclose");
+        ctx->Yield(3);
+        IM_CHECK_EQ(replayProbe().state, -1);
+        std::error_code ec; std::filesystem::remove(file, ec);
     };
 
     // Overlay/raw vs stacked/high-pass, driven from the stream's own controls.
@@ -834,12 +955,54 @@ void RegisterAppTests(ImGuiTestEngine* e) {
     //   python tools/lsl_test_streams.py --streams sine,chirp
     t = IM_REGISTER_TEST(e, "ui", "capture_fft");
     t->TestFunc = [](ImGuiTestContext* ctx) {
-        if (ctx->GetWindowByRef("//Spectrum") == nullptr) {
-            ctx->LogInfo("Spectrum window not present; skipping");
+        std::string ref;
+        if (openSpectra(&ref) == 0) {
+            ctx->LogInfo("no spectrum window open; skipping");
             return;
         }
         ctx->SleepNoSkip(3.0f, 1.0f / 30.0f);   // fill >= one FFT window
-        ctx->CaptureScreenshotWindow("//Spectrum", ImGuiCaptureFlags_HideMouseCursor);
+        ctx->CaptureScreenshotWindow(ref.c_str(), ImGuiCaptureFlags_HideMouseCursor);
+    };
+
+    // View > New spectrum adds an independent window each time, and closing one leaves the
+    // others open. Needs no streams: an unbound spectrum still opens, with a hint to connect.
+    // App > About opens, shows each license tab, and closes.
+    t = IM_REGISTER_TEST(e, "ui", "about");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->MenuClick("//##MainMenuBar/App/About");
+        ctx->Yield(2);
+        ImGuiWindow* w = ctx->GetWindowByRef("//About");
+        IM_CHECK(w != nullptr && w->WasActive);
+        ctx->SetRef("//About");
+        IM_CHECK(ctx->ItemExists("Copy version info"));
+        ctx->CaptureScreenshotWindow("//About", ImGuiCaptureFlags_HideMouseCursor);
+        ctx->ItemClick("##licenses/Third-party licenses");
+        ctx->Yield(2);
+        ctx->CaptureScreenshotWindow("//About", ImGuiCaptureFlags_HideMouseCursor);
+        ctx->WindowClose("//About");
+        ctx->Yield(2);
+        w = ctx->GetWindowByRef("//About");
+        IM_CHECK(w == nullptr || !w->WasActive);
+    };
+
+    t = IM_REGISTER_TEST(e, "ui", "spectrum_multi");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        const int before = openSpectra();
+        std::string a, b, newest;
+        ctx->MenuClick("//##MainMenuBar/View/New spectrum");
+        ctx->Yield(2);
+        IM_CHECK_EQ(openSpectra(&a), before + 1);
+        ctx->MenuClick("//##MainMenuBar/View/New spectrum");
+        ctx->Yield(2);
+        IM_CHECK_EQ(openSpectra(&b), before + 2);
+        IM_CHECK(a != b);
+        ctx->WindowClose(a.c_str());
+        ctx->Yield(2);
+        IM_CHECK_EQ(openSpectra(&newest), before + 1);
+        IM_CHECK_STR_EQ(newest.c_str(), b.c_str());
+        ctx->WindowClose(b.c_str());
+        ctx->Yield(2);
+        IM_CHECK_EQ(openSpectra(), before);
     };
 
     // ERP raster: channels x time heatmap of the trigger-averaged response. Run the
@@ -868,8 +1031,62 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->CaptureScreenshotWindow("//ERP 1", ImGuiCaptureFlags_HideMouseCursor);  // 3) channels x time raster
     };
 
-    // Tools > Replay XDF file, end to end on a file it writes itself: the streams connect, a
-    // seek from the panel moves playback and is marked as a break (not a dropout), a replay
+    // Panel accents: every panel family docked side by side, one spectrogram floating (its accent
+    // goes on the title bar, not a tab), in both themes. A whole-viewport capture, because the
+    // accents are only judged against each other. Run with LSL_DEMO=1 for the signal and marker
+    // windows; the playback accent is on the rail's Playback header and the replay's stream rows,
+    // for a file the test writes.
+    t = IM_REGISTER_TEST(e, "ui", "capture_panel_accents");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        using State = XdfPlayer::State;
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "lsl_viewer_accent_test.xdf";
+        writeReplayTestFile(file.string());
+        lslViewerRequestReplay(file.string().c_str());
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock, as in replay_open_seek
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        IM_CHECK(waitFor([] { return replayProbe().state == (int)State::playing; }, 15.0));
+        std::string spectrumRef;                         // reuse the startup spectrum, if still open
+        if (openSpectra(&spectrumRef) == 0) {
+            ctx->MenuClick("//##MainMenuBar/View/New spectrum");
+            ctx->Yield(2);
+            openSpectra(&spectrumRef);
+        }
+        ctx->MenuClick("//##MainMenuBar/View/Marker events");
+        ctx->MenuClick("//##MainMenuBar/View/New ERP (marker average)");
+        ctx->MenuClick("//##MainMenuBar/View/New spectrogram");
+        ctx->MenuClick("//##MainMenuBar/View/New spectrogram");
+        ctx->Yield(3);
+        ctx->UndockWindow("Spectrogram 2");
+        ctx->WindowMove("//Spectrogram 2", ImVec2(ImGui::GetMainViewport()->WorkSize.x * 0.55f, 120.0f));
+        ctx->WindowResize("//Spectrogram 2", ImVec2(420.0f, 260.0f));
+        ctx->WindowFocus(spectrumRef.c_str());
+        ctx->MouseMoveToPos(ImVec2(5, 5));
+        waitFor([] { return false; }, 3.0);              // fill the plots
+        ctx->CaptureReset();
+        ctx->CaptureScreenshot(ImGuiCaptureFlags_HideMouseCursor);
+        ctx->MenuCheck("//##MainMenuBar/App/Light theme");
+        ctx->MouseMoveToPos(ImVec2(5, 5));
+        ctx->Yield(3);
+        ctx->CaptureReset();
+        ctx->CaptureScreenshot(ImGuiCaptureFlags_HideMouseCursor);
+        ctx->MenuUncheck("//##MainMenuBar/App/Light theme");
+
+        ctx->SetRef("//Streams");
+        ctx->ItemClick("Stop");
+        waitFor([] { return replayProbe().shown == 0; }, 3.0);
+        ctx->ItemClick("###replayclose");
+        ctx->Yield(3);
+        std::error_code ec; std::filesystem::remove(file, ec);
+    };
+
+    // Playback > Open XDF file, end to end on a file it writes itself: the streams connect, a
+    // seek from the rail moves playback and is marked as a break (not a dropout), a replay
     // pause leaves no dropout either, and Stop removes the streams. Needs no other streams.
     t = IM_REGISTER_TEST(e, "replay", "replay_open_seek");
     t->TestFunc = [](ImGuiTestContext* ctx) {
@@ -898,7 +1115,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         // that dropped what was already due, or a dropout check against the previous sample,
         // would show the join as missing data. Back to 1x right after, so the rest of the
         // file lasts through the pause below.
-        ctx->SetRef("//Replay");
+        ctx->SetRef("//Streams");                       // Playback is a section of the rail
         ctx->ComboClick("##replayspeed/20x");
         sleepReal(0.3);
         const double before = replayProbe().position;
@@ -929,7 +1146,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK_EQ(replayProbe().state, (int)State::stopped);
         ctx->Yield(3);
         IM_CHECK(ctx->GetWindowByRef("//ReplayTestSine") == nullptr || !ctx->GetWindowByRef("//ReplayTestSine")->Active);
-        ctx->WindowClose("//Replay");                    // and the session with it
+        ctx->ItemClick("###replayclose");                // and the close button forgets the session
         ctx->Yield(3);
         IM_CHECK_EQ(replayProbe().state, -1);
         std::error_code ec; std::filesystem::remove(file, ec);
@@ -977,11 +1194,9 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         // marker is 4 s into the file; if the UI was slower than that, say so, not a false pass.
         IM_CHECK_EQ(p.markerEvents, (std::size_t)0);
 
-        // The rest at 10x, then wait for the end of the file. The ERP docks as a tab beside the
-        // Replay panel: bring each to the front to use it, and leave the ERP showing while the
+        // The rest at 10x, then wait for the end of the file. Leave the ERP showing while the
         // file plays, since it collects epochs as it draws.
-        ctx->WindowFocus("//Replay");
-        ctx->SetRef("//Replay");
+        ctx->SetRef("//Streams");
         ctx->ComboClick("##replayspeed/10x");
         ctx->WindowFocus(ref);
         IM_CHECK(waitFor([] { return replayProbe().state == (int)State::finished; }, 20.0));
@@ -993,10 +1208,10 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK_EQ(p.count, kErpGapAveraged);
         IM_CHECK_EQ(p.rejected, kErpGapLeftOut);
 
-        ctx->WindowFocus("//Replay");
+        ctx->SetRef("//Streams");
         ctx->ItemClick("Stop");
         IM_CHECK(waitFor([] { return replayProbe().shown == 0; }, 3.0));
-        ctx->WindowClose("//Replay");
+        ctx->ItemClick("###replayclose");
         ctx->WindowClose(ref);
         ctx->Yield(3);
         std::error_code ec; std::filesystem::remove(file, ec);
@@ -1063,8 +1278,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         };
         IM_CHECK(waitFor([] { const auto p = replayProbe(); return p.state == (int)State::playing && p.shown == 2; }, 15.0));
         const char* kName = "ReplayTestSine";
-        ctx->WindowFocus("//Replay");
-        ctx->SetRef("//Replay");
+        ctx->SetRef("//Streams");
         ctx->ComboClick("##replayspeed/5x");
         waitFor([] { return false; }, 1.5);              // settle at 5x (7.5 s of data)
 
@@ -1131,7 +1345,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
 
         ctx->ItemClick("Stop");
         IM_CHECK(waitFor([] { return replayProbe().shown == 0; }, 3.0));
-        ctx->WindowClose("//Replay");
+        ctx->ItemClick("###replayclose");
         ctx->Yield(3);
         std::error_code ec; std::filesystem::remove(file, ec);
     };

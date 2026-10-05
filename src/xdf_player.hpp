@@ -162,6 +162,9 @@ public:
     const std::vector<std::size_t>&       selected() const { return selected_; }
     std::size_t prepassStreams() const { return prepassStreams_; }
     double      prepassSeconds() const { return prepassSeconds_; }
+    // The liblsl uid of each outlet, in the order of selected(). A resolve by uid finds these
+    // outlets and not a replay of the same file on another host. Valid until stop().
+    std::vector<std::string> outletUids() const;
 
 private:
     using clock = std::chrono::steady_clock;
@@ -529,6 +532,21 @@ inline bool XdfPlayer::prepare(const std::filesystem::path& file, const Options&
     std::lock_guard<std::mutex> lk(m_);
     state_ = State::ready;
     return true;
+}
+
+inline std::vector<std::string> XdfPlayer::outletUids() const {
+    std::vector<std::string> out;
+    out.reserve(tracks_.size());
+    for (const Track& t : tracks_) {
+        std::string uid;
+        if (t.outlet)
+            if (lsl_streaminfo info = lsl_get_info(t.outlet)) {
+                if (const char* u = lsl_get_uid(info)) uid = u;
+                lsl_destroy_streaminfo(info);
+            }
+        out.push_back(std::move(uid));
+    }
+    return out;
 }
 
 inline bool XdfPlayer::play() {

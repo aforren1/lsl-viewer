@@ -9,6 +9,7 @@
 
 #include <SDL3/SDL.h>
 #include <cmath>
+#include <cstdint>
 
 // User-facing UI scale (persisted in imgui.ini as `scale=`). Defaults to 1.0 on every platform —
 // like most cross-platform apps we let the OS handle DPI rather than baking in a per-OS scale, and
@@ -25,15 +26,62 @@ inline float g_uiScale = 1.0f;
 // style fields (ItemSpacing): those are scaled once already and would compound.
 inline float uiScaled(float px) { return px * g_uiScale; }
 
+// Panel families, so a docked tab says what it holds before you read its title. The color goes
+// on the tab and title-bar chrome only: tinting the window background would also tint the plot
+// area (ImPlot's PlotBg derives from WindowBg) and shift how trace colors and colormaps read. Four
+// families, not one hue per window type, because faint hues stop being distinguishable past three
+// or four.
+enum class PanelKind : std::uint8_t { signal, analysis, events, playback, count };
+inline ImVec4 g_panelAccent[(int)PanelKind::count];   // per theme, set by applyTheme()
+// The rail's Recording heading: red, the color recording already means here (the live REC
+// indicator), kept apart from the panel accents.
+inline ImVec4 g_recordAccent;
+inline float  g_panelTint = 0.22f;   // accent share of the tab fill; light fills show chroma more, so less there
+
+// Wrap a window's Begin(): ImGui copies the tab colors into the window during Begin (its DockStyle)
+// and draws the title bar there, so the push only has to span that call. The overline is drawn on
+// a node's selected tab only, so the background tabs (the ones you hunt for) also get a faint fill
+// tint. The focused tab keeps its blue fill: focus stays the strongest cue.
+inline void pushPanelAccent(PanelKind k) {
+    const ImVec4 a = g_panelAccent[(int)k];
+    const float  t = g_panelTint;
+    auto tint = [&](ImGuiCol idx) {
+        const ImVec4 b = ImGui::GetStyleColorVec4(idx);
+        ImGui::PushStyleColor(idx, ImVec4(b.x + (a.x - b.x) * t, b.y + (a.y - b.y) * t, b.z + (a.z - b.z) * t, b.w));
+    };
+    for (ImGuiCol idx : {ImGuiCol_Tab, ImGuiCol_TabDimmed, ImGuiCol_TabDimmedSelected,
+                         ImGuiCol_TitleBg, ImGuiCol_TitleBgActive, ImGuiCol_TitleBgCollapsed})
+        tint(idx);
+    ImGui::PushStyleColor(ImGuiCol_TabSelectedOverline, a);
+    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelectedOverline, ImVec4(a.x, a.y, a.z, a.w * 0.6f));
+}
+inline void popPanelAccent() { ImGui::PopStyleColor(8); }
+
+// A floating (undocked) window has no tab bar, so the overline never shows; underline its title
+// bar with the same accent instead. Call right after Begin().
+inline void drawFloatingPanelAccent(PanelKind k) {
+    if (ImGui::IsWindowDocked()) return;
+    const ImGuiStyle& s = ImGui::GetStyle();
+    const ImVec2 p = ImGui::GetWindowPos();
+    const float  w = ImGui::GetWindowWidth(), t = s.TabBarOverlineSize;
+    const float  y = p.y + ImGui::GetFrameHeight() - t * 0.5f;   // title bar height = frame height
+    ImDrawList*  dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(p, ImVec2(p.x + w, p.y + ImGui::GetFrameHeight()), false);   // Begin clipped to the content
+    dl->AddLine(ImVec2(p.x + s.WindowBorderSize, y), ImVec2(p.x + w - s.WindowBorderSize, y),
+                ImGui::GetColorU32(g_panelAccent[(int)k]), t);
+    dl->PopClipRect();
+}
+
 // Apply a light or dark theme to both ImGui and ImPlot, plus shared style polish.
 inline void applyTheme(bool light) {
     if (light) { ImGui::StyleColorsLight(); ImPlot::StyleColorsLight(); }
     else       { ImGui::StyleColorsDark();  ImPlot::StyleColorsDark(); }
     ImGuiStyle& s = ImGui::GetStyle();
 
-    // Mostly-grayscale neutrals; blue + purple are the ONLY accents (checkmark,
-    // hover, active/pressed, selected-tab overline, text selection) so the chrome
-    // stays quiet and the highlights read. Blue = electric/royal hue (the palette's,
+    // Mostly-grayscale neutrals; blue + purple are the ONLY interaction accents
+    // (checkmark, hover, active/pressed, text selection) so the chrome stays quiet
+    // and the highlights read. Tab and title-bar tints are the exception: they
+    // carry the panel family (see PanelKind). Blue = electric/royal hue (the palette's,
     // not imgui's azure); purple marks the strongest active/selected states.
     auto rgb = [](int r, int g, int b, float a = 1.0f) {
         return ImVec4(r / 255.0f, g / 255.0f, b / 255.0f, a);
@@ -83,6 +131,14 @@ inline void applyTheme(bool light) {
         c[ImGuiCol_DockingPreview]       = A(blue, 0.45f);
         c[ImGuiCol_PlotLines]            = blue;
         c[ImGuiCol_PlotHistogram]        = purp;
+        // Panel accents: away from the blue/purple chrome accents and from red (dropouts,
+        // recording). Signal windows are the default and the most numerous, so they stay neutral.
+        g_panelAccent[(int)PanelKind::signal]   = rgb(0x6E, 0x6E, 0x78);
+        g_panelAccent[(int)PanelKind::analysis] = rgb(0x1F, 0x93, 0x3A);
+        g_panelAccent[(int)PanelKind::events]   = rgb(0xC2, 0x78, 0x00);
+        g_panelAccent[(int)PanelKind::playback] = rgb(0xC0, 0x1C, 0x82);
+        g_recordAccent                          = rgb(0xC6, 0x28, 0x28);
+        g_panelTint = 0.13f;
     } else {
         // Palette electric-blue + purple, lifted in lightness for dark-gray contrast but
         // kept at the palette's royal/violet HUE (not imgui's lighter azure).
@@ -128,6 +184,12 @@ inline void applyTheme(bool light) {
         c[ImGuiCol_DockingPreview]       = A(blue, 0.60f);
         c[ImGuiCol_PlotLines]            = blue;
         c[ImGuiCol_PlotHistogram]        = purp;
+        g_panelAccent[(int)PanelKind::signal]   = rgb(0x8A, 0x8A, 0x96);
+        g_panelAccent[(int)PanelKind::analysis] = rgb(0x4C, 0xC2, 0x62);
+        g_panelAccent[(int)PanelKind::events]   = rgb(0xF0, 0xA8, 0x30);
+        g_panelAccent[(int)PanelKind::playback] = rgb(0xE6, 0x5C, 0xB4);
+        g_recordAccent                          = rgb(0xF0, 0x50, 0x50);
+        g_panelTint = 0.22f;
     }
 
     // ImGui hardcodes DockingEmptyBg to a dark gray in BOTH styles, so the empty
@@ -137,6 +199,7 @@ inline void applyTheme(bool light) {
     s.WindowRounding    = 5.0f; s.ChildRounding = 4.0f; s.FrameRounding = 4.0f;
     s.PopupRounding     = 4.0f; s.GrabRounding  = 3.0f; s.TabRounding   = 4.0f;
     s.ScrollbarRounding = 9.0f;
+    s.TabBarOverlineSize = 2.0f;              // 1 px is too thin to carry the panel accent hue
     s.WindowBorderSize  = 2.0f; s.FrameBorderSize = 0.0f;   // bold outline around each (docked) window
     s.ChildBorderSize   = 1.0f;
     s.WindowPadding     = ImVec2(8, 8);

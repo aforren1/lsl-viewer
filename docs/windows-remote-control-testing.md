@@ -60,11 +60,11 @@ $env:LSL_RC_PORT = "22345"
 .\build\lsl_viewer.exe
 ```
 
-(Equivalently: launch normally and tick **Remote control** in the Streams rail.)
+(Equivalently: launch normally and select **App > Remote control**.)
 
 The server binds **loopback (127.0.0.1) only by default**. There is no authentication, so
 it is not exposed on the network unless you ask for it. To let a client elsewhere on the LAN
-reach it, tick **Allow LAN access** in the Recording panel (it re-binds the running server),
+reach it, select **App > Allow LAN access** (it re-binds the running server),
 or set `LSL_RC_BIND=all` before launching:
 
 ```powershell
@@ -163,7 +163,7 @@ loopback. Connect to `127.0.0.1` unless the beacon's `bind` field says `all`. Re
 
 ### Second instance (optional)
 
-Start a second viewer **without** `LSL_RC_PORT` and tick **Remote control**: 22345 is
+Start a second viewer **without** `LSL_RC_PORT` and select **App > Remote control**: 22345 is
 taken, so it binds an ephemeral port and announces that one (the label next to the
 checkbox shows it, and two beacons now resolve). With `LSL_RC_PORT` set, the second
 viewer instead logs `remote control unavailable: bind() failed (port in use?)`: a

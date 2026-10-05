@@ -320,7 +320,10 @@ public:
     bool open(const std::filesystem::path& p) {
         close();
 #ifdef _WIN32
-        if (_wfopen_s(&f_, p.c_str(), L"rb") != 0) f_ = nullptr;
+        // "S" (FILE_FLAG_SEQUENTIAL_SCAN): the scan and playback both move forward through
+        // the file, and the larger read-ahead it enables makes a cold scan, which waits on
+        // one small read per chunk, about a third faster (1.0 s to 0.7 s for 1.4 GB on NVMe).
+        if (_wfopen_s(&f_, p.c_str(), L"rbS") != 0) f_ = nullptr;
 #else
         f_ = std::fopen(p.c_str(), "rb");
 #endif
