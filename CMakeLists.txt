@@ -230,6 +230,10 @@ function(lsl_embed_text name path out_var)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${path})
   file(READ ${path} _hex HEX)
   string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _hex "${_hex}")
+  # Bytes from 0x80 (UTF-8, e.g. the copyright sign) do not fit a signed char, which plain char is
+  # on x86 and Apple arm64; in a braced initializer GCC and Clang reject that narrowing. An explicit
+  # cast is not narrowing. (MSVC only warns, so a Windows build does not show it.)
+  string(REGEX REPLACE "0x([89a-f][0-9a-f])," "(char)0x\\1," _hex "${_hex}")
   set(${out_var} "${${out_var}}inline constexpr char ${name}[] = {${_hex}0x00};\n" PARENT_SCOPE)
 endfunction()
 set(_about "")
