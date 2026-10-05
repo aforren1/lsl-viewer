@@ -1475,6 +1475,223 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->Yield(3);
     };
 
+    // The README images in docs/images/, opt-in: LSL_README_SHOTS lists the ones to take, from
+    // montage,spectrum,spectrogram,erp,live (unset: the test returns at once). Streams are connected
+    // by source_id, not autoconnect, so a stray stream on the network neither shows up as a tab nor
+    // takes an analysis window. Files: output/captures/readme_<name>.png, and readme_live.mp4 (needs
+    // LSL_FFMPEG; convert it to the GIF afterwards). The README images were taken as below; the
+    // analysis views and the video are fullscreen on a 1920x1200 display, so their plots get room:
+    //   uv run tools/lsl_test_streams.py --streams highdensity,eeg,drift,audio,chirp,evoked
+    //   LSL_WINDOW=1280x800 LSL_README_SHOTS=montage lsl_viewer --tests capture_readme
+    //   LSL_FULLSCREEN=1 LSL_README_SHOTS=spectrum,spectrogram,erp lsl_viewer --tests capture_readme
+    //   uv run tools/lsl_test_streams.py --streams evoked,chirp,eeg,drift,audio,markers  (no highdensity)
+    //   LSL_FULLSCREEN=1 LSL_README_SHOTS=live LSL_FFMPEG=<ffmpeg> lsl_viewer --tests capture_readme
+    // The rail lists every stream on the network, so for the video, limit discovery to this machine:
+    // LSLAPICFG=<file> with "[multicast] ResolveScope = machine" and "[lab] KnownPeers = {127.0.0.1}".
+    // Then, for the 800x500 GIF:
+    //   ffmpeg -i readme_live.mp4 -vf "trim=start_frame=2:end_frame=74,setpts=PTS-STARTPTS,
+    //     scale=800:500:flags=lanczos,split[a][b];[a]palettegen=stats_mode=full[p];
+    //     [b][p]paletteuse=dither=sierra2_4a" -r 12 -loop 0 live.gif
+    t = IM_REGISTER_TEST(e, "ui", "capture_readme");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        const char* shotsEnv = std::getenv("LSL_README_SHOTS");
+        if (!shotsEnv) { ctx->LogInfo("LSL_README_SHOTS not set; skipping"); return; }
+        const std::string shots = std::string(",") + shotsEnv + ",";
+        auto want = [&](const char* s) { return shots.find(std::string(",") + s + ",") != std::string::npos; };
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock: the streams run in real time
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        auto pause = [&](double seconds) { waitFor([] { return false; }, seconds); };
+        // A marker stream opens no window, so there is nothing to wait on: give discovery time.
+        auto connect = [&](const char* sid, const char* window) {
+            lslViewerRequestConnect(sid);
+            if (window == nullptr) { pause(2.0); return true; }
+            const std::string ref = std::string("//") + window;
+            const bool ok = waitFor([&] { return ctx->GetWindowByRef(ref.c_str()) != nullptr; }, 15.0);
+            if (!ok) IM_ERRORF("%s did not connect", window);
+            return ok;
+        };
+        auto cfgOf = [&](const std::string& ref) {        // the window's left controls child
+            ctx->WindowFocus(ref.c_str()); ctx->Yield(2);
+            ImGuiTestItemInfo cfg = ctx->WindowInfo((ref + "/cfg").c_str());
+            if (cfg.Window == nullptr) { IM_ERRORF("no cfg child in %s", ref.c_str()); return false; }
+            ctx->SetRef(cfg.Window);
+            return true;
+        };
+        auto parkMouse = [&] {                            // the menu bar's empty end: no hover state
+            ctx->MouseMoveToPos(ImVec2(ImGui::GetMainViewport()->WorkSize.x - 5.0f, 5.0f));
+            ctx->Yield(3);
+        };
+        auto shot = [&](const char* window, const char* name) {
+            parkMouse();
+            ctx->CaptureReset();
+            std::snprintf(ctx->CaptureArgs->InOutputFile, sizeof ctx->CaptureArgs->InOutputFile,
+                          "output/captures/readme_%s.png", name);
+            ctx->CaptureAddWindow(window);
+            ctx->CaptureScreenshot(ImGuiCaptureFlags_HideMouseCursor);
+        };
+        auto newWindow = [&](const char* menu, const char* prefix) {
+            ctx->MenuClick((std::string("//##MainMenuBar/View/") + menu).c_str());
+            ctx->Yield(3);
+            std::string ref;
+            openSpectra(&ref, prefix);
+            return ref;
+        };
+        auto bindSpectrum = [&](const std::string& ref, const char* stream) {
+            if (!cfgOf(ref)) return false;
+            ctx->ComboClick((std::string("##stream/") + stream).c_str());
+            ctx->ComboClick("N/4096");
+            ctx->ItemClick("All");
+            return true;
+        };
+        auto bindSpectrogram = [&](const std::string& ref, const char* stream, float span) {
+            if (!cfgOf(ref)) return false;
+            ctx->ComboClick((std::string("##stream/") + stream).c_str());
+            ctx->ItemInputValue("span (s)", span);
+            return true;
+        };
+        auto bindErp = [&](const std::string& ref) {
+            if (!waitFor([&] { return ctx->WindowInfo((ref + "/cfg").c_str(), ImGuiTestOpFlags_NoError).Window != nullptr; }, 10.0)) {
+                IM_ERRORF("%s has no controls: no marker stream?", ref.c_str());
+                return false;
+            }
+            if (!cfgOf(ref)) return false;
+            ctx->ComboClick("stream/MockEvoked");
+            ctx->ComboClick("trigger/MockEvokedMarkers");
+            ctx->ItemInputValue("match", "target");
+            return true;
+        };
+        auto openHeaders = [&](const char* window, std::initializer_list<const char*> headers) {
+            if (!cfgOf(std::string("//") + window)) return false;
+            for (const char* h : headers) ctx->ItemOpen(h);
+            return true;
+        };
+
+        if (want("montage") || want("spectrum")) {
+            // The tab order is the connect order.
+            if (!connect("mock-hd", "MockHighDensity") || !connect("mock-eeg", "MockEEG") ||
+                !connect("mock-drift", "MockDrift"))
+                return;
+            // An analysis row below gives the time series the height they have in the README.
+            const std::string spectrum = newWindow("New spectrum", "Spectrum ");
+            if (want("montage")) {
+                if (!openHeaders("MockHighDensity", {"Display", "Channels"})) return;
+                ctx->ItemClick("All");
+                ctx->ItemCheck("Raster");
+                if (!openHeaders("MockDrift", {"Display", "Channels"})) return;
+                pause(11.0);                              // fill the 10 s history
+                shot("//MockDrift", "montage_drift");
+                ctx->WindowFocus("//MockHighDensity");
+                shot("//MockHighDensity", "montage_raster");
+            }
+            if (want("spectrum")) {
+                if (!connect("mock-audio", "MockAudio")) return;
+                if (!bindSpectrum(spectrum, "MockAudio")) return;
+                pause(3.0);                               // fill one 4096-point window
+                ctx->ItemClick("Fit Hz");
+                pause(1.0);
+                shot(spectrum.c_str(), "spectrum");
+            }
+        }
+        if (want("spectrogram")) {
+            if (!connect("mock-chirp", "MockChirp")) return;
+            const std::string spectro = newWindow("New spectrogram", "Spectrogram ");
+            if (!bindSpectrogram(spectro, "MockChirp", 8.0f)) return;
+            pause(9.0);                                   // one full 8 s sweep across the span
+            ctx->ItemClick("Fit Hz");
+            pause(1.0);
+            shot(spectro.c_str(), "spectrogram");
+        }
+        if (want("erp")) {
+            if (!connect("mock-evoked", "MockEvoked")) return;
+            connect("mock-evoked-markers", nullptr);
+            const std::string erp = newWindow("New ERP (marker average)", "ERP ");
+            if (!bindErp(erp)) return;
+            waitFor([] { return erpProbe().count >= 30; }, 90.0);
+            ctx->LogInfo("ERP: %d epochs", erpProbe().count);
+            shot(erp.c_str(), "erp");
+        }
+        if (want("live")) {
+            if (!connect("mock-evoked", "MockEvoked") || !connect("mock-chirp", "MockChirp") ||
+                !connect("mock-eeg", "MockEEG") || !connect("mock-drift", "MockDrift") ||
+                !connect("mock-audio", "MockAudio"))
+                return;
+            connect("mock-evoked-markers", nullptr);
+            connect("mock-markers", nullptr);
+            // One analysis row, split three ways: spectrogram, spectrum, ERP.
+            const std::string spectro  = newWindow("New spectrogram", "Spectrogram ");
+            const std::string spectrum = newWindow("New spectrum", "Spectrum ");
+            const std::string erp      = newWindow("New ERP (marker average)", "ERP ");
+            ctx->DockInto(spectrum.c_str(), spectro.c_str(), ImGuiDir_Right);
+            ctx->DockInto(erp.c_str(), spectrum.c_str(), ImGuiDir_Right);
+            ctx->Yield(3);
+            // Docking halves a node, which leaves the ERP a quarter of the row: too narrow for its
+            // plot beside the controls. Drag the splitters to near thirds.
+            auto nodeOf = [&](const std::string& ref) { return ctx->GetWindowByRef(ref.c_str())->DockNode; };
+            const float rowX = nodeOf(spectro)->Pos.x;
+            const float rowW = nodeOf(erp)->Pos.x + nodeOf(erp)->Size.x - rowX;
+            auto dragSplitter = [&](const std::string& left, float frac) {
+                const ImGuiDockNode* n = nodeOf(left);
+                const float y = n->Pos.y + n->Size.y * 0.5f;
+                ctx->MouseMoveToPos(ImVec2(n->Pos.x + n->Size.x + 1.0f, y));
+                ctx->MouseDown(ImGuiMouseButton_Left);
+                ctx->MouseMoveToPos(ImVec2(rowX + rowW * frac, y));
+                ctx->MouseUp(ImGuiMouseButton_Left);
+                ctx->Yield(2);
+            };
+            dragSplitter(spectro, 0.33f);
+            dragSplitter(spectrum, 0.67f);
+            if (!bindSpectrogram(spectro, "MockChirp", 2.0f) || !bindSpectrum(spectrum, "MockAudio") || !bindErp(erp))
+                return;
+            if (!openHeaders("MockEEG", {"Display", "Channels", "Markers"})) return;
+            ctx->ItemCheck("Overlay markers");
+            ctx->ScrollToTop(ctx->GetRef());              // the cfg child scrolled down to reach it
+            waitFor([] { return erpProbe().count >= 15; }, 60.0);
+            if (!cfgOf(spectro)) return;
+            ctx->ItemClick("Fit Hz");
+            if (!cfgOf(spectrum)) return;
+            ctx->ItemClick("Fit Hz");
+            ctx->SetRef("//Streams");                     // the rail would show this machine's folder
+            ctx->ItemInputValue("##recdir", "");
+            ctx->WindowFocus("//MockEEG");
+            parkMouse();
+            pause(1.0);
+            // One frame per video frame, in fixed steps of the frame period, paced to the wall
+            // clock: the video then plays at the speed the streams run. A full-window readback per
+            // frame is slow, so the rate is the GIF's (12 fps), not 30 or 60.
+            constexpr int kFps = 12;
+            std::snprintf(ctx->EngineIO->VideoCaptureEncoderParams, sizeof ctx->EngineIO->VideoCaptureEncoderParams, "%s",
+                          "-hide_banner -loglevel error -r $FPS -f rawvideo -pix_fmt rgba -s $WIDTHx$HEIGHT -i - "
+                          "-threads 0 -y -c:v libx264 -preset ultrafast -crf 0 -pix_fmt yuv444p $OUTPUT");
+            ctx->CaptureReset();
+            std::snprintf(ctx->CaptureArgs->InOutputFile, sizeof ctx->CaptureArgs->InOutputFile,
+                          "output/captures/readme_live.mp4");
+            ctx->CaptureArgs->InFlags = ImGuiCaptureFlags_HideMouseCursor;
+            ctx->CaptureArgs->InRecordFPSTarget = kFps;
+            if (!ctx->CaptureBeginVideo()) { IM_ERRORF("%s", "no video capture: set LSL_FFMPEG"); return; }
+            // A hair over the period, so float rounding never makes the capture skip a frame.
+            ctx->EngineIO->ConfigFixedDeltaTime = 1.0f / kFps + 1e-5f;
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(1.0 / kFps));
+            int frames = 0, late = 0;
+            while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(6500)) {
+                if (std::chrono::steady_clock::now() > t0 + step * (frames + 1)) ++late;
+                std::this_thread::sleep_until(t0 + step * (frames + 1));
+                ctx->Yield();
+                ++frames;
+            }
+            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            ctx->CaptureEndVideo();
+            ctx->LogInfo("video: %d frames in %.2f s (%.1f Hz, %d late; %d plays at real speed)",
+                         frames, wall, frames / wall, late, kFps);
+        }
+    };
+
     // Profiling soak, opt-in so the normal suite stays fast: a default layout exercises only the
     // time series of 16 channels, which hides the analysis windows and the many-channel paths.
     //   LSL_PERF_SOAK=<seconds>  run time after setup (unset: the test returns at once)
