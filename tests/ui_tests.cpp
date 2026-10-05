@@ -14,6 +14,7 @@
 
 #include "filter.hpp"
 #include "fft.hpp"               // Psd (KissFFT-backed) under test
+#include "heatmap_image.hpp"     // heatmaps as one textured quad, under test
 #include "remote_control.hpp"   // TCP control server under test (+ its rc_socket_t layer)
 #include "xdf_player.hpp"       // XdfPlayer::State, for the replay test
 #include "xdf_writer.hpp"       // writes the replay test's file
@@ -226,13 +227,15 @@ static StreamProbeView streamProbe(const char* name) {
 // Spectrum windows are numbered as they open and never renumbered, so which ones exist
 // depends on the tests before. Returns how many are open; *newest gets the ref of the
 // highest-numbered one. WasActive, not Active: the test runs after NewFrame clears Active.
-static int openSpectra(std::string* newest = nullptr) {
+// `prefix` selects the window family ("Spectrogram " for spectrograms).
+static int openSpectra(std::string* newest = nullptr, const char* prefix = "Spectrum ") {
     int n = 0, best = 0;
+    const std::size_t plen = std::strlen(prefix);
     for (ImGuiWindow* w : ImGui::GetCurrentContext()->Windows) {
         // Docked windows are child windows of the dock host, so skip children by name.
-        if (!w->WasActive || std::strncmp(w->Name, "Spectrum ", 9) != 0 || std::strchr(w->Name, '/')) continue;
+        if (!w->WasActive || std::strncmp(w->Name, prefix, plen) != 0 || std::strchr(w->Name, '/')) continue;
         ++n;
-        if (const int id = std::atoi(w->Name + 9); id > best) {
+        if (const int id = std::atoi(w->Name + plen); id > best) {
             best = id;
             if (newest) *newest = std::string("//") + w->Name;
         }
@@ -335,6 +338,67 @@ void RegisterAppTests(ImGuiTestEngine* e) {
           b.process(s.data(), (std::size_t)N); IM_CHECK_GT(pp(s), 0.8f * full); }   // 5 Hz passes
         { auto s = tone(80.0f); Biquad b; b.init(1); b.setLowpass(30.0, fs, 0.70710678);
           b.process(s.data(), (std::size_t)N); IM_CHECK_LT(pp(s), 0.3f * full); }   // 80 Hz attenuated
+    };
+
+    // The texture heatmap colors every value as PlotHeatmap does: the same colormap table entry,
+    // including values clamped at either end of the scale, for each colormap the views use.
+    // A NaN takes the low end. No UI.
+    t = IM_REGISTER_TEST(e, "heat", "colorscale");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        IM_UNUSED(ctx);
+        ImPlotContext& gp = *GImPlot;
+        for (ImPlotColormap cm : { (ImPlotColormap)ImPlotColormap_Plasma, (ImPlotColormap)ImPlotColormap_Viridis,
+                                   (ImPlotColormap)ImPlotColormap_Deep }) {   // Deep: a qualitative map
+            ImPlot::PushColormap(cm);
+            const double lo = -40.0, hi = 20.0;
+            const heat::ColorScale cs(lo, hi);
+            int bad = 0;
+            for (int i = -200; i <= 1200; ++i) {
+                const double v = lo + (hi - lo) * i / 1000.0;
+                const float  t01 = ImClamp((float)((v - lo) / (hi - lo)), 0.0f, 1.0f);   // as GetterHeatmap
+                if (cs(v) != gp.ColormapData.LerpTable(cm, t01)) ++bad;
+            }
+            IM_CHECK_EQ(bad, 0);
+            IM_CHECK_EQ(cs(std::nan("")), gp.ColormapData.GetTableColor(cm, 0));
+            ImPlot::PopColormap();
+        }
+    };
+
+    // The texture heatmap next to PlotHeatmap on the same values: a gradient, one row past each
+    // end of the scale, and a checkerboard that shows the cell edges. Captured for a visual check.
+    t = IM_REGISTER_TEST(e, "heat", "capture_compare");
+    t->GuiFunc = [](ImGuiTestContext* ctx) {
+        IM_UNUSED(ctx);
+        constexpr int R = 6, C = 24;
+        static float v[R * C];
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < C; ++c)
+                v[r * C + c] = r == 0 ? -0.5f : r == 1 ? 1.5f : r == 2 ? (float)((r + c) % 2)
+                                                              : (float)c / (C - 1) * (float)(r - 2) / 3.0f;
+        ImGui::SetNextWindowSize(ImVec2(660, 280), ImGuiCond_Always);
+        ImGui::Begin("Heat compare", nullptr, ImGuiWindowFlags_NoSavedSettings);
+        ImPlot::PushColormap(ImPlotColormap_Plasma);
+        const ImPlotFlags      pf = ImPlotFlags_CanvasOnly;
+        const ImPlotAxisFlags  af = ImPlotAxisFlags_NoDecorations;
+        if (ImPlot::BeginPlot("##quads", ImVec2(310, 230), pf)) {
+            ImPlot::SetupAxes(nullptr, nullptr, af, af);
+            ImPlot::SetupAxesLimits(0, 1, 0, 1, ImPlotCond_Always);
+            ImPlot::PlotHeatmap("##q", v, R, C, 0.0, 1.0, nullptr, ImPlotPoint(0, 0), ImPlotPoint(1, 1));
+            ImPlot::EndPlot();
+        }
+        ImGui::SameLine();
+        if (ImPlot::BeginPlot("##texture", ImVec2(310, 230), pf)) {
+            ImPlot::SetupAxes(nullptr, nullptr, af, af);
+            ImPlot::SetupAxesLimits(0, 1, 0, 1, ImPlotCond_Always);
+            heat::plotValues("##t", v, R, C, 0.0, 1.0, ImPlotPoint(0, 0), ImPlotPoint(1, 1));
+            ImPlot::EndPlot();
+        }
+        ImPlot::PopColormap();
+        ImGui::End();
+    };
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->Yield(3);
+        ctx->CaptureScreenshotWindow("//Heat compare", ImGuiCaptureFlags_HideMouseCursor);
     };
 
     // PSD correctness (KissFFT backend): a pure 40 Hz sine must peak in the 40 Hz
@@ -1286,11 +1350,18 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         // Every frame: the edge's step and its velocity (data seconds per wall second, from the
         // frame's own time). Judder is the velocity jumping from frame to frame; a stall is a
         // frame where the edge stops while data keeps coming.
+        // A jolt is a jump in velocity that is large in itself (dv) AND large for the time it
+        // took (dv per wall second, over the mean of the two frames). During a speed change
+        // the edge really accelerates at about 13 to 17 data s/s^2, so one long frame in that
+        // ramp (60 to 130 ms under load) makes dv exceed 0.5 with a smooth scroll.
+        constexpr double kJoltDv    = 0.5;    // data s per wall s
+        constexpr double kJoltAccel = 30.0;   // data s/s^2: about twice the ramp's acceleration
         struct Stats { int frames = 0, back = 0, ahead = 0, stalls = 0, jolts = 0;
-                       double maxBack = 0.0, maxStep = 0.0, maxAhead = 0.0, maxDv = 0.0; };
+                       double maxBack = 0.0, maxStep = 0.0, maxAhead = 0.0, maxDv = 0.0,
+                              maxAccel = 0.0; };   // maxAccel: the worst dv/dt among dv > kJoltDv
         auto record = [&](double seconds) {
             Stats st;
-            double prev = streamProbe(kName).edge, prevV = -1.0;
+            double prev = streamProbe(kName).edge, prevV = -1.0, prevDt = 0.0;
             int frame = ImGui::GetFrameCount();
             const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
             while (std::chrono::steady_clock::now() < end) {
@@ -1307,19 +1378,23 @@ void RegisterAppTests(ImGuiTestEngine* e) {
                 if (prevV >= 0.0) {
                     const double dv = std::fabs(v - prevV);
                     st.maxDv = std::max(st.maxDv, dv);
-                    if (dv > 0.5) ++st.jolts;
+                    if (dv > kJoltDv) {
+                        const double accel = dv / (0.5 * (dt + prevDt));
+                        st.maxAccel = std::max(st.maxAccel, accel);
+                        if (accel > kJoltAccel) ++st.jolts;
+                    }
                 }
                 const double ahead = p.edge - p.newest;
                 if (ahead > 0.05) { ++st.ahead; st.maxAhead = std::max(st.maxAhead, ahead); }
-                prev = p.edge; prevV = v;
+                prev = p.edge; prevV = v; prevDt = dt;
             }
             return st;
         };
         auto report = [&](const char* what, const Stats& st) {
-            ctx->LogInfo("%s: %d frames, %d stalls, %d jolts (max dv %.2f), %d back (max %.3f s), max step %.3f s, "
-                         "%d ahead of the data (max %.3f s)",
-                         what, st.frames, st.stalls, st.jolts, st.maxDv, st.back, st.maxBack, st.maxStep,
-                         st.ahead, st.maxAhead);
+            ctx->LogInfo("%s: %d frames, %d stalls, %d jolts (max dv %.2f; worst dv/dt above dv %.1f: %.0f /s^2, "
+                         "limit %.0f), %d back (max %.3f s), max step %.3f s, %d ahead of the data (max %.3f s)",
+                         what, st.frames, st.stalls, st.jolts, st.maxDv, kJoltDv, st.maxAccel, kJoltAccel,
+                         st.back, st.maxBack, st.maxStep, st.ahead, st.maxAhead);
         };
         ctx->ComboClick("##replayspeed/1x");
         const Stats down = record(2.5);
@@ -1328,7 +1403,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         const Stats up = record(1.5);
         report("1x -> 5x", up);
         // Smooth: never back, never ahead of the data, never stopping while data comes, and
-        // no frame-to-frame jump in speed (a change of speed is a ramp over ~20 frames).
+        // no jump in speed (a change of speed is a ramp over ~20 frames; see kJoltAccel).
         for (const Stats* st : {&down, &up}) {
             IM_CHECK_LT(st->maxBack, 0.001);
             IM_CHECK_EQ(st->ahead, 0);
@@ -1398,5 +1473,93 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK_LT(hi - lo, 1.0);                        // and steady to read
         ctx->WindowClose("//RateTest");
         ctx->Yield(3);
+    };
+
+    // Profiling soak, opt-in so the normal suite stays fast: a default layout exercises only the
+    // time series of 16 channels, which hides the analysis windows and the many-channel paths.
+    //   LSL_PERF_SOAK=<seconds>  run time after setup (unset: the test returns at once)
+    //   LSL_PERF_STREAM=<name>   show every channel of this stream window
+    //   LSL_PERF_RASTER=1        and draw it as the raster heatmap
+    //   LSL_PERF_OPEN=<list>     windows to open, from spectrum,spectrogram,erp,markers (default all;
+    //                            each opens twice except erp and markers)
+    //   LSL_PERF_SPECTRUM_ALL=1  select every channel in the spectrum windows (of LSL_PERF_STREAM)
+    //   LSL_PERF_SPEED=<5x>      replay speed, as the Playback combo shows it (with LSL_REPLAY)
+    //   LSL_PERF_SPECTRO_SPAN=<s> spectrogram span in seconds (and bind them to LSL_PERF_STREAM)
+    //   LSL_PERF_CAPTURE=1       save a screenshot of the viewport at the end (output/captures)
+    // Run it with LSL_PROFILE=1 LSL_AUTOCONNECT=1 and a heavy sender, e.g.
+    //   uv run tools/lsl_test_streams.py --hd-channels 256 --hd-rate 8000
+    //   lsl_viewer --tests soak
+    t = IM_REGISTER_TEST(e, "bench", "soak");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        const char* soak = std::getenv("LSL_PERF_SOAK");
+        if (!soak) { ctx->LogInfo("LSL_PERF_SOAK not set; skipping"); return; }
+        ctx->SleepNoSkip(3.0f, 1.0f / 30.0f);           // discovery + autoconnect
+        if (const char* name = std::getenv("LSL_PERF_STREAM")) {
+            const std::string win = std::string("//") + name;
+            // A replay (LSL_REPLAY) can take longer than the fixed wait above to prepare and connect.
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            while (ctx->GetWindowByRef(win.c_str()) == nullptr && std::chrono::steady_clock::now() < until) ctx->Yield();
+            IM_CHECK_RETV(ctx->GetWindowByRef(win.c_str()) != nullptr, void());
+            ctx->WindowFocus(win.c_str()); ctx->Yield(2);
+            ImGuiTestItemInfo cfg = ctx->WindowInfo((win + "/cfg").c_str());
+            if (cfg.Window == nullptr) { ctx->LogError("no cfg child in %s", win.c_str()); return; }
+            ctx->SetRef(cfg.Window);
+            ctx->ItemOpen("Channels");
+            ctx->ItemClick("All");
+            ctx->ItemClose("Channels");
+            if (std::getenv("LSL_PERF_RASTER")) {
+                ctx->ItemOpen("Display");
+                ctx->ItemCheck("Raster");
+                ctx->ItemClose("Display");
+            }
+        }
+        if (const char* speed = std::getenv("LSL_PERF_SPEED")) {
+            ctx->SetRef("//Streams");                    // Playback is a section of the rail
+            ctx->ComboClick((std::string("##replayspeed/") + speed).c_str());
+        }
+        const char* openEnv = std::getenv("LSL_PERF_OPEN");
+        const std::string open = openEnv ? openEnv : "spectrum,spectrogram,erp,markers";
+        auto want = [&](const char* w) { return open.find(w) != std::string::npos; };
+        // "spectrum" is also a prefix of "spectrogram": match it with its separator or at the end.
+        const bool spectrum = (open + ",").find("spectrum,") != std::string::npos;
+        for (int i = 0; i < 2 && spectrum; ++i) {
+            ctx->MenuClick("//##MainMenuBar/View/New spectrum");
+            ctx->Yield(2);
+            std::string ref;
+            if (std::getenv("LSL_PERF_SPECTRUM_ALL") && openSpectra(&ref) > 0) {
+                ImGuiTestItemInfo cfg = ctx->WindowInfo((ref + "/cfg").c_str());   // a child window
+                if (cfg.Window == nullptr) { ctx->LogError("no cfg child in %s", ref.c_str()); return; }
+                ctx->SetRef(cfg.Window);
+                // A new spectrum takes the first connected stream, and the connect order varies.
+                if (const char* name = std::getenv("LSL_PERF_STREAM"))
+                    ctx->ComboClick((std::string("##stream/") + name).c_str());
+                ctx->ItemClick("All");
+            }
+        }
+        for (int i = 0; i < 2 && want("spectrogram"); ++i) {
+            ctx->MenuClick("//##MainMenuBar/View/New spectrogram");
+            ctx->Yield(2);
+            std::string ref;
+            const char* span = std::getenv("LSL_PERF_SPECTRO_SPAN");
+            if (span && openSpectra(&ref, "Spectrogram ") > 0) {
+                ImGuiTestItemInfo cfg = ctx->WindowInfo((ref + "/cfg").c_str());   // a child window
+                if (cfg.Window == nullptr) { ctx->LogError("no cfg child in %s", ref.c_str()); return; }
+                ctx->SetRef(cfg.Window);
+                if (const char* name = std::getenv("LSL_PERF_STREAM"))
+                    ctx->ComboClick((std::string("##stream/") + name).c_str());
+                ctx->ItemInputValue("span (s)", (float)std::atof(span));
+            }
+        }
+        if (want("erp"))     ctx->MenuClick("//##MainMenuBar/View/New ERP (marker average)");
+        if (want("markers")) ctx->MenuClick("//##MainMenuBar/View/Marker events");
+        ctx->MouseMoveToPos(ImVec2(5, 5));               // no hover tooltips during the soak
+        // Wall clock, not SleepNoSkip: that one advances simulated time, so unthrottled frames
+        // would end the soak long before the producers had delivered its worth of data.
+        const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(std::atof(soak));
+        while (std::chrono::steady_clock::now() < end) ctx->Yield();
+        if (std::getenv("LSL_PERF_CAPTURE")) {
+            ctx->CaptureReset();
+            ctx->CaptureScreenshot(ImGuiCaptureFlags_HideMouseCursor);
+        }
     };
 }

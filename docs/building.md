@@ -183,6 +183,44 @@ There's also a lightweight built-in text profiler: run with `LSL_PROFILE=1` for 
 per-zone timing table, or `LSL_BENCH=1` for an FPS / CPU-build / GPU-submit
 readout (no Tracy needed).
 
+The default layout shows only 16 channels and no analysis windows. To profile the heavy
+paths, use the `bench/soak` UI test in a `-DLSL_VIEWER_TESTS=ON` build. It opens two
+spectra, two spectrograms, an ERP window, and the marker list, and then runs for the
+time that you set:
+
+```bash
+uv run tools/lsl_test_streams.py --hd-channels 256 --hd-rate 8000
+LSL_PROFILE=1 LSL_AUTOCONNECT=1 LSL_PERF_SOAK=30 LSL_PERF_STREAM=MockHighDensity \
+    ./lsl_viewer --tests soak
+```
+
+Without `LSL_PERF_SOAK`, the test does nothing, so the normal suite is not slower. These
+variables change what the soak does:
+
+| Variable | Effect |
+|----------|--------|
+| `LSL_PERF_SOAK=<s>` | Run for this many seconds after the setup. |
+| `LSL_PERF_STREAM=<name>` | Show all channels of the stream window with this name, and bind the spectra and spectrograms to it. |
+| `LSL_PERF_RASTER=1` | Show that stream as a raster. |
+| `LSL_PERF_OPEN=<list>` | Open only these windows, from `spectrum,spectrogram,erp,markers`. |
+| `LSL_PERF_SPECTRUM_ALL=1` | Select all channels in the spectra. |
+| `LSL_PERF_SPECTRO_SPAN=<s>` | Set the spectrogram span. |
+| `LSL_PERF_SPEED=5x` | Set the replay speed, with `LSL_REPLAY=<file>`. |
+| `LSL_PERF_CAPTURE=1` | Save a screenshot of the window at the end, in `output/captures/`. |
+
+These variables of the viewer itself help to profile on a given display or GPU:
+
+| Variable | Effect |
+|----------|--------|
+| `LSL_WINDOW=WxH` | Set the initial window size. |
+| `LSL_DISPLAY=<n>` | Open on display n (1 is the first). The log shows the display name. |
+| `LSL_MAXIMIZE=1` | Maximize the window. |
+| `LSL_FULLSCREEN=1` | Use borderless fullscreen. |
+| `LSL_GPU_LOW_POWER=1` | Use the integrated GPU on a laptop with two GPUs. The log and the Debug menu show the GPU name. |
+| `LSL_NOVSYNC=1` | Turn off VSync, to measure the full render cost. |
+| `LSL_FPS_CAP=<n>` | Limit the frame rate to n frames a second (also in the Performance window). |
+| `LSL_FRAMES_IN_FLIGHT=<n>` | Let the GPU queue 1 to 3 frames (default: 1). More frames give more input lag. |
+
 ## Static build (single-file distribution)
 
 `-DLSL_VIEWER_STATIC=ON` folds SDL3 and liblsl into the executable so there's nothing to
@@ -233,6 +271,7 @@ src/                     the viewer — one translation unit + header-only modul
   minmax_summary.hpp       decimated min/max envelope for zoomed-out plots
   filter.hpp               DC-blocker high-pass + RBJ biquads (notch / low-pass)
   fft.hpp                  FFT + PSD (spectrum and spectrogram views)
+  heatmap_image.hpp        heatmaps (raster, spectrogram, ERP raster) drawn as one texture
   recorder.hpp             XDF recording driver (records connected streams)
   xdf_writer.hpp           XDF container writer
   xdf_reader.hpp           XDF scan, chunk index, decoder, pyxdf clock sync and dejitter

@@ -35,13 +35,13 @@ public:
 
     // PRODUCER thread only. Fold n interleaved samples (n*channels floats).
     void append(const float* s, std::size_t n) {
-        for (std::size_t i = 0; i < n; ++i) {
-            const float* smp = s + i * (std::size_t)C_;
-            for (int c = 0; c < C_; ++c) {
-                if (smp[c] < accMn_[c]) accMn_[c] = smp[c];
-                if (smp[c] > accMx_[c]) accMx_[c] = smp[c];
-            }
-            if (++accCount_ == B_) commit();
+        // In runs that end on a bin boundary, so the fold loop has no commit in it.
+        while (n > 0) {
+            const std::size_t run = std::min<std::size_t>(n, (std::size_t)(B_ - accCount_));
+            fold(accMn_.data(), accMx_.data(), s, run, C_);
+            s += run * (std::size_t)C_; n -= run;
+            accCount_ += (int)run;
+            if (accCount_ == B_) commit();
         }
     }
 
@@ -71,12 +71,14 @@ public:
 
     // Fill one channel's min/max for a span. mn/mx must each hold >= s.n doubles.
     void binValues(const Span& s, int c, double* mn, double* mx) const {
-        int n = 0;
-        for (std::uint64_t k = s.first; k < s.end; ++k) {
-            const std::size_t slot = (std::size_t)(k % capB_) * C_ + c;
-            mn[n] = mn_[slot];
-            mx[n] = mx_[slot];
-            ++n;
+        // A wrapping slot counter, not k % capB_ per bin: the 64-bit division was half the cost
+        // of this loop, which runs for every visible channel every frame.
+        const std::size_t C = (std::size_t)C_;
+        std::size_t slot = s.n > 0 ? (std::size_t)(s.first % capB_) : 0;
+        for (int i = 0; i < s.n; ++i) {
+            mn[i] = mn_[slot * C + c];
+            mx[i] = mx_[slot * C + c];
+            if (++slot == capB_) slot = 0;
         }
     }
 
@@ -108,6 +110,21 @@ public:
     }
 
 private:
+    // A separate function so the restrict scope is exactly the loop: with the members, MSVC
+    // (no type-based alias analysis) assumed the stores could change C_ and left it scalar.
+    static void fold(float* __restrict mn, float* __restrict mx, const float* s, std::size_t n, int C) {
+        for (std::size_t i = 0; i < n; ++i) {
+            const float* smp = s + i * (std::size_t)C;
+            for (int c = 0; c < C; ++c) {
+                // Value selects, not std::min/max: those return a reference, and MSVC then saw
+                // a choice between two addresses. A NaN sample compares false and is skipped.
+                const float v = smp[c], lo = mn[c], hi = mx[c];
+                mn[c] = v < lo ? v : lo;
+                mx[c] = v > hi ? v : hi;
+            }
+        }
+    }
+
     void commit() {
         const std::size_t base = (std::size_t)(binAbs_ % capB_) * C_;
         for (int c = 0; c < C_; ++c) { mn_[base + c] = accMn_[c]; mx_[base + c] = accMx_[c]; }

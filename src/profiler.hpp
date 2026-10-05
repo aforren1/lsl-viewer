@@ -38,7 +38,10 @@ struct Stat { std::uint64_t count = 0, total_ns = 0, max_ns = 0; };
 
 inline std::atomic<bool>                       g_on{false};
 inline std::mutex                              g_mtx;
-inline std::unordered_map<std::string, Stat>   g_stats;
+// Keyed by the zone's string-literal pointer: a std::string key cost a hash and possibly an
+// allocation on every zone exit, under the lock, which inflated the times being measured.
+// The same name can have a different pointer per translation unit, so dump() merges by text.
+inline std::unordered_map<const char*, Stat>   g_stats;
 
 inline void enable(bool e) { g_on.store(e, std::memory_order_relaxed); }
 
@@ -52,7 +55,13 @@ inline void record(const char* name, std::uint64_t ns) {
 inline void dump(double elapsed_s) {
     std::lock_guard<std::mutex> lk(g_mtx);
     if (g_stats.empty()) return;
-    std::vector<std::pair<std::string, Stat>> v(g_stats.begin(), g_stats.end());
+    std::vector<std::pair<std::string, Stat>> v;
+    for (const auto& [name, st] : g_stats) {
+        auto it = std::find_if(v.begin(), v.end(), [&](const auto& e) { return e.first == name; });
+        if (it == v.end()) { v.emplace_back(name, st); continue; }
+        it->second.count += st.count; it->second.total_ns += st.total_ns;
+        it->second.max_ns = std::max(it->second.max_ns, st.max_ns);
+    }
     std::sort(v.begin(), v.end(),
               [](const auto& a, const auto& b) { return a.second.total_ns > b.second.total_ns; });
     std::printf("[profile] --- %.1fs window ---  %-16s %8s %10s %9s %9s %7s\n",

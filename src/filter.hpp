@@ -29,16 +29,23 @@ struct DcBlocker {
         return (float)std::exp(-2.0 * std::numbers::pi * fc / fs);
     }
 
-    // Filter n interleaved samples (C channels) from `in` into `out`.
+    // Filter n interleaved samples (C channels) from `in` into `out`. `in` may equal `out`.
     void process(const float* in, float* out, std::size_t n) {
         if (!primed_) { for (int c = 0; c < C_; ++c) x1_[c] = in[c]; primed_ = true; }
+        // Locals, not members, in the loop: MSVC has no type-based alias analysis, so with the
+        // members it must assume a store to out can change x1_, y1_, R_ or even C_, and it
+        // leaves the channel loop scalar (C5002, reasons 500 and 1200).
+        float* __restrict x1 = x1_.data();
+        float* __restrict y1 = y1_.data();
+        const float R = R_;
+        const int   C = C_;
         for (std::size_t i = 0; i < n; ++i) {
-            const float* x = in  + i * (std::size_t)C_;
-            float*       o = out + i * (std::size_t)C_;
-            for (int c = 0; c < C_; ++c) {
+            const float* x = in  + i * (std::size_t)C;
+            float*       o = out + i * (std::size_t)C;
+            for (int c = 0; c < C; ++c) {
                 const float xc = x[c];
-                const float y  = xc - x1_[c] + R_ * y1_[c];
-                x1_[c] = xc; y1_[c] = y; o[c] = y;
+                const float y  = xc - x1[c] + R * y1[c];
+                x1[c] = xc; y1[c] = y; o[c] = y;
             }
         }
     }
@@ -84,13 +91,18 @@ struct Biquad {
 
     // Filter n interleaved samples (C channels) in place.
     void process(float* x, std::size_t n) {
+        // Locals for the state, coefficients and channel count, as in DcBlocker::process.
+        float* __restrict z1 = z1_.data();
+        float* __restrict z2 = z2_.data();
+        const float b0 = b0_, b1 = b1_, b2 = b2_, a1 = a1_, a2 = a2_;
+        const int   C = C_;
         for (std::size_t i = 0; i < n; ++i) {
-            float* s = x + i * (std::size_t)C_;
-            for (int c = 0; c < C_; ++c) {
+            float* s = x + i * (std::size_t)C;
+            for (int c = 0; c < C; ++c) {
                 const float in = s[c];
-                const float y  = b0_ * in + z1_[c];
-                z1_[c] = b1_ * in - a1_ * y + z2_[c];
-                z2_[c] = b2_ * in - a2_ * y;
+                const float y  = b0 * in + z1[c];
+                z1[c] = b1 * in - a1 * y + z2[c];
+                z2[c] = b2 * in - a2 * y;
                 s[c] = y;
             }
         }

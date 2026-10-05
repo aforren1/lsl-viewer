@@ -20,6 +20,7 @@
 #include "magic_ring_buffer.hpp"
 #include "minmax_summary.hpp"
 #include "filter.hpp"
+#include "profiler.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -306,16 +307,28 @@ public:
     // moves (data seconds per wall second). A plot edge that follows this a little in the past
     // moves exactly as the data arrived, speed changes included, with no speed estimate to wait
     // for; the averaging smooths delivery jitter and turns a change of speed into a short ramp.
-    // False before the first delivery.
-    bool trajectory(double tA, double tB, double& value, double& slope) const {
+    // Past the newest delivery, N goes on at the slope of the last `ahead` seconds for up to
+    // `ahead` seconds, then stays flat. A delivery that comes late (a busy machine held the
+    // transport for 100 ms) then fits the line the edge was already following. Flat at once,
+    // the slope fell as the window ran past the last delivery and jumped back when the late
+    // block arrived, and the edge lurched. False before the first delivery.
+    bool trajectory(double tA, double tB, double& value, double& slope, double ahead = 0.0) const {
         std::lock_guard<std::mutex> lk(markMtx_);
         if (markCount_ == 0 || !(tB > tA)) return false;
         const std::size_t cap = marks_.size(), first = (markHead_ + cap - markCount_) % cap;
         auto at = [&](std::size_t i) -> const Mark& { return marks_[(first + i) % cap]; };
+        const Mark& last = at(markCount_ - 1);
+        double lastSlope = 0.0;
+        if (ahead > 0.0 && markCount_ > 1) {
+            std::size_t lo = 0, hi = markCount_ - 1;   // the newest knot at least `ahead` s older
+            if (at(0).wall <= last.wall - ahead)
+                while (hi - lo > 1) { const std::size_t mid = (lo + hi) / 2; (at(mid).wall <= last.wall - ahead ? lo : hi) = mid; }
+            const Mark& ref = at(lo);
+            if (last.wall > ref.wall) lastSlope = std::max(0.0, (last.newest - ref.newest) / (last.wall - ref.wall));
+        }
         auto valueAt = [&](double t) {             // N(t)
             if (t <= at(0).wall) return at(0).newest;
-            const Mark& last = at(markCount_ - 1);
-            if (t >= last.wall) return last.newest;
+            if (t >= last.wall) return last.newest + lastSlope * std::min(t - last.wall, ahead);
             std::size_t lo = 0, hi = markCount_ - 1;   // at(lo).wall <= t < at(hi).wall
             while (hi - lo > 1) { const std::size_t mid = (lo + hi) / 2; (at(mid).wall <= t ? lo : hi) = mid; }
             const Mark& a = at(lo); const Mark& b = at(hi);
@@ -329,6 +342,12 @@ public:
             if (m.wall >= tB) break;
             area += 0.5 * (v + m.newest) * (m.wall - t);
             t = m.wall; v = m.newest;
+        }
+        const double kink = last.wall + ahead;   // where the extension turns flat
+        if (lastSlope > 0.0 && kink > t && kink < tB) {
+            const double vk = valueAt(kink);
+            area += 0.5 * (v + vk) * (kink - t);
+            t = kink; v = vk;
         }
         const double vB = valueAt(tB);
         area += 0.5 * (v + vB) * (tB - t);
@@ -425,6 +444,7 @@ private:
     // canonical head every reader bounds by, including filtered reads of ringHp_ — never
     // runs ahead of the filtered ring/summaries for the same chunk. Producer-only.
     void publishChunk(const float* raw, std::size_t n, float* refScratch, float* hpScratch) {
+        LSL_ZONE("publish");
         const float* condIn = reference(raw, refScratch, n);   // re-reference (first stage)
         const bool hpOn = hpOn_.load(std::memory_order_relaxed);
         if (hpOn && !hpApplied_) hp_.reset();                  // re-enabled: re-prime clean
