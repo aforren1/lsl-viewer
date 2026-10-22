@@ -1832,6 +1832,9 @@ static char g_recDir[512]  = "";                          // output directory ("
 // the optional acq entity is left out of the default — add `{acq}` to the template if needed).
 static char g_recTmpl[512] =
     "sub-{subject}/ses-{session}/{modality}/sub-{subject}_ses-{session}_task-{task}_run-{run}_{modality}.xdf";
+// The built-in template (native separators), captured before the ini can override g_recTmpl, so
+// a cleared field still records to a full BIDS name instead of a bare directory.
+static std::string g_recTmplDefault;
 // Playback > Open XDF file: the folder of the last replayed file (the dialog opens there) and
 // the last speed, because a session is usually checked at the same speed every time.
 static char  g_replayDir[512] = "";
@@ -2183,6 +2186,7 @@ int main(int argc, char** argv) {
     if (g_recDir[0] == '\0' && !recDefault.empty())
         std::snprintf(g_recDir, sizeof g_recDir, "%s", recDefault.c_str());
     toNativeSeparators(g_recTmpl);   // native separators in the default template (ini overrides keep their own)
+    g_recTmplDefault = g_recTmpl;
     // App settings only, no layout (see appSettingsOnly). Loading here marks the settings as
     // loaded, which stops ImGui's own whole-file load on the first NewFrame.
     if (io.IniFilename) {
@@ -2344,7 +2348,7 @@ int main(int argc, char** argv) {
     // Full output path: resolve the template, then prefix the directory (unless the
     // template is already absolute).
     auto recFullPath = [&]() -> std::string {
-        std::string fn = resolveTemplate(g_recTmpl,
+        std::string fn = resolveTemplate(g_recTmpl[0] ? std::string(g_recTmpl) : g_recTmplDefault,
             RecVars{recSubject, recSession, recTask, recRun, recAcq, recModality});
         const bool abs = !fn.empty() &&
                          (fn[0] == '/' || fn[0] == '\\' || (fn.size() > 1 && fn[1] == ':'));
@@ -3582,9 +3586,20 @@ int main(int argc, char** argv) {
                     SDL_ShowOpenFolderDialog(onFolderPicked, nullptr, window,
                                              g_recDir[0] ? g_recDir : nullptr, false);
                 ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::InputTextWithHint("##recpath", "sub-{subject}/…/{modality}.xdf",
+                if (ImGui::InputTextWithHint("##recpath", g_recTmplDefault.c_str(),
                                              g_recTmpl, sizeof(g_recTmpl)))
                     ImGui::MarkIniSettingsDirty();
+                // A persisted custom name otherwise sticks across launches with no way back to the
+                // BIDS template short of retyping it.
+                if (ImGui::BeginPopupContextItem("##recpathctx")) {
+                    if (ImGui::MenuItem("Reset to default template")) {
+                        std::snprintf(g_recTmpl, sizeof(g_recTmpl), "%s", g_recTmplDefault.c_str());
+                        ImGui::MarkIniSettingsDirty();
+                    }
+                    ImGui::EndPopup();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) && !ImGui::IsItemActive())
+                    ImGui::SetTooltip("right-click to reset to the default template");
                 if (ImGui::TreeNodeEx("filename fields", ImGuiTreeNodeFlags_SpanAvailWidth)) {
                     const float fw = (ImGui::GetContentRegionAvail().x
                                       - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
