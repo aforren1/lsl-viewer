@@ -40,6 +40,12 @@ something concrete to lock onto:
                                  test the high-pass across its 0.5 Hz cutoff.
   audio       2 ch   @ 48000 Hz float  440/660 Hz stereo tone -> high-rate (48 kHz)
                                  stress for ring/FFT/spectrogram.
+  bursty      8 ch   @ 250 Hz   float  EEG-like content with uneven delivery, as from
+                                 a wireless headset: chunks every 20-60 ms and a
+                                 100-400 ms hold every 1-3 s. Timestamps stay on
+                                 the sample clock, so no data is missing. The plots
+                                 (time series and spectrogram) should scroll at an
+                                 even speed through the holds.
 
 Usage:
     python lsl_test_streams.py                 # all streams
@@ -133,6 +139,26 @@ def run_regular(name, outlet, srate, gen, stop, period=0.02, skew=0.0, drift=0.0
             push_chunk(outlet, gen(pushed, n), now + skew + drift * (now - start))
             pushed += n
         time.sleep(period)
+
+
+# Like run_regular, but delivery is uneven, as from a wireless headset whose radio link
+# stalls: a random push period, and every few seconds a hold, after which the backlog goes
+# out as one chunk. Each sample keeps its sample-clock time, so a hold is late delivery,
+# not a dropout. A viewer whose scroll speed follows the deliveries instead of the sample
+# times slows down at every hold.
+def run_bursty(outlet, srate, gen, stop, rng, skew=0.0):
+    start = local_clock()
+    pushed = 0
+    next_hold = start + rng.uniform(1.0, 3.0)
+    while not stop.is_set():
+        if local_clock() >= next_hold:
+            time.sleep(rng.uniform(0.1, 0.4))
+            next_hold = local_clock() + rng.uniform(1.0, 3.0)
+        n = int((local_clock() - start) * srate) - pushed
+        if n > 0:
+            push_chunk(outlet, gen(pushed, n), start + (pushed + n - 1) / srate + skew)
+            pushed += n
+        time.sleep(rng.uniform(0.02, 0.06))
 
 
 # ---- generators ------------------------------------------------------------
@@ -488,6 +514,15 @@ def build_streams(selected, args, stop, host_suffix):
         spawn(run_regular, "audio", out, sr, make_audio_gen(sr), stop, 0.02, sk("audio"), dr("audio"))
         started.append("audio        2ch @ 48000 Hz  float  (440/660 Hz stereo tone)")
 
+    if "bursty" in selected:
+        C, sr = 8, 250
+        info = StreamInfo(f"MockBursty{host_suffix}", "EEG", C, sr, cf_float32, "mock-bursty")
+        add_channels(info, eeg_labels(C), "microvolts", "EEG")
+        out = StreamOutlet(info, max_buffered=360)
+        gen, _ = make_eeg_gen(C, sr, args.line_freq, rng, n_eog=0)
+        spawn(run_bursty, out, sr, gen, stop, rng, sk("bursty"))
+        started.append(f"bursty       {C}ch @ {sr} Hz  float  (uneven delivery: 100-400 ms holds every 1-3 s)")
+
     if "evoked" in selected:
         sr = 250
         dinfo = StreamInfo(f"MockEvoked{host_suffix}", "EEG", 1, sr, cf_float32, "mock-evoked")
@@ -503,7 +538,7 @@ def build_streams(selected, args, stop, host_suffix):
 
 
 ALL = ["eeg", "highdensity", "chirp", "sine", "accel", "flaky", "mouse",
-       "markers", "fastmarkers", "trigger", "evoked", "drift", "audio"]
+       "markers", "fastmarkers", "trigger", "evoked", "drift", "audio", "bursty"]
 
 
 def main():

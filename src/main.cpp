@@ -15,7 +15,7 @@
 //   LSL_AUTOCONNECT=1 connect every discovered stream automatically
 //   LSL_NOVSYNC=1     start with VSync off (uncapped — measure real render cost)
 //   LSL_FPS_CAP=<n>   start with the frame rate capped at n per second (Performance window)
-//   LSL_FRAMES_IN_FLIGHT=<1..3> frames the GPU may queue (default 1; more = more input lag)
+//   LSL_FRAMES_IN_FLIGHT=<1..3> frames the GPU may queue (default 2; more = more input lag)
 //   LSL_BENCH=1       print FPS / frame-time stats to stdout once a second
 //   LSL_PROFILE=1     print a per-zone CPU table (count/total/avg/max/%frame) every 3 s
 //   LSL_WINDOW=WxH    initial window size
@@ -507,15 +507,13 @@ static bool overdue(const HfStreamSource& s, double base) {
 // recomputed every frame from a speed estimate that updates per chunk, jumped whenever the
 // estimate did or the edge hit a limit, and showed as judder. Never moves back, never past
 // `upper` (the live-dropout strip starts there). Long frames are sub-stepped to stay stable.
-// `omega` sets how closely it tracks: stiff when the target is the data's own smooth trajectory
-// (edgeTarget), soft when the feed-forward is only an estimate that lags the data.
+// `omega` sets how closely it tracks.
 struct EdgeState { double pos = 0.0, vel = 1.0; };   // data seconds; data seconds per wall second
 // Stiff: tracks edgeTarget's ramps to about acceleration / omega^2 (15 ms of data while a
 // replay slows from 5x to 1x), so no lag builds up to be paid back as a dip in speed. A real
 // jump of the target (data resuming after a stall) is smoothed by the acceleration limit
 // (edgeAccelOf), which the stiffness alone would take up in about 0.1 s.
 constexpr double kEdgeStiff = 30.0;
-constexpr double kEdgeSoft  = 3.0;    // settles an estimated speed change in about a second
 // The most the edge may speed up or slow down, in data s/s^2, for a source that delivers
 // `speed` data s per wall s (HfStreamSource::deliverySpeed: a 5 s window, so a pause of a few
 // hundred ms does not move it). A busy machine can hold a delivery back for 100 to 400 ms; the
@@ -2117,12 +2115,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     applyPresentMode(gpu, window, vsync);
-    // One frame in flight, not SDL's 2: each queued frame is a frame of input lag, and the GPU work
-    // here is small, so the second frame bought no throughput (measured: same FPS on a 3840x1600
-    // DisplayLink monitor, the slowest display tested). LSL_FRAMES_IN_FLIGHT overrides it.
+    // SDL's 2 frames in flight. With 1, a late acquire or present (a busy GPU or compositor) costs
+    // a whole refresh, and the plots then move two frames' worth at once. Those misses depend on
+    // machine load and could not be measured apart on the dev machine, so the spare frame is kept
+    // for unknown hardware; it costs a frame of input lag on pan and zoom, which matters less in a
+    // viewer than an even scroll. LSL_FRAMES_IN_FLIGHT overrides it (1 for the least lag).
     {
         const char* f = std::getenv("LSL_FRAMES_IN_FLIGHT");
-        SDL_SetGPUAllowedFramesInFlight(gpu, f ? (Uint32)std::clamp(std::atoi(f), 1, 3) : 1u);
+        SDL_SetGPUAllowedFramesInFlight(gpu, f ? (Uint32)std::clamp(std::atoi(f), 1, 3) : 2u);
     }
     // The adapter matters on a laptop with two GPUs: a frame rendered on one and shown on a display
     // that the other drives (or a DisplayLink USB display) is copied across on every present.
@@ -4449,32 +4449,31 @@ int main(int argc, char** argv) {
 
                         // Right edge of the newest cell (cells centered on their real times).
                         const double bMax = spectro.colNewestTime + 0.5 * spectro.hopSec;
-                        // View edge. Normally ease toward the DATA edge (newest column)
-                        // and never pass it, so sub-column scrolling stays smooth with no
-                        // blank live-edge strip. While stalled, glide the edge PAST the
-                        // data at wall-clock so the red gap scrolls in gradually (same
-                        // pacing as the time series) instead of freezing then jumping.
-                        // Steady scroll: advance at a constant, refresh-paced velocity (NOT
-                        // an ease — that varies the speed). Identical scheme to the time-
-                        // series edge: glide at frameDt, a weak pull keeps it aligned when
-                        // live, and while stalled it runs ahead freely so the red gap scrolls
-                        // in at the same steady rate.
+                        // View edge: the time series' follower and target (see edgeTarget), so
+                        // both views scroll alike and a late delivery bends the scroll instead
+                        // of stopping it. Column times are window ends, so the newest column is
+                        // within a hop of the newest sample and the target stays clear of it.
+                        // The old target was the newest column itself (less a lag that is 0 for a
+                        // source in small chunks): that is also the backstop, so the edge hit it
+                        // at every late delivery and a soft follower took over a second to regain
+                        // speed (measured: 0.6x dips every couple of seconds on a 250 Hz source
+                        // with 100 to 400 ms delivery holds). Never past the newest column, except
+                        // while stalled: then it glides past at wall rate so the red gap scrolls
+                        // in at the time series' pace instead of freezing and then jumping.
                         const double dataEdge = bMax;
                         // A source that sends in blocks (or a fast replay) goes quiet between
-                        // deliveries: count it as stalled only once the next block is overdue,
-                        // trail the data by the same extra lag as the time series, and glide
-                        // at the data's rate. All three are the old values for a smooth source.
-                        const double speed    = dataSpeedOf(*src);
-                        const double lagX     = edgeLagOf(*src) - 0.15;
+                        // deliveries: count it as stalled only once the next block is overdue.
                         const bool   stalling = !paused && overdue(*src, 0.4) && !replayHeld(*src);
                         const double frameDt  = edgeDt;   // the time series' step, so both scroll alike
+                        double tgt = dataEdge - (edgeLagOf(*src) - 0.15), ff = dataSpeedOf(*src);   // before the first delivery
+                        edgeTarget(*src, nowLsl, tgt, ff);
                         if (!spectro.smoothInit) {
-                            spectro.smoothNow = dataEdge - lagX; spectro.smoothInit = true;
+                            spectro.smoothNow = tgt; spectro.smoothInit = true;
                         } else if (paused) {
                             // frozen — leave smoothNow as-is
-                        } else if (dataEdge - lagX - spectro.smoothNow > spectro.spanSec) {
-                            spectro.smoothNow = dataEdge - lagX;          // far behind → snap forward
-                            spectro.smoothVel = speed;
+                        } else if (tgt - spectro.smoothNow > spectro.spanSec) {
+                            spectro.smoothNow = tgt;                      // far behind → snap forward
+                            spectro.smoothVel = ff;
                         } else if (stalling) {
                             spectro.smoothVel  = 1.0;                     // the red gap scrolls in at wall rate
                             spectro.smoothNow += frameDt;
@@ -4482,7 +4481,8 @@ int main(int argc, char** argv) {
                             // As the time series edge (see followEdge): smooth through speed
                             // changes, never back, never past the data.
                             EdgeState es{spectro.smoothNow, spectro.smoothVel};
-                            followEdge(es, dataEdge - lagX, speed, dataEdge, frameDt, kEdgeSoft);
+                            followEdge(es, tgt, ff, dataEdge, frameDt, kEdgeStiff,
+                                       edgeAccelOf(src->deliverySpeed()));
                             spectro.smoothNow = es.pos; spectro.smoothVel = es.vel;
                         }
                         const double viewNewest = stalling ? spectro.smoothNow

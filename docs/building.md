@@ -219,7 +219,7 @@ These variables of the viewer itself help to profile on a given display or GPU:
 | `LSL_GPU_LOW_POWER=1` | Use the integrated GPU on a laptop with two GPUs. The log and the Debug menu show the GPU name. |
 | `LSL_NOVSYNC=1` | Turn off VSync, to measure the full render cost. |
 | `LSL_FPS_CAP=<n>` | Limit the frame rate to n frames a second (also in the Performance window). |
-| `LSL_FRAMES_IN_FLIGHT=<n>` | Let the GPU queue 1 to 3 frames (default: 1). More frames give more input lag. |
+| `LSL_FRAMES_IN_FLIGHT=<n>` | Let the GPU queue 1 to 3 frames (default: 2). More frames give more input lag. Fewer frames make a late frame more likely to show as a hitch. |
 
 ## Static build (single-file distribution)
 
