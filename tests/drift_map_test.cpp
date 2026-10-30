@@ -45,6 +45,7 @@ struct SimConfig {
     double outlier    = 0.050;     // s
     double settle     = 60.0;      // s after start before the error bound applies
     double recover    = 0.0;       // s after the offset step excluded from the bound (0 = none)
+    double recoverDrop = 0.0;      // s after the dropout excluded from the bound (0 = none)
     bool   fitGap     = true;      // dropout length from the fit (as the viewer), else the raw stamps
     bool   recheck    = true;      // re-evaluate the kept display times after every knot
     unsigned seed     = 12345;
@@ -52,6 +53,7 @@ struct SimConfig {
 
 struct SimResult {
     double maxErr = 0.0;           // outside the excluded windows, after `settle`
+    double maxErrDrop = 0.0;       // inside the window after the dropout
     double maxErrAll = 0.0;        // after `settle`, events included
     double firstConverged = -1.0;  // s: from here on the error stays < 1 ms (outside event windows)
     double recoverDropout = 0.0;   // s after the dropout until the error stays < 1 ms
@@ -81,7 +83,14 @@ SimResult simulate(const SimConfig& c) {
     const std::uint64_t outK   = c.outlierAt < 0.0 ? ~0ull : (std::uint64_t)(c.outlierAt * c.srate) / c.chunk * c.chunk;
 
     std::mt19937_64 rng(c.seed);
-    std::normal_distribution<double> jit(0.0, c.jitter);
+    // Not std::normal_distribution: its algorithm is up to the library, so libstdc++, libc++
+    // and MSVC draw different jitter from the same seed and the seeded checks would pass or
+    // fail by platform. The engine itself is fully specified.
+    auto jit = [&rng, sd = c.jitter]() {
+        const double u1 = (double)((rng() >> 11) + 1) * 0x1p-53;   // (0, 1]
+        const double u2 = (double)(rng() >> 11) * 0x1p-53;
+        return sd * std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
+    };
 
     TimeMap    map;
     DriftServo servo;
@@ -135,7 +144,7 @@ SimResult simulate(const SimConfig& c) {
             trueT[j] = T0 + (double)devK[j] * dtTrue;              // sender clock
         }
         // liblsl stamps the newest sample and back-fills the rest from the nominal rate.
-        const double newest = trueT[n - 1] + jit(rng) + (k == outK ? c.outlier : 0.0);
+        const double newest = trueT[n - 1] + jit() + (k == outK ? c.outlier : 0.0);
         for (int j = 0; j < n; ++j) ts[j] = newest - (double)(n - 1 - j) * dt;
         k += (std::uint64_t)n;
 
@@ -179,7 +188,9 @@ SimResult simulate(const SimConfig& c) {
             const double tSim = (double)devK[j] / c.srate;
             if (tSim >= c.settle) res.maxErrAll = std::max(res.maxErrAll, err);
             const bool inStep = tSim >= tStep && tSim < tStep + c.recover;
-            if (tSim >= c.settle && !inStep) res.maxErr = std::max(res.maxErr, err);
+            const bool inDrop = tSim >= tDrop && tSim < tDrop + c.recoverDrop;
+            if (tSim >= c.settle && !inStep && !inDrop) res.maxErr = std::max(res.maxErr, err);
+            if (inDrop) res.maxErrDrop = std::max(res.maxErrDrop, err);
             if (err >= 1e-3) {
                 if (tSim < tDrop)      lastBadPre = tSim;
                 else if (tSim < tStep) lastBadDrop = tSim;
@@ -203,17 +214,35 @@ SimResult simulate(const SimConfig& c) {
     return res;
 }
 
+// The fit removes the jitter of the stamp before a dropout, but the length still takes the
+// jitter of the one stamp after it, and the samples published right after the gap keep that
+// error until the servo removes it. With 1 ms Gaussian jitter that is above 1 ms in about a
+// third of dropouts and takes up to about a minute to go. So inside kDropWindow the check is
+// that the error comes from the length alone, does not grow past it, and decays; the 1 ms
+// bound applies outside.
+constexpr double kDropWindow = 90.0;   // s
+
+void checkDropout(const SimResult& r, const SimConfig& c, const char* tag) {
+    CHECK(std::fabs(r.gapErr) < 4.0 * c.jitter, "%sdropout length error %+.3f ms", tag, r.gapErr * 1e3);
+    CHECK(r.maxErrDrop < std::fabs(r.gapErr) + 0.25e-3, "%smax error %.3f ms after the dropout, length error %+.3f ms",
+          tag, r.maxErrDrop * 1e3, r.gapErr * 1e3);
+    CHECK(r.recoverDropout < kDropWindow, "%sdropout recovery %.1f s", tag, r.recoverDropout);
+}
+
 void testSynthetic(double ppm) {
     std::printf("synthetic: %+.0f ppm, 4 h at 1 kHz, 1 ms jitter, 20 ms chunks, 2 s dropout at 1 h, "
                 "30 ms offset step at 2 h\n", ppm);
     SimConfig c;
     c.ppm = ppm;
     c.recover = 120.0;
+    c.recoverDrop = kDropWindow;
     const auto t = std::chrono::steady_clock::now();
     const SimResult r = simulate(c);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
-    std::printf("  max |display - true| after %.0f s, outside %.0f s after the step: %.3f ms\n",
-                c.settle, c.recover, r.maxErr * 1e3);
+    std::printf("  max |display - true| after %.0f s, outside %.0f s after the step and %.0f s after the "
+                "dropout: %.3f ms\n", c.settle, c.recover, c.recoverDrop, r.maxErr * 1e3);
+    std::printf("  max |display - true| in the %.0f s after the dropout: %.3f ms (length error %+.3f ms)\n",
+                c.recoverDrop, r.maxErrDrop * 1e3, r.gapErr * 1e3);
     std::printf("  max |display - true| after %.0f s, all samples:               %.3f ms\n",
                 c.settle, r.maxErrAll * 1e3);
     std::printf("  error < 1 ms from %.1f s on (startup); after the dropout %.1f s; after the step %.1f s\n",
@@ -227,6 +256,7 @@ void testSynthetic(double ppm) {
     std::printf("  realTime vs apply max diff %.3g s; inverse max error %.3g s; %.2f s to run\n",
                 r.realTimeDiff, r.inverseErr, secs);
     CHECK(r.maxErr < 1e-3, "max error %.3f ms", r.maxErr * 1e3);
+    checkDropout(r, c, "");
     CHECK(r.firstConverged < c.settle, "converged only at %.1f s", r.firstConverged);
     CHECK(r.mismatches == 0, "%lu re-evaluations changed", r.mismatches);
     CHECK(r.reevals > 0, "nothing re-evaluated");
@@ -237,16 +267,12 @@ void testSynthetic(double ppm) {
     CHECK(r.gaps == 1 && r.resets == 1, "%zu dropouts, %lu refits", r.gaps, r.resets);
 
     // The same over 8 seeds, the dropout length from the fit (as the viewer) and, for
-    // reference, from the raw stamps. The fit removes the jitter of the stamp before the gap,
-    // but the length still takes the jitter of the one stamp after it (1 ms here), and the
-    // samples published right after the gap keep that error until the servo removes it. So
-    // the 1 ms bound is checked outside kDropWindow after the dropout, and a looser one inside.
+    // reference, from the raw stamps.
     std::printf("  seed  max err  startup  dropout recovery (fit / raw)  gap error (fit / raw)  step\n");
     for (unsigned i = 0; i < 8; ++i) {
         SimConfig cs = c;
         cs.seed = 1000u + i;
         cs.recheck = false;
-        constexpr double kDropWindow = 30.0;   // s
         const SimResult f = simulate(cs);
         cs.fitGap = false;
         const SimResult w = simulate(cs);
@@ -254,8 +280,10 @@ void testSynthetic(double ppm) {
                     cs.seed, f.maxErr * 1e3, f.firstConverged + 1.0 / cs.srate, f.recoverDropout,
                     w.recoverDropout, f.gapErr * 1e3, w.gapErr * 1e3,
                     f.recoverStep);
-        CHECK(f.maxErr < 2e-3, "seed %u: max error %.3f ms", cs.seed, f.maxErr * 1e3);
-        CHECK(f.recoverDropout < kDropWindow, "seed %u: dropout recovery %.1f s", cs.seed, f.recoverDropout);
+        char tag[32];
+        std::snprintf(tag, sizeof tag, "seed %u: ", cs.seed);
+        CHECK(f.maxErr < 1e-3, "%smax error %.3f ms", tag, f.maxErr * 1e3);
+        checkDropout(f, cs, tag);
         CHECK(f.firstConverged < c.settle, "seed %u: converged only at %.1f s", cs.seed, f.firstConverged);
     }
 }
@@ -491,11 +519,13 @@ int seeds(int count) {
     for (double ppm : {+100.0, -100.0})
         for (int i = 0; i < count; ++i) {
             SimConfig c;
-            c.ppm = ppm; c.seed = 1000u + (unsigned)i; c.recover = 120.0; c.recheck = false;
+            c.ppm = ppm; c.seed = 1000u + (unsigned)i; c.recover = 120.0; c.recoverDrop = kDropWindow;
+            c.recheck = false;
             const SimResult r = simulate(c);
-            std::printf("%+5.0f ppm seed %u: max %.3f ms, startup %.1f s, dropout %.1f s, step %.1f s, "
-                        "end %+.3f ppm, bit changes %lu\n", ppm, c.seed, r.maxErr * 1e3, r.firstConverged,
-                        r.recoverDropout, r.recoverStep, r.finalPpm, r.mismatches);
+            std::printf("%+5.0f ppm seed %u: max %.3f ms, startup %.1f s, dropout %.1f s (%.3f ms, "
+                        "length %+.3f ms), step %.1f s, end %+.3f ppm, bit changes %lu\n", ppm, c.seed,
+                        r.maxErr * 1e3, r.firstConverged, r.recoverDropout, r.maxErrDrop * 1e3, r.gapErr * 1e3,
+                        r.recoverStep, r.finalPpm, r.mismatches);
         }
     return 0;
 }
