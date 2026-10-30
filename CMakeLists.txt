@@ -99,7 +99,7 @@ FetchContent_Declare(liblsl
 # GCC/Clang reject). Bump the three together.
 FetchContent_Declare(imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
-  GIT_TAG        v1.92.9b-docking
+  GIT_TAG        v1.93.0-docking
   GIT_SHALLOW    TRUE
   # Force the SDL_GPU backend to use MSL source instead of its macOS-14-only .metallib, so the
   # viewer renders on macOS 11–13. See cmake/patch_imgui_msl.cmake for the full why.
@@ -109,9 +109,8 @@ FetchContent_Declare(imgui
 # --- ImPlot -----------------------------------------------------------------
 FetchContent_Declare(implot
   GIT_REPOSITORY https://github.com/epezent/implot.git
-  GIT_TAG        7eeb9168d2e5e6b14e266d8782ecf7e649dfc3a4   # master @ 2026-06-08
-  # No GIT_SHALLOW: a depth-1 clone only has the branch tip, so a commit-hash pin fails to
-  # check out once upstream moves on. (Tags are fine shallow; hashes are not.)
+  GIT_TAG        v1.1   # 2026-10-25, supports imgui v1.93.0
+  GIT_SHALLOW    TRUE
 )
 
 # --- spdlog (logging) -------------------------------------------------------
@@ -151,8 +150,9 @@ endif()
 if(LSL_VIEWER_TESTS)
   FetchContent_Declare(imgui_test_engine
     GIT_REPOSITORY https://github.com/ocornut/imgui_test_engine.git
-    GIT_TAG        fdc1cb0930fa9bc2bef1d884bf2c10b570d29170   # main @ 2026-08-07, matches v1.92.9b
-    # No GIT_SHALLOW: commit-hash pin (see implot above).
+    GIT_TAG        7c808483d6f0a69b9d0843d5f4a141f0a9f74a58   # main @ 2026-10-29, matches v1.93.0
+    # No GIT_SHALLOW: a depth-1 clone only has the branch tip, so a commit-hash pin fails to
+    # check out once upstream moves on. (Tags are fine shallow; hashes are not.)
   )
 endif()
 
@@ -190,6 +190,10 @@ target_include_directories(ui PUBLIC
   ${implot_SOURCE_DIR}
 )
 target_link_libraries(ui PUBLIC SDL3::SDL3)
+# Compile out the obsolete ImGui/ImPlot API, so a call that only works through an upstream
+# redirect fails at the bump that obsoletes it, not at the later one that deletes the redirect.
+# PUBLIC: the define changes struct layouts (ImGuiStyle, ImGuiIO), so every consumer must see it.
+target_compile_definitions(ui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS IMPLOT_DISABLE_OBSOLETE_FUNCTIONS)
 
 # Test Engine hooks must be compiled INTO imgui (and seen by every consumer, or
 # the ImGuiContext layout diverges) — so the define is PUBLIC on `ui`.

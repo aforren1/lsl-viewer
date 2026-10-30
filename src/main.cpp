@@ -74,6 +74,9 @@
 #include <vector>
 
 #ifdef LSL_VIEWER_TESTS
+#if defined(_WIN32) && defined(_DEBUG)
+#include <crtdbg.h>                                  // assert reports to stderr in test runs
+#endif
 #include "imgui_test_engine/imgui_te_engine.h"
 #include "imgui_test_engine/imgui_te_context.h"
 #include "imgui_test_engine/imgui_te_ui.h"
@@ -513,6 +516,25 @@ void lslViewerParsePaging(const std::string& payload, bool& paginate, int& pageS
 }
 #endif
 
+// A filter field at `width`. ImGui 1.93's Draw() shows an "incl -excl" hint in an empty field,
+// which documents the filter syntax where it is used.
+static bool drawFilter(ImGuiTextFilter& f, const char* label, float width) {
+    ImGui::SetNextItemWidth(width);
+    return f.Draw(label);
+}
+
+// An unrounded fill at data (fractional pixel) coordinates. Since ImGui 1.93 such edges are
+// anti-aliased; before, the rasterizer snapped them to whole pixels. Rounding keeps them crisp,
+// and spans that touch still meet without a seam.
+static void fillRectPx(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col) {
+    dl->AddRectFilled(ImVec2(std::round(a.x), std::round(a.y)), ImVec2(std::round(b.x), std::round(b.y)), col);
+}
+
+// Envelope fill alphas. ImPlot before v1.1 applied FillAlpha twice (alpha squared), and the
+// look was tuned there: these are the squares of the old 0.55, 0.9 (highlighted lane) and 0.2
+// (dimmed lane).
+constexpr float kBandAlpha = 0.30f, kBandAlphaHl = 0.81f, kBandAlphaDim = 0.04f;
+
 // Stable per-channel color (by absolute channel index, so a channel keeps its
 // color across stacked/overlay and regardless of which others are selected).
 // ImPlot v1.0 takes styling via ImPlotSpec on the plot call. We draw a light
@@ -521,7 +543,7 @@ void lslViewerParsePaging(const std::string& payload, bool& paginate, int& pageS
 static ImPlotSpec bandSpec(int c) {
     ImPlotSpec sp;
     sp.FillColor = ImPlot::GetColormapColor(c);
-    sp.FillAlpha = 0.55f;   // visible enough to read on its own when zoomed out
+    sp.FillAlpha = kBandAlpha;   // visible enough to read on its own when zoomed out
     return sp;
 }
 static ImPlotSpec lineSpec(int c, float w) {
@@ -705,8 +727,8 @@ static void drawDropoutRed(HfStreamSource& s, std::vector<std::pair<double, doub
     auto flush = [&](double s0, double s1) {
         if (s1 < lim.X.Min || s0 > lim.X.Max) return;
         const double x0 = std::max(s0, lim.X.Min), x1 = std::min(s1, lim.X.Max);
-        if (x1 > x0) dl->AddRectFilled(ImPlot::PlotToPixels(x0, lim.Y.Max),
-                                       ImPlot::PlotToPixels(x1, lim.Y.Min), kDropoutRed);
+        if (x1 > x0) fillRectPx(dl, ImPlot::PlotToPixels(x0, lim.Y.Max),
+                                ImPlot::PlotToPixels(x1, lim.Y.Min), kDropoutRed);
     };
     double cs = iv[0].first, ce = iv[0].second;       // iv is time-ordered (gaps then live)
     for (std::size_t i = 1; i < iv.size(); ++i) {
@@ -739,8 +761,8 @@ static void fillDropouts(const std::vector<std::pair<double, double>>& iv, float
     auto flush = [&](double s0, double s1) {
         if (s1 < lim.X.Min || s0 > lim.X.Max) return;
         const double x0 = std::max(s0, lim.X.Min), x1 = std::min(s1, lim.X.Max);
-        if (x1 > x0) dl->AddRectFilled(ImVec2(ImPlot::PlotToPixels(x0, lim.Y.Max).x, yTop),
-                                       ImVec2(ImPlot::PlotToPixels(x1, lim.Y.Max).x, yBot), col);
+        if (x1 > x0) fillRectPx(dl, ImVec2(ImPlot::PlotToPixels(x0, lim.Y.Max).x, yTop),
+                                ImVec2(ImPlot::PlotToPixels(x1, lim.Y.Max).x, yBot), col);
     };
     double cs = iv[0].first, ce = iv[0].second;
     for (std::size_t i = 1; i < iv.size(); ++i) {
@@ -777,7 +799,7 @@ static void drawBreaks(const HfStreamSource& s, std::vector<HfStreamSource::Brea
         const float  tw = ImGui::CalcTextSize(b.label).x;
         const float  xr = ImPlot::GetPlotPos().x + ImPlot::GetPlotSize().x;
         const ImVec2 p(x + 3.0f + tw > xr ? x - 3.0f - tw : x + 3.0f, yBot - lh - 3.0f);   // flip near the right edge
-        dl->AddRectFilled(ImVec2(p.x - 1.0f, p.y), ImVec2(p.x + tw + 1.0f, p.y + lh), IM_COL32(0, 0, 0, 170));
+        fillRectPx(dl, ImVec2(p.x - 1.0f, p.y), ImVec2(p.x + tw + 1.0f, p.y + lh), IM_COL32(0, 0, 0, 170));
         dl->AddText(p, kBreakBlue, b.label);
     }
     ImPlot::PopPlotClipRect();
@@ -940,8 +962,8 @@ static void drawMarkers(const std::vector<MarkerEvent>& evs, bool contrast = fal
         if (drewLine && e.text && !e.text->empty() && x > rowEnd[e.row] + 3.0f) {
             const float  w = ImGui::CalcTextSize(e.text->c_str()).x;
             const ImVec2 p(x + 2.0f, yTop + 1.0f + (float)e.row * lh);
-            dl->AddRectFilled(ImVec2(p.x - 1.0f, p.y), ImVec2(p.x + w + 1.0f, p.y + lh),
-                              IM_COL32(0, 0, 0, 150));                // backing for legibility
+            fillRectPx(dl, ImVec2(p.x - 1.0f, p.y), ImVec2(p.x + w + 1.0f, p.y + lh),
+                       IM_COL32(0, 0, 0, 150));                // backing for legibility
             dl->AddText(p, e.col, e.text->c_str());
             rowEnd[e.row] = x + 2.0f + w;
         }
@@ -1110,8 +1132,8 @@ static void drawSourceLanes(HfStreamSource& s, std::span<const int> chans, std::
                 }
                 char id[12]; std::snprintf(id, sizeof(id), "##b%d", col);
                 ImPlotSpec sp = bandSpec(col);
-                if (hl)       sp.FillAlpha = 0.9f;
-                else if (dim) sp.FillAlpha = 0.2f;
+                if (hl)       sp.FillAlpha = kBandAlphaHl;
+                else if (dim) sp.FillAlpha = kBandAlphaDim;
                 ImPlot::PlotShaded(id, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, sp);
             } else {
                 const float yoff = (float)slot * st.spacing;
@@ -1414,7 +1436,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(filtering ? "deselect channels matching the filter"
                                         : "deselect all channels");
-        o.chanFilter.Draw("filter", 140.0f);       // own line; e.g. "Cz" or "Cz,Pz" or "-EOG"
+        drawFilter(o.chanFilter, "filter", uiScaled(140));   // own line; e.g. "Cz" or "Cz,Pz" or "-EOG"
         // Pages slice the enabled channels only; the filter above just narrows the list below.
         pagerUi(o, enabled, pages, "ch", "enabled", "plot the enabled channels one page at a time");
         ImGui::BeginChild("chsel", ImVec2(0, uiScaled(120)), ImGuiChildFlags_Borders);
@@ -1507,9 +1529,15 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImGui::TextDisabled("measured: --");
             }
         }
-        ImGui::Text("clock offset: %+.2f ms", s.clockOffset() * 1000.0);
+        // The offset lies within half the round trip it was measured over, so that is the bound.
+        if (const double rtt = s.clockUncertainty(); rtt >= 0.0)
+            ImGui::Text("clock offset: %+.2f ms (+/- %.3f ms)", s.clockOffset() * 1000.0, rtt * 500.0);
+        else
+            ImGui::Text("clock offset: %+.2f ms", s.clockOffset() * 1000.0);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("LSL time_correction (remote -> local clock)");
+            ImGui::SetTooltip("LSL time_correction (remote -> local clock). The bound is half the\n"
+                              "round-trip time of the last measurement, refreshed every 5 s:\n"
+                              "small on one computer, larger over a busy or wireless network.");
         if (!s.irregular()) {
             if (!s.driftEnabled()) {
                 ImGui::TextDisabled("drift correction: off");
@@ -1655,7 +1683,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                     ImPlot::PushPlotClipRect();
                     ImPlot::GetPlotDrawList()->AddRect(ImPlot::PlotToPixels(bMin, yc + 0.5),
                                                        ImPlot::PlotToPixels(bMax, yc - 0.5),
-                                                       IM_COL32_WHITE, 0.0f, 0, 2.0f);
+                                                       IM_COL32_WHITE, 0.0f, 2.0f);
                     ImPlot::PopPlotClipRect();
                     drawLaneLabelHighlight(sc.tlabs[hlRow], sc.visIdx[hlRow], hlC0, hlRow);
                 }
@@ -1708,9 +1736,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImVec4 bg = ImPlot::GetColormapColor(sc.visIdx[hlRow]);
                 bg.w = 0.10f;
                 ImPlot::PushPlotClipRect();
-                ImPlot::GetPlotDrawList()->AddRectFilled(ImPlot::PlotToPixels(lim.X.Min, yc + 0.5),
-                                                         ImPlot::PlotToPixels(lim.X.Max, yc - 0.5),
-                                                         ImGui::ColorConvertFloat4ToU32(bg));
+                fillRectPx(ImPlot::GetPlotDrawList(), ImPlot::PlotToPixels(lim.X.Min, yc + 0.5),
+                           ImPlot::PlotToPixels(lim.X.Max, yc - 0.5), ImGui::ColorConvertFloat4ToU32(bg));
                 ImPlot::PopPlotClipRect();
                 drawLaneLabelHighlight(sc.tlabs[hlRow], sc.visIdx[hlRow], hlC0, hlRow);
             }
@@ -1756,7 +1783,10 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             const double xbar = lim.X.Min + 0.03 * lim.X.Size();
             const ImU32  col  = ImGui::GetColorU32(ImGuiCol_Text);   // adapts to theme
             ImDrawList*  dl   = ImPlot::GetPlotDrawList();
-            dl->AddLine(ImPlot::PlotToPixels(xbar, -0.5), ImPlot::PlotToPixels(xbar, 0.5), col, 2.0f);
+            // Whole pixel columns keep the bar crisp, where the +0.5 that AddLine() had before ImGui
+            // 1.93 put it.
+            const ImVec2 barTop = ImPlot::PlotToPixels(xbar, 0.5), barBot = ImPlot::PlotToPixels(xbar, -0.5);
+            dl->AddLineV(std::round(barTop.x - 0.5f), barTop.y, barBot.y, col, 2.0f);
             const int   c0   = sc.visIdx[0];
             const char* unit = (c0 < (int)units.size() && !units[c0].empty())
                                    ? units[c0].c_str() : "a.u.";
@@ -2073,7 +2103,7 @@ static void combinedAddPopup(CombinedPlot& cp, std::vector<std::unique_ptr<HfStr
     };
     ImGui::SetNextItemWidth(uiScaled(260));
     if (ImGui::BeginCombo("##stream", display(pi))) {
-        cp.addStreamFilter.Draw("##sf", -1.0f);   // searchable
+        drawFilter(cp.addStreamFilter, "##sf", -1.0f);   // searchable
         for (int j = 0; j < (int)sources.size(); ++j) {
             if (!cp.addStreamFilter.PassFilter(sources[(std::size_t)j]->name().c_str())) continue;
             // display() names are unique (" #2"), so they serve as the ids.
@@ -2086,7 +2116,7 @@ static void combinedAddPopup(CombinedPlot& cp, std::vector<std::unique_ptr<HfStr
     const auto& labels = s.labels();
     if ((int)cp.addSel.size() != C) cp.addSel.assign((std::size_t)C, 0);
     auto pass = [&](int c) { return cp.addChanFilter.PassFilter(labels[(std::size_t)c].c_str()); };
-    cp.addChanFilter.Draw("##chf", uiScaled(260));
+    drawFilter(cp.addChanFilter, "##chf", uiScaled(260));
     if (ImGui::SmallButton("All"))  for (int c = 0; c < C; ++c) if (pass(c)) cp.addSel[(std::size_t)c] = 1;
     ImGui::SameLine();
     if (ImGui::SmallButton("None")) for (int c = 0; c < C; ++c) if (pass(c)) cp.addSel[(std::size_t)c] = 0;
@@ -2318,9 +2348,8 @@ static void drawCombined(CombinedPlot& cp, std::vector<std::unique_ptr<HfStreamS
                     ImVec4 bg = ImPlot::GetColormapColor(pb + hlRow);
                     bg.w = 0.10f;
                     ImPlot::PushPlotClipRect();
-                    ImPlot::GetPlotDrawList()->AddRectFilled(ImPlot::PlotToPixels(lim.X.Min, yc + 0.5),
-                                                             ImPlot::PlotToPixels(lim.X.Max, yc - 0.5),
-                                                             ImGui::ColorConvertFloat4ToU32(bg));
+                    fillRectPx(ImPlot::GetPlotDrawList(), ImPlot::PlotToPixels(lim.X.Min, yc + 0.5),
+                               ImPlot::PlotToPixels(lim.X.Max, yc - 0.5), ImGui::ColorConvertFloat4ToU32(bg));
                     ImPlot::PopPlotClipRect();
                     drawLaneLabelHighlight(cp.tickPtr[(std::size_t)hlRow], pb + hlRow, hlC0, hlRow);
                 }
@@ -3288,6 +3317,17 @@ int main(int argc, char** argv) {
 
 #ifdef LSL_VIEWER_TESTS
     const bool runTests = (argc > 1 && std::strcmp(argv[1], "--tests") == 0);
+#if defined(_WIN32) && defined(_DEBUG)
+    // An unattended run must fail, not wait: the debug CRT's assert dialog is modal and holds the
+    // test past the watchdog. Reports go to stderr, and the failure then ends the process.
+    if (runTests) {
+        for (int type : {_CRT_WARN, _CRT_ERROR, _CRT_ASSERT}) {
+            _CrtSetReportMode(type, _CRTDBG_MODE_FILE);
+            _CrtSetReportFile(type, _CRTDBG_FILE_STDERR);
+        }
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    }
+#endif
     // Optional filter: `--tests <query>` runs only matching tests. The query is a
     // case-insensitive SUBSTRING of the test name or its category, not a path:
     // "capture" and "ui" match, "ui/capture_fft" matches nothing; "-capture" excludes.
@@ -3877,11 +3917,8 @@ int main(int argc, char** argv) {
                 ImGuiViewport* vp = ImGui::GetMainViewport();
                 const float pulse = 0.55f + 0.45f * (float)std::sin(recorder.seconds() * 3.2);
                 const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.18f, 0.18f, pulse));
-                const float th = uiScaled(3.0f), in = th * 0.5f;
-                ImGui::GetForegroundDrawList(vp)->AddRect(
-                    ImVec2(vp->Pos.x + in, vp->Pos.y + in),
-                    ImVec2(vp->Pos.x + vp->Size.x - in, vp->Pos.y + vp->Size.y - in),
-                    col, 0.0f, 0, th);
+                ImGui::GetForegroundDrawList(vp)->AddRect(   // the stroke runs inside the rect
+                    vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y), col, 0.0f, uiScaled(3.0f));
             }
             if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Q)) done = true;
             if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_P)) paused = !paused;
@@ -4435,13 +4472,13 @@ int main(int argc, char** argv) {
                 (railScroll ? 0 : ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse));
             ImGuiWindow* streamsWin = ImGui::GetCurrentWindow();  // kept on top below
             // Slightly larger section headers for the sidebar so the Recording/Playback groups
-            // stand out (SetWindowFontScale is per-window, reset after). An accent tints the rules,
-            // as a panel family tints its tab. The stream list has none: the rail's title names it.
+            // stand out. An accent tints the rules, as a panel family tints its tab. The stream list
+            // has none: the rail's title names it.
             auto sectionHeader = [](const char* label, const ImVec4* accent = nullptr) {
                 if (accent) ImGui::PushStyleColor(ImGuiCol_Separator, *accent);
-                ImGui::SetWindowFontScale(1.2f);
+                ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.2f);
                 ImGui::SeparatorText(label);
-                ImGui::SetWindowFontScale(1.0f);
+                ImGui::PopFont();
                 if (accent) ImGui::PopStyleColor();
             };
             ImGui::TextDisabled("live \xc2\xb7 %d stream%s on the network",
@@ -5192,7 +5229,11 @@ int main(int argc, char** argv) {
                 g_combinedProbe.state.assign(cp.srcOf.begin(), cp.srcOf.begin() + std::min(cp.srcOf.size(), cp.tick.size()));
                 g_combinedProbe.groups = (int)cp.groups.size();
                 g_combinedProbe.edges.resize(g_combinedProbe.state.size());
-                for (std::size_t i = 0; i < g_combinedProbe.state.size(); ++i) {
+                // tick and srcOf are resolved before drawCombined applies the frame's edits, so on
+                // the frame that removes a trace they are longer than `traces`. Skip the edges for
+                // that one frame; the next frame resolves them again.
+                const bool aligned = cp.traces.size() == g_combinedProbe.state.size();
+                for (std::size_t i = 0; aligned && i < g_combinedProbe.state.size(); ++i) {
                     const int si = g_combinedProbe.state[i];
                     if (si >= 0) probeRisingEdges(*sources[(std::size_t)si], cp.traces[i].channel, cp.traces[i].filtered,
                                                   g_combinedProbe.edges[i]);
@@ -5269,7 +5310,7 @@ int main(int argc, char** argv) {
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("zoom the frequency axis to the band that actually carries\n"
                                           "signal energy (handy at high sample rates, e.g. 48 kHz audio)");
-                    spec.filter.Draw("##f", -1.0f);                                           // channel name filter
+                    drawFilter(spec.filter, "##f", -1.0f);                                    // channel name filter
                     ImGui::BeginChild("chans", ImVec2(0, 0), ImGuiChildFlags_Borders);      // fills the rest of the strip
                     for (int c = 0; c < src->channels(); ++c) {
                         if (!fpass(c)) continue;
@@ -5390,15 +5431,15 @@ int main(int argc, char** argv) {
                                 const ImVec2 top = ImPlot::PlotToPixels(fx, lim.Y.Max);
                                 const ImVec2 bot = ImPlot::PlotToPixels(fx, lim.Y.Min);
                                 ImDrawList* dl = ImPlot::GetPlotDrawList();
-                                dl->AddLine(top, bot, IM_COL32(200, 200, 200, 130), 1.0f);
+                                dl->AddLineV(top.x, top.y, bot.y, IM_COL32(200, 200, 200, 130));   // one crisp column
                                 char hz[24]; std::snprintf(hz, sizeof hz, "%.1f Hz", fx);
                                 const ImVec2 sz = ImGui::CalcTextSize(hz);
                                 const float  pr = ImPlot::GetPlotPos().x + ImPlot::GetPlotSize().x;  // plot right edge (px)
                                 // label just right of the line near the top, flipping left near the edge
                                 const bool   left = top.x + 6.0f + sz.x > pr;
                                 const ImVec2 p(left ? top.x - 6.0f - sz.x : top.x + 6.0f, top.y + 3.0f);
-                                dl->AddRectFilled(ImVec2(p.x - 2, p.y - 1), ImVec2(p.x + sz.x + 2, p.y + sz.y + 1),
-                                                  IM_COL32(0, 0, 0, 150));
+                                fillRectPx(dl, ImVec2(p.x - 2, p.y - 1), ImVec2(p.x + sz.x + 2, p.y + sz.y + 1),
+                                           IM_COL32(0, 0, 0, 150));
                                 dl->AddText(p, IM_COL32(220, 220, 220, 255), hz);
                             }
                             spec.refit = false;
@@ -5438,7 +5479,7 @@ int main(int argc, char** argv) {
                     ImGui::BeginChild("cfg", ImVec2(uiScaled(230), 0), ImGuiChildFlags_Borders);
                     ImGui::SetNextItemWidth(-1.0f);
                     if (ImGui::BeginCombo("##stream", src->name().c_str())) {
-                        spectro.streamFilter.Draw("##sf", -1.0f);   // searchable
+                        drawFilter(spectro.streamFilter, "##sf", -1.0f);   // searchable
                         for (int i = 0; i < (int)sources.size(); ++i) {
                             if (!spectro.streamFilter.PassFilter(sources[i]->name().c_str())) continue;
                             if (ImGui::Selectable(sources[i]->name().c_str(), i == spectro.streamIdx)) {
@@ -5454,7 +5495,7 @@ int main(int argc, char** argv) {
                                           ? labels[spectro.channel].c_str() : "ch";
                     ImGui::SetNextItemWidth(-1.0f);
                     if (ImGui::BeginCombo("##channel", chn)) {
-                        spectro.chanFilter.Draw("##chf", -1.0f);    // searchable (e.g. "Cz")
+                        drawFilter(spectro.chanFilter, "##chf", -1.0f);    // searchable (e.g. "Cz")
                         for (int c = 0; c < src->channels(); ++c) {
                             if (!spectro.chanFilter.PassFilter(labels[c].c_str())) continue;
                             if (ImGui::Selectable(labels[c].c_str(), c == spectro.channel)) {
@@ -5692,7 +5733,7 @@ int main(int argc, char** argv) {
                     // data stream
                     ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("stream", src->name().c_str())) {
-                        erp.streamFilter.Draw("##sf", -1.0f);
+                        drawFilter(erp.streamFilter, "##sf", -1.0f);
                         for (int i = 0; i < (int)sources.size(); ++i) {
                             if (!erp.streamFilter.PassFilter(sources[i]->name().c_str())) continue;
                             if (ImGui::Selectable(sources[i]->name().c_str(), i == erp.streamIdx)) {
@@ -5709,7 +5750,7 @@ int main(int argc, char** argv) {
                     ImGui::SetNextItemWidth(uiScaled(140));
                     const char* chn = (erp.channel < (int)labels.size()) ? labels[erp.channel].c_str() : "ch";
                     if (ImGui::BeginCombo("channel", chn)) {
-                        erp.chanFilter.Draw("##chf", -1.0f);
+                        drawFilter(erp.chanFilter, "##chf", -1.0f);
                         for (int c = 0; c < src->channels(); ++c) {
                             if (!erp.chanFilter.PassFilter(labels[c].c_str())) continue;
                             if (ImGui::Selectable(labels[c].c_str(), c == erp.channel)) {
@@ -5727,7 +5768,7 @@ int main(int argc, char** argv) {
                     // trigger marker stream
                     ImGui::SetNextItemWidth(uiScaled(140));
                     if (ImGui::BeginCombo("trigger", mk->name().c_str())) {
-                        erp.markerFilter.Draw("##mf", -1.0f);
+                        drawFilter(erp.markerFilter, "##mf", -1.0f);
                         for (int i = 0; i < (int)markerSources.size(); ++i) {
                             if (!erp.markerFilter.PassFilter(markerSources[i]->name().c_str())) continue;
                             if (ImGui::Selectable(markerSources[i]->name().c_str(), i == erp.markerIdx)) {
@@ -6242,8 +6283,9 @@ int main(int argc, char** argv) {
 #ifdef LSL_VIEWER_TESTS
     int exitCode = 0;
     if (runTests) {
-        int tested = 0, ok = 0;
-        ImGuiTestEngine_GetResult(engine, tested, ok);
+        ImGuiTestEngineResultSummary sum;
+        ImGuiTestEngine_GetResultSummary(engine, &sum);
+        const int tested = sum.CountTested, ok = sum.CountSuccess;
         std::printf("\n[tests] %d/%d passed\n", ok, tested);
         std::fflush(stdout);
         exitCode = (tested > 0 && ok == tested) ? 0 : 1;

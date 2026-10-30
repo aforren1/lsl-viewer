@@ -182,7 +182,7 @@ before treating any detail as current.
   separate marker path (`MarkerSource`) and a sample-and-hold path for irregular numeric streams.
 - **FFT / spectrogram** — KissFFT (`src/fft.hpp`), rate-limited recompute, STFT spectrogram.
 - **Build / platform** — every FetchContent dependency pinned to a tag or commit (SDL3
-  `release-3.4.x`, liblsl tagged, imgui docking tag + matching implot / test engine commits)
+  `release-3.4.x`, liblsl tagged, imgui docking tag + matching implot tag and test engine commit)
   and a ubuntu / macos / windows CI matrix.
 
 Not yet built: the multi-level min/max pyramid (only one `B` level exists; a scrolling view

@@ -196,6 +196,15 @@ inline void applyTheme(bool light) {
     // dockspace (visible when no plots are open) stayed dark in the light theme.
     // Match it to the window background so it follows the theme.
     s.Colors[ImGuiCol_DockingEmptyBg] = s.Colors[ImGuiCol_WindowBg];
+    // ImGui 1.93 brightened these to suit its greyer default WindowBg, which we replace; the
+    // 1.92 values keep our tables and collapsed title bars as they were.
+    if (light) {
+        c[ImGuiCol_TitleBgCollapsed]  = ImVec4(1.00f, 1.00f, 1.00f, 0.51f);
+    } else {
+        c[ImGuiCol_TableHeaderBg]     = ImVec4(0.19f, 0.19f, 0.20f, 1.00f);
+        c[ImGuiCol_TableBorderStrong] = ImVec4(0.31f, 0.31f, 0.35f, 1.00f);
+        c[ImGuiCol_TableBorderLight]  = ImVec4(0.23f, 0.23f, 0.25f, 1.00f);
+    }
     s.WindowRounding    = 5.0f; s.ChildRounding = 4.0f; s.FrameRounding = 4.0f;
     s.PopupRounding     = 4.0f; s.GrabRounding  = 3.0f; s.TabRounding   = 4.0f;
     s.ScrollbarRounding = 9.0f;
@@ -205,7 +214,6 @@ inline void applyTheme(bool light) {
     s.WindowPadding     = ImVec2(8, 8);
     s.FramePadding      = ImVec2(7, 4);
     s.ItemSpacing       = ImVec2(8, 5);
-    s.AntiAliasedLinesUseTex = true;          // texture AA = fewer line vertices
 
     // Apply the UI scale: FontScaleMain scales every font (1.92 re-rasterizes crisply at the new
     // size), ScaleAllSizes grows/shrinks paddings, rounding, borders, spacing. Both run last on the

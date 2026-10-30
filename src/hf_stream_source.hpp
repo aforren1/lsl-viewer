@@ -367,6 +367,9 @@ public:
         return true;
     }
     double        clockOffset()  const { return clockOffset_.load(std::memory_order_relaxed); }     // remote->local (s)
+    // Round-trip time of the last clock offset measurement (s): the offset lies within half of
+    // it. Negative until the first measurement succeeds.
+    double        clockUncertainty() const { return clockUncertainty_.load(std::memory_order_relaxed); }
     std::uint64_t dropouts()     const { return dropouts_.load(std::memory_order_relaxed); }        // recorded gaps
 
     // Snapshot of channel labels / units (written once on connect, under a lock).
@@ -493,8 +496,7 @@ private:
             // A transient timeout on the initial correction must NOT kill the worker (the
             // periodic refresh below recovers it); wrap it like that refresh does.
             double offset = 0.0;
-            try { offset = inlet.time_correction(2.0); } catch (const std::exception&) { /* 0 until refresh */ }
-            clockOffset_.store(offset, std::memory_order_relaxed);
+            try { offset = correctClock(inlet, 2.0); } catch (const std::exception&) { /* 0 until refresh */ }
             double lastCorr = lsl::local_clock();
 
             std::vector<float>  buf(chunkSamples_ * (std::size_t)channels_);
@@ -698,7 +700,7 @@ private:
                 if (now - lastCorr > 5.0) {        // refresh for cross-stream align
                     // A transient timeout here (stream briefly down) must NOT kill the
                     // worker — recover=true on the inlet reconnects the pull on its own.
-                    try { offset = inlet.time_correction(1.0); clockOffset_.store(offset, std::memory_order_relaxed); }
+                    try { offset = correctClock(inlet, 1.0); }
                     catch (const std::exception&) { /* keep previous offset */ }
                     lastCorr = now;
                 }
@@ -708,6 +710,16 @@ private:
             std::lock_guard<std::mutex> lk(mtx_);
             error_ = e.what();
         }
+    }
+
+    // One time_correction round trip. Publishes the offset and its uncertainty (the round-trip
+    // time: the offset lies within half of it) for the Info panel. Throws as time_correction does.
+    double correctClock(lsl::stream_inlet& inlet, double timeout) {
+        double remote = 0.0, uncertainty = 0.0;
+        const double offset = inlet.time_correction(&remote, &uncertainty, timeout);
+        clockOffset_.store(offset, std::memory_order_relaxed);
+        clockUncertainty_.store(uncertainty, std::memory_order_relaxed);
+        return offset;
     }
 
     // Irregular float stream: resample onto the fixed grid (dt_ = 1/kIrregularRate)
@@ -726,7 +738,7 @@ private:
             if (st.stop_requested()) { inlet.close_stream(); return; }
             try { parseLabels(inlet.info(2.0)); } catch (...) { /* keep defaults */ }
             double offset = 0.0;
-            try { offset = inlet.time_correction(2.0); } catch (...) {}
+            try { offset = correctClock(inlet, 2.0); } catch (...) {}
             double lastCorr = lsl::local_clock();
 
             std::vector<float> cur(channels_, 0.0f);     // most recent (held) value
@@ -742,7 +754,7 @@ private:
                 catch (const std::exception&) { continue; } // recover reconnects
                 const double now = lsl::local_clock();
                 if (now - lastCorr > 5.0) {
-                    try { offset = inlet.time_correction(1.0); } catch (...) {}
+                    try { offset = correctClock(inlet, 1.0); } catch (...) {}
                     lastCorr = now;
                 }
                 if (sts != 0.0) {                            // new value arrived
@@ -944,6 +956,7 @@ private:
     std::atomic<double>        shownRate_{0.0};
     std::atomic<double>        deliverySpeed_{0.0};
     std::atomic<double>        clockOffset_{0.0};    // last remote->local time_correction (s)
+    std::atomic<double>        clockUncertainty_{-1.0};   // its round-trip time (s); < 0: not measured yet
     std::atomic<std::uint64_t> dropouts_{0};         // count of recorded gaps
     double                     lastChunkT_ = 0.0;    // producer-only: local time of previous chunk
     double                     burst_ = 0.0;         // producer-only: data seconds in the current burst
