@@ -390,6 +390,16 @@ struct PlotScratch {
     std::vector<std::pair<double, double>> bands;    // dropout intervals in display time
 };
 
+// Wide enough for one stream that mixes 100 uV EEG with a +/- 600000 uV microphone input
+// (a gain near 1e-4), and for streams whose units put signals far from 150 per lane.
+constexpr float kChanGainMin = 1e-4f, kChanGainMax = 1e4f;
+constexpr float kLaneGainMin = 1e-3f, kLaneGainMax = 1e7f;
+// ImGui divides a logarithmic drag's speed by (max - min) and spreads that over the whole log
+// range, so the speed has to grow with the range. This keeps the 4e-4 decades a pixel the old
+// 0.01..100 field had (about 11 px per 0.01 at 1x; Shift is 10x faster).
+static const float kChanGainDragSpeed =
+    4e-4f * (kChanGainMax - kChanGainMin) / std::log10(kChanGainMax / kChanGainMin);
+
 struct DisplayOpts {
     float history     = 10.0f;
     bool  stacked     = true;   // EEG-style montage (vs shared-axis overlay)
@@ -1352,7 +1362,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::EndDisabled();
         ImGui::BeginDisabled(!o.stacked);          // lane gain: stacked montage only
         ImGui::SetNextItemWidth(uiScaled(110));
-        ImGui::SliderFloat("Gain/lane", &o.gainUv, 5.0f, 2000.0f, "%.0f",
+        ImGui::SliderFloat("Gain/lane", &o.gainUv, kLaneGainMin, kLaneGainMax, "%.3g",
                            ImGuiSliderFlags_Logarithmic);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("per-lane gain (%s)", streamUnit);
         ImGui::EndDisabled();
@@ -1463,8 +1473,9 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             const int c = sc.visIdx[j];
             ImGui::PushID(c);
             ImGui::SetNextItemWidth(uiScaled(120));
-            ImGui::DragFloat(labels[c].c_str(), &gain[c], 0.01f, 0.01f, 100.0f, "%.2fx",
-                             ImGuiSliderFlags_Logarithmic);
+            // The format's precision is also ImGui's zero on the log scale: 4 digits reach 1e-4.
+            ImGui::DragFloat(labels[c].c_str(), &gain[c], kChanGainDragSpeed, kChanGainMin, kChanGainMax,
+                             "%.4gx", ImGuiSliderFlags_Logarithmic);
             ImGui::PopID();
         }
     }
@@ -1692,7 +1703,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 streamPlotDropTarget(s);
                 ImPlot::EndPlot();
                 ImGui::SameLine();
-                ImPlot::ColormapScale("p2p", 0.0, (double)o.gainUv, ImVec2(60, -1), "%.0f");
+                ImPlot::ColormapScale("p2p", 0.0, (double)o.gainUv, ImVec2(60, -1), "%.3g");
                 ImPlot::PopColormap();
             } else {
                 ImPlot::EndPlot();
@@ -1772,7 +1783,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 for (int j = 0; j < show; ++j) {
                     const int c = sc.visIdx[j];
                     amp[c]  = sc.ampOut[j];
-                    gain[c] = std::clamp(o.gainUv * 0.4f / std::max(amp[c], 1e-3f), 0.01f, 100.0f);
+                    gain[c] = std::clamp(o.gainUv * 0.4f / std::max(amp[c], 1e-3f), kChanGainMin, kChanGainMax);
                 }
                 o.autoGainReq = false;
             }
@@ -1791,7 +1802,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             const char* unit = (c0 < (int)units.size() && !units[c0].empty())
                                    ? units[c0].c_str() : "a.u.";
             ImPlot::Annotation(xbar, 0.0, ImGui::ColorConvertU32ToFloat4(col), ImVec2(6, 0),
-                               false, "%.0f %s", o.gainUv, unit);
+                               false, "%.3g %s", o.gainUv, unit);
             drawDropoutRed(s, sc.bands, 0.0, 0.0, headFreeze, edge);
             drawBreaks(s, sc.breaks);
             drawMarkers(sc.markers);
@@ -3048,7 +3059,8 @@ void lslViewerRequestConnect(const char* sourceId) {
 // Per connected data stream, refreshed every frame: whether it is anchored (has data), its
 // dropout count, and the total length of its recorded gaps.
 struct StreamProbe { std::string name; bool anchored = false; unsigned long long dropouts = 0; double gapSec = 0.0;
-                     double edge = 0.0, newest = 0.0, dt = 0.0, rate = 0.0, speed = 0.0; };   // edge: the plot's right edge last frame,
+                     double edge = 0.0, newest = 0.0, dt = 0.0, rate = 0.0, speed = 0.0;   // edge: the plot's right edge last frame,
+                     std::vector<float> gains; };
 static double g_probeFrameDt = 0.0;                                     // and dt: that frame's step time
 static std::vector<StreamProbe> g_streamProbes;
 bool lslViewerStreamProbe(const char* name, bool& anchored, unsigned long long& dropouts, double& gapSec,
@@ -3057,6 +3069,11 @@ bool lslViewerStreamProbe(const char* name, bool& anchored, unsigned long long& 
         if (p.name == name) { anchored = p.anchored; dropouts = p.dropouts; gapSec = p.gapSec;
                               edge = p.edge; newest = p.newest; dt = p.dt; rate = p.rate; speed = p.speed;
                               return true; }
+    return false;
+}
+bool lslViewerChannelGain(const char* name, int channel, float& gain) {
+    for (const auto& p : g_streamProbes)
+        if (p.name == name && channel >= 0 && channel < (int)p.gains.size()) { gain = p.gains[(std::size_t)channel]; return true; }
     return false;
 }
 // The newest ERP window (an earlier test may have opened others): its id, the streams it is
@@ -4233,6 +4250,7 @@ int main(int argc, char** argv) {
                 sp.dt = g_probeFrameDt;
                 sp.rate = s->measuredRate(); sp.speed = s->deliverySpeed();
                 sp.gapSec = s->missingSeconds();
+                sp.gains = s->chanGain();
                 g_streamProbes.push_back(std::move(sp));
             }
             g_erpProbe = {};

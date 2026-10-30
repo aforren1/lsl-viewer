@@ -220,6 +220,7 @@ extern bool lslViewerStreamProbe(const char* name, bool& anchored, unsigned long
                                  double& edge, double& newest, double& dt, double& rate, double& speed);
 struct StreamProbeView { bool found = false, anchored = false; unsigned long long dropouts = 0; double gapSec = 0.0;
                          double edge = 0.0, newest = 0.0, dt = 0.0, rate = 0.0, speed = 0.0; };
+extern bool lslViewerChannelGain(const char* name, int channel, float& gain);
 static StreamProbeView streamProbe(const char* name) {
     StreamProbeView p;
     p.found = lslViewerStreamProbe(name, p.anchored, p.dropouts, p.gapSec, p.edge, p.newest, p.dt, p.rate, p.speed);
@@ -2112,6 +2113,67 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK(lo > 998.0 && hi < 1002.0);              // within 0.2% of 1 kHz
         IM_CHECK_LT(hi - lo, 1.0);                        // and steady to read
         ctx->WindowClose("//RateTest");
+        ctx->Yield(3);
+    };
+
+    // One stream that mixes EEG (100 uV) with a microphone input (+/- 600000 uV), as some amps
+    // do. Auto-gain must bring both to the lane: the microphone needs a gain near 1e-4.
+    t = IM_REGISTER_TEST(e, "stream", "auto_gain_wide");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock: LSL runs on the real one
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        const char* kName = "GainWide";
+        constexpr double kRate = 250.0;
+        constexpr float kEeg = 100.0f, kMic = 600000.0f;
+        lsl::stream_outlet out(lsl::stream_info(kName, "EEG", 2, kRate, lsl::cf_float32, "gaintest-wide"));
+        lslViewerRequestConnect("gaintest-wide");
+        IM_CHECK(waitFor([&] { return streamProbe(kName).found && out.have_consumers(); }, 15.0));
+        std::vector<float> v;
+        const auto start = std::chrono::steady_clock::now();
+        long long sent = 0;
+        auto pushDue = [&] {
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            v.clear();
+            for (; (double)sent / kRate <= el; ++sent) {
+                const double ph = 6.283185307179586 * (double)sent / kRate;
+                v.push_back(kEeg * (float)std::sin(10.0 * ph));
+                v.push_back(kMic * (float)std::sin(3.0 * ph));
+            }
+            if (!v.empty()) out.push_chunk_multiplexed(v.data(), v.size());
+        };
+        IM_CHECK(waitFor([&] { pushDue(); return (double)sent / kRate > 3.0; }, 10.0));
+
+        ctx->WindowFocus("//GainWide"); ctx->Yield(2);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo("//GainWide/cfg");
+        IM_CHECK(cfg.Window != nullptr);
+        ctx->SetRef(cfg.Window);
+        ctx->ItemOpen("Display");
+        ctx->ItemUncheck("High-pass");       // keep the sines as sent
+        ctx->ItemOpen("Channel gains");
+        ctx->ItemClick("Auto");
+        waitFor([&] { pushDue(); return false; }, 0.2);   // a few frames for Auto to measure and apply
+        float gEeg = 0.0f, gMic = 0.0f;
+        IM_CHECK(lslViewerChannelGain(kName, 0, gEeg) && lslViewerChannelGain(kName, 1, gMic));
+        ctx->LogInfo("%s: auto gains %.4g (EEG) and %.4g (mic)", kName, gEeg, gMic);
+        // Auto puts the amplitude at 0.4 lane height (150 uV a lane): 0.6 and 1e-4.
+        IM_CHECK(gEeg > 0.4f && gEeg < 0.9f);
+        IM_CHECK(gMic > 0.5e-4f && gMic < 2e-4f);
+        IM_CHECK_GT(gEeg / gMic, 3000.0f);
+        // Dragging the gain keeps the old feel: 100 px from 1x is about 0.04 decades (1.1x).
+        ctx->ItemClick("Reset");
+        ctx->ItemDragWithDelta("$$0/ch 0", ImVec2(100.0f, 0.0f));
+        ctx->Yield(2);
+        IM_CHECK(lslViewerChannelGain(kName, 0, gEeg));
+        ctx->LogInfo("%s: gain %.4g after a 100 px drag from 1x", kName, gEeg);
+        IM_CHECK(gEeg > 1.03f && gEeg < 1.2f);
+        ctx->ItemCheck("High-pass");
+        ctx->WindowClose("//GainWide");
         ctx->Yield(3);
     };
 
