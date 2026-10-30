@@ -21,6 +21,7 @@ The signal path lives in single-header modules under `src/` (each documented in
 | `src/hf_stream_source.hpp` | High-frequency producer: `InterleavedRing` + `MinMaxSummary`, `pull_chunk_multiplexed` |
 | `src/magic_ring_buffer.hpp` | Cross-platform mirrored ring + `InterleavedRing` SPSC |
 | `src/minmax_summary.hpp` | Incremental absolute-indexed min/max for shimmer-free decimation |
+| `src/drift_map.hpp` | Sample index to display time: dropout gaps + drift correction (no LSL dependency) |
 | `src/main.cpp` | SDL3/GPU loop, stream browser, all plot paths (time series / spectrum / spectrogram / ERP) |
 
 ---
@@ -117,11 +118,35 @@ summary.append(buf.data(), n);
 
 Set inlet `max_chunklen` and sender chunking to 5–30 ms. For a regular stream,
 **do not store per-sample timestamps** — derive x from absolute sample index +
-srate using one `(sample_index ↔ LSL_timestamp)` anchor refreshed periodically.
-Store timestamps only for marker / irregular-rate streams.
+srate using one `(sample_index ↔ LSL_timestamp)` anchor, set once at the first
+chunk. Store timestamps only for marker / irregular-rate streams.
 
 `time_correction()` maps the sender's LSL clock to the local clock; call it once
 on connect and refresh every ~5 s for cross-stream alignment.
+
+The anchor is never moved: that would shift the whole history, make the plot
+jump, and misalign ERP epochs already averaged. A device off its nominal rate
+(10 to 100 ppm is typical) and a drifting clock offset are instead taken up by
+the **drift map** (`src/drift_map.hpp`). The index gives the "old-frame" time
+`x = t0 + i * dt`, and the display time is
+
+```
+display(x) = x + G(x) + D(x)
+```
+
+- `G` is the step function of recorded dropouts.
+- `D` is a continuous piecewise-linear correction with a knot every 5 s of data.
+  A small clock servo estimates it from one residual per pull, from the newest
+  sample: `(stamp + time_correction) - (x + G(x))`. The servo uses an
+  exponentially weighted line fit and a steering term.
+- Knots are added only at the newest sample, with their value set by
+  continuity. Thus the display time of a published sample never changes.
+
+Gaps, replay breaks and the spectrogram's gap lookup stay keyed in old-frame
+time. A dropout is detected on the raw stamps (a jump of more than 0.25 s).
+When the fit can steer, its length is set so that the first sample after it
+lands on the fitted line; before that, and at a replay break, the length is
+the raw stamp difference. `LSL_DRIFT_CORR=0` keeps `D` at 0, for A/B checks.
 
 ### SDL_GPU render loop (critical note)
 
@@ -174,4 +199,6 @@ still translates bins without re-scanning, so this is a zoom-range refinement, n
 4. The `MinMaxSummary` bin grid is anchored to absolute sample index zero of each
    stream — do not reset `binAbs_` or `closed_` after construction.
 5. For regular-rate streams, x is computed from sample index, not stored
-   per sample — do not add a timestamp array to `InterleavedRing`.
+   per sample — do not add a timestamp array to `InterleavedRing`. The drift
+   map turns that x into display time, and it only appends knots at the newest
+   sample: never re-map samples that are already published.

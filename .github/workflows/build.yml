@@ -65,12 +65,17 @@ jobs:
           echo "APP_VERSION=$ver" >> "$GITHUB_ENV"
 
       # Compile check incl. the UI test suite + Test Engine (LSL_VIEWER_TESTS=ON, no LTO so the
-      # link stays fast). The tests themselves need a GPU to run, so CI only builds them.
+      # link stays fast). The UI tests need a GPU to run, so CI only builds them; the headless
+      # tests run in the next step.
       - name: Build (with tests)
         run: >
           cmake -S . -B build-test -G "${{ matrix.gen }}"
           -DCMAKE_BUILD_TYPE=Release -DLSL_VIEWER_TESTS=ON &&
           cmake --build build-test --config Release --parallel
+
+      # The headless tests (no GPU, no LSL network): drift_map_test on synthetic timestamps.
+      - name: Test (headless)
+        run: ctest --test-dir build-test -C Release --output-on-failure
 
       # Compile check for the Tracy-profiler build path (LSL_VIEWER_TRACY=ON), so a change that
       # breaks the profiler.hpp Tracy branch / TracyClient link is caught in CI rather than

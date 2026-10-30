@@ -173,7 +173,7 @@ uv run tests/compare_labrecorder.py        # all mock streams, incl. 48 kHz audi
 
 | Flag | Effect |
 |------|--------|
-| `-DLSL_VIEWER_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]` |
+| `-DLSL_VIEWER_TESTS=ON`  | build the UI test suite; run headless with `lsl_viewer --tests [query]`. Also builds `drift_map_test`, which needs no GPU: run it with `ctest --test-dir build-test -C Release` |
 | `-DLSL_VIEWER_TRACY=ON`  | enable the [Tracy](https://github.com/wolfpld/tracy) frame profiler (connect the Tracy server to view) |
 | `-DLSL_VIEWER_STATIC=ON` | static-link SDL3 + liblsl into one self-contained binary (see below) |
 | `-DLSL_CLI_ONLY=ON` | build **only** the headless `xdf_record` and `xdf_replay` (skip all GUI deps: SDL3/ImGui/ImPlot/KissFFT). With `-DLSL_VIEWER_STATIC=ON` + a musl toolchain + `-DCMAKE_EXE_LINKER_FLAGS=-static` → a fully-static recorder with no glibc/GPU deps |
@@ -207,6 +207,7 @@ variables change what the soak does:
 | `LSL_PERF_SPECTRO_SPAN=<s>` | Set the spectrogram span. |
 | `LSL_PERF_SPEED=5x` | Set the replay speed, with `LSL_REPLAY=<file>`. |
 | `LSL_PERF_CAPTURE=1` | Save a screenshot of the window at the end, in `output/captures/`. |
+| `LSL_PERF_COMBINED=streams` or `combined` | For `--tests combined_vs_streams`: show 4 streams of 16 channels at 500 Hz as 4 stream plots, or as 1 combined plot on the same area. That test publishes the streams itself. |
 
 These variables of the viewer itself help to profile on a given display or GPU:
 
@@ -220,6 +221,11 @@ These variables of the viewer itself help to profile on a given display or GPU:
 | `LSL_NOVSYNC=1` | Turn off VSync, to measure the full render cost. |
 | `LSL_FPS_CAP=<n>` | Limit the frame rate to n frames a second (also in the Performance window). |
 | `LSL_FRAMES_IN_FLIGHT=<n>` | Let the GPU queue 1 to 3 frames (default: 2). More frames give more input lag. Fewer frames make a late frame more likely to show as a hitch. |
+
+To compare the time axis with and without the drift correction, set `LSL_DRIFT_CORR=0`.
+The viewer then draws sample i of a regular stream at `t0 + i / nominal rate`, and a
+device off its nominal rate drifts against the marker streams. The Info section of a
+stream shows the correction in use.
 
 ## Static build (single-file distribution)
 
@@ -267,6 +273,7 @@ runtime see [windows-remote-control-testing.md](windows-remote-control-testing.m
 src/                     the viewer — one translation unit + header-only modules
   main.cpp                 app entry: UI, dock layout, render loop, recording UI
   hf_stream_source.hpp     LSL inlet -> ring buffers + filter chain on a worker thread
+  drift_map.hpp            sample index -> display time: dropout gaps + drift correction
   magic_ring_buffer.hpp    mirrored (contiguous-wraparound) lock-free ring buffer
   minmax_summary.hpp       decimated min/max envelope for zoomed-out plots
   filter.hpp               DC-blocker high-pass + RBJ biquads (notch / low-pass)
@@ -288,6 +295,8 @@ tools/                   standalone helpers (not linked into the viewer)
 
 tests/                   Dear ImGui Test Engine UI tests + screenshot captures
   ui_tests.cpp             enabled with -DLSL_VIEWER_TESTS=ON; run via `lsl_viewer --tests`
+  drift_map_test.cpp       headless drift-map tests on synthetic timestamps (`ctest`);
+                           `drift_map_test --bench` times the per-frame time mapping
   compare_labrecorder.py   records the mock streams with our recorder + LabRecorder and
                            checks the XDFs are identical (needs LabRecorderCLI; runs locally)
 

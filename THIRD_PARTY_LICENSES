@@ -21,7 +21,8 @@ contain musl libc; its notices are in the musl-COPYRIGHT file beside them.
   ImPlot          MIT           (C) 2020 Evan Pezent              https://github.com/epezent/implot
   liblsl          MIT           (C) 2012 Christian A. Kothe       https://github.com/sccn/liblsl
     pugixml       MIT           (C) 2006-2025 Arseny Kapoulkine   (linked into liblsl)
-  spdlog          MIT           (C) 2016 Gabi Melman              https://github.com/gabime/spdlog
+  spdlog          MIT           (C) 2016-present Gabi Melman      https://github.com/gabime/spdlog
+                                and spdlog contributors
   KissFFT         BSD-3-Clause  (C) 2003-2010 Mark Borgerding     https://github.com/mborgerding/kissfft
   App-LabRecorder MIT           (C) 2012 Christian Kothe          https://github.com/labstreaminglayer/App-LabRecorder
                   (src/xdf_writer.hpp is adapted from its xdfwriter)
@@ -49,7 +50,7 @@ Copyright (c) 2026 Disco Hello, Copyright (c) 2019,2023 Tristan Grimmer (ProggyF
 Copyright (c) 2020 Evan Pezent (ImPlot)
 Copyright (c) 2012 Christian A. Kothe (liblsl)
 Copyright (c) 2006-2025 Arseny Kapoulkine (pugixml)
-Copyright (c) 2016 Gabi Melman (spdlog)
+Copyright (c) 2016 - present, Gabi Melman and spdlog contributors (spdlog)
 Copyright (c) 2012 Christian Kothe (App-LabRecorder / xdfwriter)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

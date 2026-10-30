@@ -60,7 +60,7 @@ include(FetchContent)
 # Pin GIT_TAG to a tagged SDL3 stable release (3.4.x line).
 FetchContent_Declare(SDL3
   GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-  GIT_TAG        release-3.4.10     # pinned stable 3.4.x
+  GIT_TAG        release-3.4.18     # pinned stable 3.4.x
   GIT_SHALLOW    TRUE
 )
 # Trim SDL to the subsystems the viewer actually uses: video + SDL_GPU (Vulkan/D3D12)
@@ -118,7 +118,7 @@ FetchContent_Declare(implot
 set(SPDLOG_BUILD_PIC ON CACHE BOOL "" FORCE)
 FetchContent_Declare(spdlog
   GIT_REPOSITORY https://github.com/gabime/spdlog.git
-  GIT_TAG        v1.15.1
+  GIT_TAG        v1.17.0            # latest release; bundles {fmt} 12.1.0
   GIT_SHALLOW    TRUE
 )
 
@@ -131,7 +131,7 @@ set(KISSFFT_TOOLS     OFF         CACHE BOOL   "" FORCE)
 set(KISSFFT_PKGCONFIG OFF         CACHE BOOL   "" FORCE)
 FetchContent_Declare(kissfft
   GIT_REPOSITORY https://github.com/mborgerding/kissfft.git
-  GIT_TAG        131.1.0
+  GIT_TAG        131.2.0            # latest release
   GIT_SHALLOW    TRUE
 )
 
@@ -305,6 +305,15 @@ if(LSL_VIEWER_TESTS AND NOT LSL_CLI_ONLY)
   target_compile_definitions(lsl_viewer PRIVATE LSL_VIEWER_TESTS)
   target_link_libraries(lsl_viewer PRIVATE imgui_te)
   target_compile_options(lsl_viewer PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/Z7,-g>)
+endif()
+
+# Headless tests of the drift map (src/drift_map.hpp) on synthetic timestamps: no LSL and no GPU,
+# so unlike the UI suite they run anywhere (`ctest`, or the exe; `--bench` for the microbenchmark).
+if(LSL_VIEWER_TESTS)
+  enable_testing()
+  add_executable(drift_map_test tests/drift_map_test.cpp)
+  target_include_directories(drift_map_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME drift_map COMMAND drift_map_test)
 endif()
 
 # Link-time optimization for shipping builds — trims unreferenced library code

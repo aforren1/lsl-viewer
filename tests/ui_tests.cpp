@@ -12,6 +12,7 @@
 #include "imgui_test_engine/imgui_te_engine.h"
 #include "imgui_test_engine/imgui_te_context.h"
 
+#include "combined_plot.hpp"     // trace binding, grouping and the workspace record, under test
 #include "filter.hpp"
 #include "fft.hpp"               // Psd (KissFFT-backed) under test
 #include "heatmap_image.hpp"     // heatmaps as one textured quad, under test
@@ -159,6 +160,7 @@ static void writeReplayTestFile(const std::string& path) {
 // trigger stream has received, and the epochs it averaged or left out.
 extern void lslViewerErpProbe(int& id, std::string& stream, std::string& trigger, std::size_t& markerEvents,
                               int& count, int& rejected);
+extern void lslViewerErpLastPeak(double& ms, int& count);
 struct ErpProbeView { int id = 0, count = 0, rejected = 0; std::size_t markerEvents = 0; std::string stream, trigger; };
 static ErpProbeView erpProbe() {
     ErpProbeView p;
@@ -243,8 +245,104 @@ static int openSpectra(std::string* newest = nullptr, const char* prefix = "Spec
     return n;
 }
 
+// The newest combined plot: its lane labels, and per lane an index into the connected
+// sources or -1 (not connected), -2 (channel missing), -3 (waiting for data).
+extern void lslViewerCombinedProbe(int& id, std::vector<std::string>& ticks, std::vector<int>& state, int& groups);
+extern void lslViewerCombinedEdges(std::vector<std::vector<double>>& edges);
+struct CombinedProbeView { int id = 0, groups = 0; std::vector<std::string> ticks; std::vector<int> state; };
+static CombinedProbeView combinedProbe() {
+    CombinedProbeView p;
+    lslViewerCombinedProbe(p.id, p.ticks, p.state, p.groups);
+    return p;
+}
+// The combined plot window with the highest id ("<title>###combined<id>"), or null.
+static ImGuiWindow* newestCombinedWindow() {
+    ImGuiWindow* best = nullptr;
+    int bestId = 0;
+    for (ImGuiWindow* w : ImGui::GetCurrentContext()->Windows) {
+        const char* m = std::strstr(w->Name, "###combined");
+        if (!w->WasActive || m == nullptr || std::strchr(w->Name, '/')) continue;
+        if (const int id = std::atoi(m + 11); id > bestId) { bestId = id; best = w; }
+    }
+    return best;
+}
+// Adds channel `chan` of `stream` with the combined plot's Add popup (`cfg`: its config strip).
+static void combinedAdd(ImGuiTestContext* ctx, ImGuiWindow* cfg, const char* stream, const char* chan) {
+    ctx->SetRef(cfg);
+    ctx->ItemClick("Add...");
+    ctx->SetRef("//$FOCUSED");
+    ctx->ComboClick((std::string("##stream/") + stream).c_str());
+    ctx->ItemCheck((std::string("**/") + chan).c_str());
+    ctx->ItemClick("Add selected");
+    ctx->Yield(2);
+}
+
 extern std::string lslViewerAppSettingsOnly(const std::string& ini);
 extern std::string lslViewerLayoutOnly(const std::string& ini);
+extern int  lslViewerPageSlice(const std::vector<int>& enabled, int pageSize, int page, std::vector<int>& out);
+extern std::string lslViewerSerializePaging(bool paginate, int pageSize, int page, int nch);
+extern void lslViewerParsePaging(const std::string& payload, bool& paginate, int& pageSize, int& page, int& nch);
+
+// The Y tick labels of a stream window's lane plot (stacked or raster) as drawn last frame,
+// top lane first, without the "(1.5x)" gain suffix: an earlier test may have changed gains.
+// Empty when the plot is not there.
+static std::vector<std::string> laneTicks(ImGuiWindow* plt) {
+    std::vector<std::string> out;
+    ImPlotPlot* plot = plt ? GImPlot->Plots.GetByKey(ImHashStr("##plot", 0, plt->ID)) : nullptr;
+    if (plot == nullptr) return out;
+    const ImPlotTicker& tk = plot->Axes[ImAxis_Y1].Ticker;
+    for (int i = 0; i < tk.Ticks.Size; ++i) {
+        std::string s = tk.GetText(i);
+        if (const std::size_t g = s.find(" ("); g != std::string::npos) s.resize(g);
+        out.push_back(s);
+    }
+    return out;
+}
+static std::vector<std::string> sliceOf(const std::vector<std::string>& v, int b, int e) {
+    return std::vector<std::string>(v.begin() + b, v.begin() + std::min(e, (int)v.size()));
+}
+
+// Sets up a paged stacked plot on MockEEG: every channel enabled, with the reference tick
+// list taken before paging. Returns false (the test then skips) without the stream. The ref
+// is left on the cfg child.
+struct PagedPlot { ImGuiWindow* cfg = nullptr; ImGuiWindow* plt = nullptr; std::vector<std::string> all; };
+static bool pagedPlotSetup(ImGuiTestContext* ctx, int perPage, PagedPlot& pp) {
+    ctx->SleepNoSkip(2.5f, 1.0f / 30.0f);
+    if (ctx->GetWindowByRef("//MockEEG") == nullptr) { ctx->LogInfo("MockEEG not present; skipping"); return false; }
+    ctx->WindowFocus("//MockEEG"); ctx->Yield(2);
+    pp.cfg = ctx->WindowInfo("//MockEEG/cfg").Window;
+    pp.plt = ctx->WindowInfo("//MockEEG/plt").Window;
+    if (pp.cfg == nullptr || pp.plt == nullptr) { ctx->LogInfo("no cfg/plt child; skipping"); return false; }
+    ctx->SetRef(pp.cfg);
+    ctx->ItemOpen("Display");
+    ctx->ItemCheck("Stacked montage");
+    ctx->ItemUncheck("Raster");
+    // Closed, so the channel list below fits in a short window: the test engine scrolls the
+    // list to a checkbox but not the cfg child around it.
+    ctx->ItemClose("Display");
+    ctx->ItemOpen("Channels");
+    ctx->ItemUncheck("Paginate");        // a failed run may have left it on
+    ctx->ItemInputValue("filter", "");   // All acts on the filtered list
+    ctx->ItemClick("All");
+    ctx->Yield(3);
+    pp.all = laneTicks(pp.plt);
+    ctx->LogInfo("%d channels enabled", (int)pp.all.size());
+    ctx->ItemCheck("Paginate");
+    ctx->ItemInputValue("per page", perPage);
+    ctx->Yield(3);
+    return true;
+}
+// Back to the default: every channel enabled, 16 per page, first page.
+static void pagedPlotRestore(ImGuiTestContext* ctx, PagedPlot& pp) {
+    ctx->SetRef(pp.cfg);
+    ctx->ItemCheck("Paginate");
+    ctx->ItemInputValue("per page", 16);
+    ctx->ItemClick("All");
+    ctx->ItemClick("##pgprev");
+    ctx->ItemClick("##pgprev");
+    ctx->ItemClick("##pgprev");
+    ctx->Yield(2);
+}
 
 void RegisterAppTests(ImGuiTestEngine* e) {
     ImGuiTest* t = nullptr;
@@ -419,6 +517,72 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         IM_CHECK_LT(std::fabs(psd.binHz(peak) - f0), fs / N + 1.0f);   // within a bin of 40 Hz
         const int kFar = (int)(150.0f * N / fs);                       // a 150 Hz bin
         IM_CHECK_GT(out[peak], 100.0f * out[kFar]);                    // tone dominates
+    };
+
+    // Channel pagination math: pages of N over the enabled list, the last one short, and the
+    // page clamped into range. No UI.
+    t = IM_REGISTER_TEST(e, "pages", "slice");
+    t->TestFunc = [](ImGuiTestContext*) {
+        std::vector<int> en, out;
+        for (int c = 0; c < 64; ++c) if (c % 11 != 5) en.push_back(c);   // 58 enabled, with holes
+        IM_CHECK_EQ((int)en.size(), 58);
+        for (int p = 0; p < 4; ++p) {
+            IM_CHECK_EQ(lslViewerPageSlice(en, 16, p, out), p);
+            IM_CHECK_EQ((int)out.size(), p < 3 ? 16 : 10);
+            IM_CHECK_EQ(out.front(), en[p * 16]);
+            IM_CHECK_EQ(out.back(), en[p * 16 + (int)out.size() - 1]);
+        }
+        IM_CHECK_EQ(lslViewerPageSlice(en, 16, 4, out), 3);              // past the end
+        IM_CHECK_EQ((int)out.size(), 10);
+        IM_CHECK_EQ(lslViewerPageSlice(en, 16, 1000, out), 3);
+        IM_CHECK_EQ(lslViewerPageSlice(en, 16, -2, out), 0);
+        IM_CHECK_EQ(out.front(), en[0]);
+
+        const std::vector<int> none;
+        IM_CHECK_EQ(lslViewerPageSlice(none, 16, 2, out), 0);           // one empty page
+        IM_CHECK(out.empty());
+
+        IM_CHECK_EQ(lslViewerPageSlice(en, 1, 57, out), 57);             // N = 1: a channel per page
+        IM_CHECK_EQ((int)out.size(), 1);
+        IM_CHECK_EQ(out[0], en[57]);
+        IM_CHECK_EQ(lslViewerPageSlice(en, 1, 58, out), 57);
+
+        IM_CHECK_EQ(lslViewerPageSlice(en, 100, 1, out), 0);             // N > |E|: one page of all
+        IM_CHECK(out == en);
+    };
+
+    // Workspaces keep the pagination fields, and a payload saved before they existed loads
+    // with pagination off. 256 channels, all enabled: the longest line serializeOpts writes
+    // into its fixed buffer (the vis= list is appended outside it), so a cut would lose nch.
+    t = IM_REGISTER_TEST(e, "pages", "workspace_roundtrip");
+    t->TestFunc = [](ImGuiTestContext*) {
+        bool pg = false; int n = 0, p = 0, nch = 0;
+        const std::string s = lslViewerSerializePaging(true, 8, 3, 256);
+        IM_CHECK(s.find(" pg=1 pgn=8 pgi=3 ") != std::string::npos);
+        lslViewerParsePaging(s, pg, n, p, nch);
+        IM_CHECK(pg);
+        IM_CHECK_EQ(n, 8);
+        IM_CHECK_EQ(p, 3);
+        IM_CHECK_EQ(nch, 256);
+
+        lslViewerParsePaging(lslViewerSerializePaging(false, 256, 0, 1), pg, n, p, nch);
+        IM_CHECK(!pg);
+        IM_CHECK_EQ(n, 256);
+        IM_CHECK_EQ(p, 0);
+
+        const std::string old = "hist=10.000 stk=1 ras=0 gain=150.000 spc=0.000 hp=1 hphz=0.5000 no=0 "
+                                "nohz=60.0 lp=0 lphz=40.0 ref=0 refc=0 lw=1.00 ovm=0 cfg=1 nch=32 vis=0,1,2,";
+        lslViewerParsePaging(old, pg, n, p, nch);
+        IM_CHECK(!pg);
+        IM_CHECK_EQ(n, 16);
+        IM_CHECK_EQ(p, 0);
+        IM_CHECK_EQ(nch, 32);
+
+        lslViewerParsePaging("pg=1 pgn=0 pgi=-4", pg, n, p, nch);       // hand-edited: clamped
+        IM_CHECK_EQ(n, 1);
+        IM_CHECK_EQ(p, 0);
+        lslViewerParsePaging("pg=1 pgn=9999", pg, n, p, nch);
+        IM_CHECK_EQ(n, 256);
     };
 
     // Remote-control server roundtrip: start the TCP server, drive it from a
@@ -860,6 +1024,419 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         std::error_code ec; std::filesystem::remove(file, ec);
     };
 
+    // Combined plot model, no UI: a trace binds by index while the label there matches, else by
+    // label; traces group by (source, kind) in lane order; the workspace record survives keys
+    // and labels with spaces, tabs, '|' and '%'.
+    t = IM_REGISTER_TEST(e, "combined", "model");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const std::vector<std::string> labels = {"Fp1", "Cz", "Pz"};
+        TraceRef tr;
+        tr.label = "Cz"; tr.channel = 1;
+        IM_CHECK_EQ(bindTraceChannel(tr, labels), 1);                 // index match
+        tr.channel = 2;
+        IM_CHECK_EQ(bindTraceChannel(tr, labels), 1);                 // index moved: by label
+        const std::vector<std::string> moved = {"Cz", "Fp1"};
+        tr.channel = 1;
+        IM_CHECK_EQ(bindTraceChannel(tr, moved), 0);                  // reconnect, new layout
+        tr.channel = 7; tr.label = "Pz";
+        IM_CHECK_EQ(bindTraceChannel(tr, labels), 2);                 // index out of range
+        tr.label = "Oz";
+        IM_CHECK_EQ(bindTraceChannel(tr, labels), -1);                // channel missing
+        IM_CHECK_EQ(bindTraceChannel(tr, {}), -1);
+
+        // Lanes 0..5 from sources 2, 0, 2, (none), 0, 2; lane 4 is raw (kind 0).
+        const std::vector<int> src = {2, 0, 2, -1, 0, 2}, kind = {1, 1, 1, 1, 0, 1};
+        std::vector<TraceGroup> groups;
+        std::vector<int> order;
+        groupTraces(src, kind, groups, order);
+        IM_CHECK_EQ((int)groups.size(), 3);
+        IM_CHECK(groups[0].src == 2 && groups[0].kind == 1 && groups[0].first == 0 && groups[0].count == 3);
+        IM_CHECK(groups[1].src == 0 && groups[1].kind == 1 && groups[1].first == 3 && groups[1].count == 1);
+        IM_CHECK(groups[2].src == 0 && groups[2].kind == 0 && groups[2].first == 4 && groups[2].count == 1);
+        IM_CHECK((order == std::vector<int>{0, 2, 5, 1, 4}));
+        groupTraces(std::vector<int>{-1, -2}, std::vector<int>{1, 1}, groups, order);
+        IM_CHECK(groups.empty() && order.empty());
+
+        CombinedRecord r;
+        r.id = 7; r.title = "EEG + chirp: 50% | left";
+        r.view = "hist=12.000 stk=1 lw=1.50";
+        r.unitScale = {{"microvolts", 150.0f}, {"a.u. (x|y)", 0.25f}};
+        TraceRef a;
+        a.streamKey = "amp 1 serial|EEG amplifier"; a.channel = 3; a.label = "Cz"; a.filtered = true;
+        TraceRef b;
+        b.streamKey = "odd%key\twith|bars"; b.channel = 0; b.label = "chirp 1|2 %"; b.filtered = false; b.autoFit = true;
+        r.traces = {a, b};
+        const std::string line = toLine(r);
+        IM_CHECK(line.find('\n') == std::string::npos);
+        IM_CHECK_EQ((int)std::count(line.begin(), line.end(), '\t'), 5);
+        CombinedRecord q;
+        IM_CHECK(fromLine(line, q));
+        IM_CHECK_EQ(q.id, 7);
+        IM_CHECK_STR_EQ(q.title.c_str(), r.title.c_str());
+        IM_CHECK_STR_EQ(q.view.c_str(), r.view.c_str());
+        IM_CHECK_EQ((int)q.unitScale.size(), 2);
+        IM_CHECK_STR_EQ(q.unitScale[1].first.c_str(), "a.u. (x|y)");
+        IM_CHECK(std::fabs(q.unitScale[1].second - 0.25f) < 1e-6f);
+        IM_CHECK_EQ((int)q.traces.size(), 2);
+        IM_CHECK_STR_EQ(q.traces[0].streamKey.c_str(), a.streamKey.c_str());
+        IM_CHECK_STR_EQ(q.traces[0].streamName.c_str(), "EEG amplifier");   // shown until it connects
+        IM_CHECK(q.traces[0].channel == 3 && q.traces[0].filtered && !q.traces[0].autoFit);
+        IM_CHECK_STR_EQ(q.traces[1].streamKey.c_str(), b.streamKey.c_str());
+        IM_CHECK_STR_EQ(q.traces[1].label.c_str(), b.label.c_str());
+        IM_CHECK(q.traces[1].channel == 0 && !q.traces[1].filtered && q.traces[1].autoFit);
+        IM_CHECK(!fromLine("S\tkey\thist=10", q));
+        r.traces.clear(); r.unitScale.clear();                        // an empty plot round-trips too
+        IM_CHECK(fromLine(toLine(r), q) && q.traces.empty() && q.unitScale.empty());
+
+        // Raw and filtered of one channel side by side are allowed; the same trace twice is not.
+        IM_CHECK(hasTrace({a}, a.streamKey, 3, true));
+        IM_CHECK(!hasTrace({a}, a.streamKey, 3, false));
+        IM_CHECK(!hasTrace({a}, "other", 3, true));
+    };
+
+    // Combined plot on the demo streams: add Cz of MockEEG (500 Hz) and the chirp of MockChirp
+    // (1 kHz) with the Add popup; disconnect the chirp (its lane stays, as a placeholder) and
+    // connect it again (the lane binds again). Needs LSL_DEMO=1; skips without the streams.
+    t = IM_REGISTER_TEST(e, "combined", "demo_streams");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SleepNoSkip(3.0f, 1.0f / 30.0f);
+        if (ctx->GetWindowByRef("//MockEEG") == nullptr || ctx->GetWindowByRef("//MockChirp") == nullptr) {
+            ctx->LogInfo("MockEEG / MockChirp not present; skipping");
+            return;
+        }
+        ctx->MenuClick("//##MainMenuBar/View/New combined plot");
+        ctx->Yield(3);
+        ImGuiWindow* w = newestCombinedWindow();
+        IM_CHECK_RETV(w != nullptr, );
+        const int id = combinedProbe().id;
+        IM_CHECK(combinedProbe().ticks.empty());
+        ctx->SetRef(w);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo("cfg");
+        IM_CHECK_RETV(cfg.Window != nullptr, );
+        auto add = [&](const char* stream, const char* chan) { combinedAdd(ctx, cfg.Window, stream, chan); };
+        add("MockEEG", "Cz");
+        add("MockChirp", "chirp");
+        ctx->SleepNoSkip(2.0f, 1.0f / 30.0f);
+        CombinedProbeView p = combinedProbe();
+        IM_CHECK_EQ(p.id, id);
+        IM_CHECK_EQ((int)p.ticks.size(), 2);
+        if (p.ticks.size() != 2) return;
+        ctx->LogInfo("lanes: '%s', '%s'", p.ticks[0].c_str(), p.ticks[1].c_str());
+        IM_CHECK_STR_EQ(p.ticks[0].c_str(), "Cz (MockEEG)");
+        IM_CHECK_STR_EQ(p.ticks[1].c_str(), "chirp (MockChirp)");
+        IM_CHECK(p.state[0] >= 0 && p.state[1] >= 0 && p.state[0] != p.state[1]);
+        IM_CHECK_EQ(p.groups, 2);                                      // one read per stream
+        ctx->CaptureScreenshotWindow(w->ID, ImGuiCaptureFlags_HideMouseCursor);
+
+        ctx->WindowClose("//MockChirp");                               // closing the window disconnects
+        ctx->SleepNoSkip(1.0f, 1.0f / 30.0f);
+        p = combinedProbe();
+        IM_CHECK_EQ((int)p.ticks.size(), 2);
+        if (p.ticks.size() != 2) return;
+        IM_CHECK_STR_EQ(p.ticks[1].c_str(), "chirp (MockChirp, not connected)");
+        IM_CHECK_EQ(p.state[1], -1);
+        IM_CHECK(p.state[0] >= 0);
+        IM_CHECK_EQ(p.groups, 1);
+        ctx->CaptureScreenshotWindow(w->ID, ImGuiCaptureFlags_HideMouseCursor);
+
+        lslViewerRequestConnect("mock-chirp");
+        for (int i = 0; i < 300 && combinedProbe().state.size() == 2 && combinedProbe().state[1] < 0; ++i)
+            ctx->SleepNoSkip(0.05f, 1.0f / 30.0f);
+        ctx->SleepNoSkip(1.0f, 1.0f / 30.0f);
+        p = combinedProbe();
+        IM_CHECK(p.state.size() == 2 && p.state[1] >= 0);
+        if (p.ticks.size() == 2) IM_CHECK_STR_EQ(p.ticks[1].c_str(), "chirp (MockChirp)");
+        ctx->WindowFocus(w->ID);                                       // the reconnected stream's tab took focus
+        ctx->Yield(2);
+        ctx->CaptureScreenshotWindow(w->ID, ImGuiCaptureFlags_HideMouseCursor);
+
+        // A 48 kHz trace takes the envelope path on its own; the overlay gives each unit an axis.
+        add("MockAudio", "L");
+        ctx->SleepNoSkip(2.0f, 1.0f / 30.0f);
+        p = combinedProbe();
+        IM_CHECK_EQ((int)p.ticks.size(), 3);
+        IM_CHECK_EQ(p.groups, 3);
+        ctx->CaptureScreenshotWindow(w->ID, ImGuiCaptureFlags_HideMouseCursor);
+        ctx->SetRef(cfg.Window);
+        ctx->ItemOpen("Display");
+        ctx->ItemUncheck("Stacked lanes");
+        ctx->SleepNoSkip(1.0f, 1.0f / 30.0f);
+        ctx->CaptureScreenshotWindow(w->ID, ImGuiCaptureFlags_HideMouseCursor);
+        ctx->ItemCheck("Stacked lanes");
+        ctx->WindowClose(w->ID);
+        ctx->Yield(2);
+    };
+
+    // A combined plot survives a workspace save and load: its trace (raw here) binds again.
+    // Needs LSL_DEMO=1; skips without MockEEG.
+    t = IM_REGISTER_TEST(e, "combined", "workspace");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SleepNoSkip(3.0f, 1.0f / 30.0f);
+        if (ctx->GetWindowByRef("//MockEEG") == nullptr) { ctx->LogInfo("MockEEG not present; skipping"); return; }
+        ctx->MenuClick("//##MainMenuBar/View/New combined plot");
+        ctx->Yield(3);
+        ImGuiWindow* w = newestCombinedWindow();
+        IM_CHECK_RETV(w != nullptr, );
+        ctx->SetRef(w);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo("cfg");
+        IM_CHECK_RETV(cfg.Window != nullptr, );
+        combinedAdd(ctx, cfg.Window, "MockEEG", "Cz");
+        ctx->SetRef(cfg.Window);
+        ctx->ItemClick("**/filt");                                     // the trace shows raw samples
+        ctx->Yield(3);
+        IM_CHECK(combinedProbe().ticks.size() == 1 && combinedProbe().ticks[0] == "Cz (MockEEG, raw)");
+        // Auto-fit on and off: its button is tinted while on, and the push and pop of that tint
+        // must not follow the flag the same click flips (ImGui reports an unbalanced style stack).
+        ctx->ItemClick("**/fit");
+        ctx->Yield(2);
+        ctx->ItemClick("**/fit");
+        ctx->Yield(2);
+
+        ctx->MenuClick("//##MainMenuBar/Workspaces");
+        ctx->SetRef("//$FOCUSED");
+        ctx->ItemInputValue("##wsname", "combined_ws_test");
+        ctx->ItemClick("Save");
+        ctx->WindowClose(w->ID);
+        ctx->Yield(3);
+        IM_CHECK_EQ(combinedProbe().id, 0);                            // no combined plot left
+
+        ctx->MenuClick("//##MainMenuBar/Workspaces");
+        ctx->SetRef("//$FOCUSED");
+        ctx->ItemClick("**/combined_ws_test");
+        ctx->SleepNoSkip(2.0f, 1.0f / 30.0f);
+        const CombinedProbeView p = combinedProbe();
+        IM_CHECK(p.id > 0);
+        IM_CHECK_EQ((int)p.ticks.size(), 1);
+        if (p.ticks.size() == 1) {
+            IM_CHECK_STR_EQ(p.ticks[0].c_str(), "Cz (MockEEG, raw)");
+            IM_CHECK(p.state[0] >= 0);
+        }
+        ctx->MenuClick("//##MainMenuBar/Workspaces");                  // clean up the saved file
+        ctx->SetRef("//$FOCUSED");
+        ctx->ItemClick("**/combined_ws_test/\xc3\x97");
+        ctx->KeyPress(ImGuiKey_Escape);
+        if (ImGuiWindow* w2 = newestCombinedWindow()) ctx->WindowClose(w2->ID);
+        ctx->Yield(2);
+    };
+
+    // Alignment of two streams in a combined plot (design test 4). Both carry a square wave that
+    // rises at the same true times, every 2 s; one is a device running 500 ppm fast that declares
+    // the same 250 Hz. Both stamp the true time, as liblsl does. Without the drift map the fast
+    // stream's edges walk 30 ms a minute; with it, once converged (after the first minute), the
+    // two lanes' rising edges must lie within one sample (4 ms) of each other on the plot's time
+    // axis. Read through a probe of the drawn x axis, not pixels. Four minutes of stamps are sent
+    // at 25x, so the test takes about 10 s. LSL_DRIFT_CORR=0 checks the drift instead.
+    t = IM_REGISTER_TEST(e, "combined", "alignment");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock: LSL runs on the real one
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        const char* env = std::getenv("LSL_DRIFT_CORR");
+        const bool corrected = !(env && std::strcmp(env, "0") == 0);
+        constexpr double kRate = 250.0, kPpm = 500.0, kSpeed = 25.0, kSpan = 240.0, kSettle = 60.0;
+        auto info = [](const char* name, const char* sid) {
+            lsl::stream_info i(name, "Signal", 1, kRate, lsl::cf_float32, sid);
+            i.desc().append_child("channels").append_child("channel").append_child_value("label", "sq");
+            return i;
+        };
+        lsl::stream_outlet ref(info("AlignRef", "aligntest-ref")), fast(info("AlignFast", "aligntest-fast"));
+        lslViewerRequestConnect("aligntest-ref");
+        IM_CHECK_RETV(waitFor([&] { return streamProbe("AlignRef").found && ref.have_consumers(); }, 15.0), );
+        lslViewerRequestConnect("aligntest-fast");
+        IM_CHECK_RETV(waitFor([&] { return streamProbe("AlignFast").found && fast.have_consumers(); }, 15.0), );
+
+        ctx->MenuClick("//##MainMenuBar/View/New combined plot");
+        ctx->Yield(3);
+        ImGuiWindow* w = newestCombinedWindow();
+        IM_CHECK_RETV(w != nullptr, );
+        ctx->SetRef(w);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo("cfg");
+        IM_CHECK_RETV(cfg.Window != nullptr, );
+        combinedAdd(ctx, cfg.Window, "AlignRef", "sq");
+        combinedAdd(ctx, cfg.Window, "AlignFast", "sq");
+        ctx->SetRef(cfg.Window);
+        ctx->ItemClick("**/filt");                       // both raw: the high-pass would bend the steps
+        ctx->ItemClick("**/filt");
+        ctx->Yield(2);
+        IM_CHECK_RETV(combinedProbe().ticks.size() == 2, );
+        // For review: the two lanes overlaid, 3 s wide (a capture is taken near the end).
+        ctx->ItemOpen("Display");
+        ctx->ItemInputValue("History (s)", 3.0f);
+        ctx->ItemUncheck("Stacked lanes");
+        ctx->WindowFocus(w->ID);
+        ctx->MouseMoveToPos(ImVec2(5, 5));
+        bool shot = false;
+
+        // Device sample k of a stream with rate `r` is taken at true time k / r after `base`.
+        const double base = lsl::local_clock();
+        const double rates[2] = {kRate, kRate * (1.0 + kPpm * 1e-6)};
+        lsl::stream_outlet* outs[2] = {&ref, &fast};
+        long long k[2] = {0, 0};
+        std::vector<float> v(5);
+        double lateMax = 0.0, earlyMax = 0.0;
+        int    matched = 0;
+        std::vector<std::vector<double>> edges;
+        const auto wall0 = std::chrono::steady_clock::now();
+        for (;;) {
+            const double virt = kSpeed * std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
+            if (virt > kSpan) break;
+            for (int o = 0; o < 2; ++o)   // chunks of 5, stamped with the newest sample, as liblsl does
+                for (const long long due = (long long)(virt * rates[o]); k[o] + 5 <= due; k[o] += 5) {
+                    for (int i = 0; i < 5; ++i)
+                        v[(std::size_t)i] = std::fmod((double)(k[o] + i) / rates[o], 2.0) < 1.0 ? 1.0f : 0.0f;
+                    outs[o]->push_chunk_multiplexed(v, base + (double)(k[o] + 4) / rates[o]);
+                }
+            ctx->Yield();
+            lslViewerCombinedEdges(edges);
+            if (edges.size() == 2)
+                for (double a : edges[0]) {   // each reference edge against the fast lane's nearest
+                    double best = 1e9;
+                    for (double b : edges[1]) if (std::fabs(b - a) < std::fabs(best)) best = b - a;
+                    if (std::fabs(best) > 0.5) continue;   // that edge is not in the other lane yet
+                    if (virt > kSettle) { lateMax = std::max(lateMax, std::fabs(best)); ++matched; }
+                    else                  earlyMax = std::max(earlyMax, std::fabs(best));
+                }
+            if (!shot && virt > kSpan - 30.0) { ctx->CaptureScreenshotWindow(w->ID, ImGuiCaptureFlags_HideMouseCursor); shot = true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        ctx->LogInfo("alignment %s: before %.0f s up to %.2f ms apart; after, up to %.2f ms (%d edge pairs)",
+                     corrected ? "corrected" : "NOT corrected", kSettle, earlyMax * 1e3, lateMax * 1e3, matched);
+        IM_CHECK_GT(matched, 20);
+        if (corrected) IM_CHECK_LE(lateMax, 1.0 / kRate + 1e-5);   // one sample of the slower stream
+        else           IM_CHECK_GT(lateMax, 20.0 / 1000.0);        // 500 ppm: 30 ms a minute
+
+        ctx->WindowClose(w->ID);
+        ctx->WindowClose("//AlignRef");                  // disconnect before the outlets go
+        ctx->WindowClose("//AlignFast");
+        ctx->Yield(3);
+    };
+
+    // Drag and drop into a combined plot: a channel row of a stream plot onto the empty plot, a
+    // lane label onto the trace list (inserted at that row), and a channel onto a stream plot
+    // (a new combined plot with that stream's enabled channels, then the dropped one). Needs
+    // LSL_DEMO=1; skips without MockEEG.
+    t = IM_REGISTER_TEST(e, "combined", "drag_drop");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        constexpr float uiFreeLeft = 320.0f;   // px of MockEEG's plot (labels included) left uncovered
+        ctx->SleepNoSkip(3.0f, 1.0f / 30.0f);
+        if (ctx->GetWindowByRef("//MockEEG") == nullptr) { ctx->LogInfo("MockEEG not present; skipping"); return; }
+        ctx->MenuClick("//##MainMenuBar/View/New combined plot");
+        ctx->Yield(3);
+        ImGuiWindow* w = newestCombinedWindow();
+        IM_CHECK_RETV(w != nullptr, );
+        ctx->WindowFocus("//MockEEG");
+        ctx->Yield(2);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo("//MockEEG/cfg");
+        ImGuiTestItemInfo plt = ctx->WindowInfo("//MockEEG/plt");
+        IM_CHECK_RETV(cfg.Window != nullptr && plt.Window != nullptr, );
+        // Float it over the right part of MockEEG's plot, so that both are on screen for the drag
+        // and the left part of that plot stays free to drop on.
+        ctx->UndockWindow((std::string("//") + w->Name).c_str());   // absolute: the ref may be a child
+        const ImVec2 wp = ImGui::GetMainViewport()->WorkPos, ws = ImGui::GetMainViewport()->WorkSize;
+        const float  wx = plt.Window->Pos.x + uiFreeLeft;
+        // Set directly: a title-bar drag across the dock space would dock it again.
+        ImGui::SetWindowPos(w->Name, ImVec2(wx, plt.Window->Pos.y + 20.0f));
+        ImGui::SetWindowSize(w->Name, ImVec2(std::max(300.0f, wp.x + ws.x - wx - 10.0f), ws.y * 0.6f));
+        ctx->Yield(2);
+        ctx->WindowFocus("//MockEEG");
+        ctx->Yield(2);
+        ctx->LogInfo("MockEEG plot at x %.0f, combined plot at x %.0f", plt.Window->Pos.x, w->Pos.x);
+        ctx->SetRef(cfg.Window);
+        ctx->ItemOpen("Display");
+        ctx->ItemCheck("Stacked montage");
+        ctx->ItemClose("Display");
+        ctx->ItemOpen("Channels");
+        ctx->Yield(2);
+        auto dragTo = [&](ImVec2 to, const char* shot = nullptr) {
+            ctx->MouseDown(ImGuiMouseButton_Left);
+            ctx->MouseMoveToPos(ImVec2(ImGui::GetIO().MousePos.x + 30.0f, ImGui::GetIO().MousePos.y));
+            ctx->MouseMoveToPos(to);
+            ctx->Yield(2);
+            if (shot) ctx->CaptureScreenshotWindow(shot, 0);   // the drop tooltip, before the release
+            ctx->MouseUp(ImGuiMouseButton_Left);
+            ctx->Yield(3);
+        };
+        auto center = [](ImGuiWindow* win) { return ImVec2(win->Pos.x + win->Size.x * 0.65f, win->Pos.y + win->Size.y * 0.5f); };
+
+        // 1) The "Pz" row of MockEEG's channel list onto the empty combined plot.
+        ctx->SetRef(w);
+        ImGuiTestItemInfo cplt = ctx->WindowInfo("plt");
+        IM_CHECK_RETV(cplt.Window != nullptr, );
+        ctx->SetRef(cfg.Window);
+        ctx->MouseMove("**/Pz");
+        dragTo(center(cplt.Window));
+        CombinedProbeView p = combinedProbe();
+        IM_CHECK_EQ((int)p.ticks.size(), 1);
+        if (!p.ticks.empty()) IM_CHECK_STR_EQ(p.ticks[0].c_str(), "Pz (MockEEG)");
+
+        // 1b) The same from the row's label text, not its box: a label is the larger target.
+        {
+            ctx->MouseMove("**/Cz");   // scrolls the row into view; then aim at its text
+            const ImGuiTestItemInfo cz = ctx->ItemInfo("**/Cz");
+            IM_CHECK_RETV(cz.ID != 0, );
+            ctx->MouseMoveToPos(ImVec2(cz.RectFull.Max.x - 3.0f, cz.RectFull.GetCenter().y));
+            dragTo(center(cplt.Window));
+            p = combinedProbe();
+            IM_CHECK_EQ((int)p.ticks.size(), 2);
+            if (p.ticks.size() == 2) IM_CHECK_STR_EQ(p.ticks[1].c_str(), "Cz (MockEEG)");
+            // A drag must not also toggle the channel it started on.
+            ctx->SetRef(cfg.Window);
+            IM_CHECK(ctx->ItemIsChecked("**/Cz"));
+            // Back to one trace, so the steps below see what they expect.
+            ctx->SetRef(w);
+            ctx->ItemClick("**/$$1/x");
+            ctx->SetRef(cfg.Window);
+            ctx->Yield(2);
+            IM_CHECK_EQ((int)combinedProbe().ticks.size(), 1);
+        }
+
+        // 2) MockEEG's first lane label (Fp1) onto the trace list's first row: inserted before Pz.
+        ctx->MouseMoveToPos(ImVec2(plt.Window->Pos.x + 22.0f, plt.Window->Pos.y + 10.0f + (plt.Window->Size.y - 50.0f) * (0.5f / 16.0f)));
+        ctx->Yield(2);
+        ctx->SetRef(w);
+        ImGuiTestItemInfo row = ctx->ItemInfo("**/MockEEG: Pz");
+        IM_CHECK_RETV(row.ID != 0, );
+        dragTo(row.RectFull.GetCenter());
+        p = combinedProbe();
+        IM_CHECK_EQ((int)p.ticks.size(), 2);
+        if (p.ticks.size() == 2) {
+            IM_CHECK_STR_EQ(p.ticks[0].c_str(), "Fp1 (MockEEG)");
+            IM_CHECK_STR_EQ(p.ticks[1].c_str(), "Pz (MockEEG)");
+        }
+        ctx->CaptureScreenshotWindow(w->ID, ImGuiCaptureFlags_HideMouseCursor);
+        const int firstId = p.id;
+
+        // 3) The "Pz" row onto MockEEG's own plot, with Pz disabled there: a new combined plot,
+        //    MockEEG's enabled channels (all 32 but Pz, as the default enables all) and then Pz.
+        //    MockEEG's plot is unchanged.
+        ctx->WindowFocus("//MockEEG");
+        ctx->Yield(2);
+        ctx->SetRef(cfg.Window);
+        ctx->ItemUncheck("**/Pz");
+        ctx->MouseMove("**/Pz");
+        dragTo(ImVec2(plt.Window->Pos.x + 0.7f * uiFreeLeft, plt.Window->Pos.y + plt.Window->Size.y * 0.5f), "//MockEEG");
+        ctx->Yield(3);
+        p = combinedProbe();
+        IM_CHECK(p.id != firstId);
+        IM_CHECK_EQ((int)p.ticks.size(), 32);
+        if (p.ticks.size() == 32) {
+            IM_CHECK_STR_EQ(p.ticks[0].c_str(), "Fp1 (MockEEG)");
+            IM_CHECK_STR_EQ(p.ticks[31].c_str(), "Pz (MockEEG)");
+        }
+        ctx->WindowFocus("//MockEEG");                 // the new combined plot came up in front
+        ctx->Yield(2);
+        ctx->SetRef(cfg.Window);
+        ctx->ItemCheck("**/Pz");
+        if (ImGuiWindow* w2 = newestCombinedWindow(); w2 && w2 != w) ctx->WindowClose(w2->ID);
+        ctx->WindowClose(w->ID);
+        ctx->Yield(2);
+    };
+
     // Overlay/raw vs stacked/high-pass, driven from the stream's own controls.
     t = IM_REGISTER_TEST(e, "ui", "capture_eeg_plot");
     t->TestFunc = [](ImGuiTestContext* ctx) {
@@ -966,6 +1543,69 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->Yield(3);
         ctx->CaptureScreenshotWindow("//MockEEG", ImGuiCaptureFlags_HideMouseCursor);
         ctx->ItemInputValue("filter", "");   // clear
+    };
+
+    // Channel pagination on a stacked plot: each page's lane labels, the next arrow stopping
+    // on the last page, the corner label wrapping, PgDn on the hovered plot, and disabling
+    // channels clamping the page. Needs MockEEG (demo streams); skips without it.
+    t = IM_REGISTER_TEST(e, "ui", "pages_stacked");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        constexpr int N = 8;
+        PagedPlot pp;
+        if (!pagedPlotSetup(ctx, N, pp)) return;
+        const int C = (int)pp.all.size();
+        if (C <= N) { ctx->LogInfo("only %d channels; skipping", C); pagedPlotRestore(ctx, pp); return; }
+        const int P = (C + N - 1) / N;
+        IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, 0, N));
+        for (int p = 1; p < P; ++p) {
+            ctx->ItemClick("##pgnext");
+            ctx->Yield(3);
+            IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, p * N, p * N + N));
+        }
+        ctx->ItemClick("##pgnext");                              // past the last page: stays
+        ctx->Yield(3);
+        IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, (P - 1) * N, C));
+
+        ctx->SetRef(pp.plt);
+        ctx->ItemClick("##pgcorner");                            // the corner label wraps
+        ctx->Yield(3);
+        IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, 0, N));
+        ctx->MouseMoveToPos(pp.plt->Rect().GetCenter());
+        ctx->KeyPress(ImGuiKey_PageDown);
+        ctx->Yield(3);
+        IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, N, 2 * N));
+        ctx->KeyPress(ImGuiKey_PageUp);
+        ctx->Yield(3);
+        IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, 0, N));
+
+        // Back to the last page, then disable its channels: the page holds while one is
+        // left on it, and clamps to the page before once none is.
+        ctx->SetRef(pp.cfg);
+        for (int p = 1; p < P; ++p) ctx->ItemClick("##pgnext");
+        ctx->Yield(3);
+        ctx->SetRef(ctx->WindowInfo("chsel").Window);
+        for (int c = (P - 1) * N; c < C - 1; ++c) ctx->ItemUncheck(pp.all[c].c_str());
+        ctx->Yield(3);
+        IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, C - 1, C));
+        ctx->ItemUncheck(pp.all[C - 1].c_str());
+        ctx->Yield(3);
+        IM_CHECK(laneTicks(pp.plt) == sliceOf(pp.all, (P - 2) * N, (P - 1) * N));
+
+        pagedPlotRestore(ctx, pp);
+    };
+
+    // A paged stacked plot on its short last page: the corner label, and the empty lane slots
+    // at the bottom that keep the lane height of the full pages.
+    t = IM_REGISTER_TEST(e, "ui", "capture_pages");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        PagedPlot pp;
+        if (!pagedPlotSetup(ctx, 12, pp)) return;
+        const int P = ((int)pp.all.size() + 11) / 12;
+        for (int p = 1; p < P; ++p) ctx->ItemClick("##pgnext");
+        ctx->MouseMoveToPos(ImVec2(ImGui::GetMainViewport()->WorkSize.x - 5.0f, 5.0f));   // no tooltip
+        ctx->SleepNoSkip(1.0f, 1.0f / 30.0f);
+        ctx->CaptureScreenshotWindow("//MockEEG", ImGuiCaptureFlags_HideMouseCursor);
+        pagedPlotRestore(ctx, pp);
     };
 
     // Spectrogram (STFT heatmap). Run with the chirp for a rising diagonal:
@@ -1475,6 +2115,101 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->Yield(3);
     };
 
+    // A device off its nominal rate must not move the ERP. The data stream declares 250 Hz but
+    // runs 500 ppm fast, with a peak 100 ms after each marker; the markers carry the true time.
+    // Without the drift map the peak walks 30 ms a minute; with it, every epoch after the first
+    // minute has its peak within one sample of 100 ms. Ten minutes of stamps are sent at 25x, so
+    // the test takes 24 s. With LSL_DRIFT_CORR=0 it checks the drift instead (the A/B reference).
+    t = IM_REGISTER_TEST(e, "stream", "drift_erp_latency");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock: LSL runs on the real one
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        const char* env = std::getenv("LSL_DRIFT_CORR");
+        const bool corrected = !(env && std::strcmp(env, "0") == 0);
+        constexpr double kRate = 250.0, kPpm = 500.0, kSpeed = 25.0, kSpan = 600.0, kLatency = 0.100;
+        lsl::stream_outlet dout(lsl::stream_info("DriftErpTest", "EEG", 1, kRate, lsl::cf_float32, "drifttest-data"));
+        lsl::stream_outlet mout(lsl::stream_info("DriftErpMarkers", "Markers", 1, lsl::IRREGULAR_RATE,
+                                                 lsl::cf_string, "drifttest-markers"));
+        lslViewerRequestConnect("drifttest-data");
+        IM_CHECK(waitFor([&] { return streamProbe("DriftErpTest").found && dout.have_consumers(); }, 15.0));
+        lslViewerRequestConnect("drifttest-markers");
+        IM_CHECK(waitFor([&] { return mout.have_consumers(); }, 15.0));
+
+        ctx->MenuClick("//##MainMenuBar/View/New ERP (marker average)");
+        ctx->Yield(2);
+        const int id = erpProbe().id;
+        char ref[32];
+        std::snprintf(ref, sizeof ref, "//ERP %d", id);
+        IM_CHECK(ctx->GetWindowByRef(ref) != nullptr);
+        ctx->WindowFocus(ref);
+        ctx->Yield(2);
+        ImGuiTestItemInfo cfg = ctx->WindowInfo((std::string(ref) + "/cfg").c_str());
+        IM_CHECK(cfg.Window != nullptr);
+        ctx->SetRef(cfg.Window);
+        ctx->ComboClick("stream/DriftErpTest");
+        ctx->ComboClick("trigger/DriftErpMarkers");
+        ctx->Yield(2);
+        IM_CHECK_STR_EQ(erpProbe().stream.c_str(), "DriftErpTest");
+        IM_CHECK_STR_EQ(erpProbe().trigger.c_str(), "DriftErpMarkers");
+
+        // True time of device sample k, from `base`: the device makes kRate * (1 + ppm) samples a second.
+        const double base = lsl::local_clock(), devRate = kRate * (1.0 + kPpm * 1e-6);
+        std::vector<double> peaks;                       // true peak times still ahead of the data
+        std::vector<float>  v(5);
+        long long k = 0;
+        double nextMarker = 1.0;
+        double lateLo = 1e9, lateHi = -1e9, firstMs = 0.0, lastMs = 0.0;
+        int lastCount = 0, late = 0;
+        const auto wall0 = std::chrono::steady_clock::now();
+        for (;;) {
+            const double virt = kSpeed * std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
+            if (virt > kSpan) break;
+            for (; nextMarker <= virt; nextMarker += 0.8) {
+                mout.push_sample(std::vector<std::string>{"stim"}, base + nextMarker);
+                peaks.push_back(nextMarker + kLatency);
+            }
+            // Chunks of 5 samples, stamped like liblsl does: the newest sample, the rest back-filled.
+            for (const long long due = (long long)(virt * devRate); k + 5 <= due; k += 5) {
+                for (int i = 0; i < 5; ++i) {
+                    const double tk = (double)(k + i) / devRate;
+                    float y = 0.0f;
+                    for (double tp : peaks) { const double z = (tk - tp) / 0.008; y += 100.0f * (float)std::exp(-0.5 * z * z); }
+                    v[(std::size_t)i] = y;
+                }
+                dout.push_chunk_multiplexed(v, base + (double)(k + 4) / devRate);
+                const double tNow = (double)(k + 4) / devRate;
+                std::erase_if(peaks, [&](double tp) { return tp < tNow - 0.1; });
+            }
+            double ms = 0.0; int count = 0;
+            lslViewerErpLastPeak(ms, count);
+            if (count > lastCount) {
+                if (lastCount == 0) firstMs = ms;
+                lastMs = ms; lastCount = count;
+                if (virt > 60.0) { lateLo = std::min(lateLo, ms); lateHi = std::max(lateHi, ms); ++late; }
+            }
+            ctx->Yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        ctx->LogInfo("drift %s: %d epochs, peak %.1f ms first, %.1f ms last; after 60 s %.1f .. %.1f ms (%d epochs)",
+                     corrected ? "corrected" : "NOT corrected", lastCount, firstMs, lastMs, lateLo, lateHi, late);
+        IM_CHECK_GT(late, 100);
+        if (corrected) {
+            IM_CHECK_LE(lateHi - lateLo, 1000.0 / kRate + 0.01);           // one sample
+            IM_CHECK_LT(std::fabs(0.5 * (lateLo + lateHi) - kLatency * 1000.0), 1000.0 / kRate);
+        } else {
+            IM_CHECK_GT(lateHi - lateLo, 100.0);                            // 500 ppm over 9 min: ~270 ms
+        }
+        ctx->WindowClose(ref);
+        ctx->WindowClose("//DriftErpTest");               // disconnect before the outlets go
+        ctx->Yield(3);
+    };
+
     // The README images in docs/images/, opt-in: LSL_README_SHOTS lists the ones to take, from
     // montage,spectrum,spectrogram,erp,live (unset: the test returns at once). Streams are connected
     // by source_id, not autoconnect, so a stray stream on the network neither shows up as a tab nor
@@ -1582,6 +2317,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
             if (want("montage")) {
                 if (!openHeaders("MockHighDensity", {"Display", "Channels"})) return;
                 ctx->ItemClick("All");
+                ctx->ItemUncheck("Paginate");             // the raster shows every channel at once
                 ctx->ItemCheck("Raster");
                 if (!openHeaders("MockDrift", {"Display", "Channels"})) return;
                 pause(11.0);                              // fill the 10 s history
@@ -1706,6 +2442,145 @@ void RegisterAppTests(ImGuiTestEngine* e) {
     // Run it with LSL_PROFILE=1 LSL_AUTOCONNECT=1 and a heavy sender, e.g.
     //   uv run tools/lsl_test_streams.py --hd-channels 256 --hd-rate 8000
     //   lsl_viewer --tests soak
+    // Frame cost of a combined plot against the stream plots it combines: 4 streams x 16
+    // channels at 500 Hz (published here), as four stream plots tiled over the dock area
+    // (LSL_PERF_COMBINED=streams) or as one combined plot of all 64 channels docked in front of
+    // them (=combined), so the stream plots behind it are not drawn. Control strips hidden.
+    // LSL_PERF_HISTORY sets the time window (s). Runs for LSL_PERF_SOAK seconds (default 15);
+    // profile with LSL_PROFILE=1 / LSL_BENCH=1. Does nothing without LSL_PERF_COMBINED, so the
+    // normal suite is not slower.
+    t = IM_REGISTER_TEST(e, "bench", "combined_vs_streams");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        const char* mode = std::getenv("LSL_PERF_COMBINED");
+        if (!mode) { ctx->LogInfo("LSL_PERF_COMBINED not set; skipping"); return; }
+        const bool   combinedMode = std::strcmp(mode, "combined") == 0;
+        const double secs = std::getenv("LSL_PERF_SOAK") ? std::atof(std::getenv("LSL_PERF_SOAK")) : 15.0;
+        constexpr int kStreams = 4, kCh = 16;
+        constexpr double kRate = 500.0;
+        std::vector<std::unique_ptr<lsl::stream_outlet>> outs;
+        for (int i = 0; i < kStreams; ++i) {
+            char name[32], sid[32];
+            std::snprintf(name, sizeof name, "PerfCombined%c", 'A' + i);
+            std::snprintf(sid, sizeof sid, "perf-combined-%c", 'a' + i);
+            lsl::stream_info info(name, "EEG", kCh, kRate, lsl::cf_float32, sid);
+            lsl::xml_element chns = info.desc().append_child("channels");
+            for (int c = 0; c < kCh; ++c) {
+                char lab[8]; std::snprintf(lab, sizeof lab, "C%02d", c);
+                lsl::xml_element ch = chns.append_child("channel");
+                ch.append_child_value("label", lab);
+                ch.append_child_value("unit", "microvolts");
+            }
+            outs.push_back(std::make_unique<lsl::stream_outlet>(info));
+        }
+        std::atomic<bool> stop{false};
+        std::atomic<std::uint64_t> sent{0};
+        std::thread gen([&] {   // real time, stamped on the local clock like a live device
+            std::mt19937 rng(7);
+            std::normal_distribution<float> noise(0.0f, 5.0f);
+            std::vector<float>  buf;
+            std::vector<double> ts;
+            const double t0 = lsl::local_clock();
+            while (!stop.load()) {
+                const std::uint64_t due = (std::uint64_t)((lsl::local_clock() - t0) * kRate), s0 = sent.load();
+                if (due > s0) {
+                    const std::size_t n = (std::size_t)(due - s0);
+                    buf.resize(n * kCh); ts.resize(n);
+                    for (std::size_t j = 0; j < n; ++j) ts[j] = t0 + (double)(s0 + j) / kRate;
+                    for (int o = 0; o < kStreams; ++o) {
+                        for (std::size_t j = 0; j < n; ++j)
+                            for (int c = 0; c < kCh; ++c)
+                                buf[j * kCh + c] = 20.0f * std::sin(0.0628f * (float)((s0 + j) % 100000) * (float)(1 + c % 4)) + noise(rng);
+                        outs[(std::size_t)o]->push_chunk_multiplexed(buf.data(), ts.data(), n * kCh, true);   // elements, not samples
+                    }
+                    sent = due;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        });
+        struct Join { std::atomic<bool>& stop; std::thread& t; ~Join() { stop = true; if (t.joinable()) t.join(); } } join{stop, gen};
+
+        std::vector<std::string> wins;
+        for (int i = 0; i < kStreams; ++i) {
+            char sid[32], ref[40];
+            std::snprintf(sid, sizeof sid, "perf-combined-%c", 'a' + i);
+            std::snprintf(ref, sizeof ref, "//PerfCombined%c", 'A' + i);
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            while (ctx->GetWindowByRef(ref) == nullptr && std::chrono::steady_clock::now() < until) {
+                lslViewerRequestConnect(sid);
+                for (int k = 0; k < 10; ++k) ctx->Yield();
+            }
+            IM_CHECK_RETV(ctx->GetWindowByRef(ref) != nullptr, );
+            wins.push_back(ref);
+        }
+        // Wall clock: SleepNoSkip advances simulated time, and the data comes in real time.
+        auto allAnchored = [&] {
+            for (const std::string& w : wins) if (!streamProbe(w.c_str() + 2).anchored) return false;
+            return true;
+        };
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (!allAnchored() && std::chrono::steady_clock::now() < until) ctx->Yield();
+        IM_CHECK_RETV(allAnchored(), );
+        const ImVec2 wp = ImGui::GetMainViewport()->WorkPos, ws = ImGui::GetMainViewport()->WorkSize;
+        const ImVec2 a0(wp.x + 300.0f, wp.y + 30.0f), area(ws.x - 310.0f, ws.y - 40.0f);
+        auto place = [&](ImGuiWindow* w, ImVec2 pos, ImVec2 size) {
+            ctx->UndockWindow((std::string("//") + w->Name).c_str());   // absolute: the ref may be a child
+            ImGui::SetWindowPos(w->Name, pos);   // directly: a title-bar drag would dock it again
+            ImGui::SetWindowSize(w->Name, size);
+            ctx->Yield(2);
+        };
+        const char* hist = std::getenv("LSL_PERF_HISTORY");
+        auto hideCfg = [&](ImGuiWindow* w) {
+            ctx->SetRef(w);
+            ImGuiTestItemInfo cfg = ctx->WindowInfo("cfg");
+            if (cfg.Window == nullptr) return;
+            ctx->SetRef(cfg.Window);
+            if (hist) {
+                ctx->ItemOpen("Display");
+                ctx->ItemInputValue("History (s)", (float)std::atof(hist));
+                ctx->ItemClose("Display");
+            }
+            ctx->ItemClick("< hide");
+        };
+        if (combinedMode) {
+            ctx->MenuClick("//##MainMenuBar/View/New combined plot");
+            ctx->Yield(3);
+            ImGuiWindow* w = newestCombinedWindow();
+            IM_CHECK_RETV(w != nullptr, );
+            ctx->SetRef(w);
+            ImGuiTestItemInfo cfg = ctx->WindowInfo("cfg");
+            IM_CHECK_RETV(cfg.Window != nullptr, );
+            for (int i = 0; i < kStreams; ++i) {
+                ctx->SetRef(cfg.Window);
+                ctx->ItemClick("Add...");
+                ctx->SetRef("//$FOCUSED");
+                ctx->ComboClick((std::string("##stream/") + (wins[(std::size_t)i].c_str() + 2)).c_str());
+                ctx->ItemClick("Add all enabled");
+                ctx->Yield(2);
+            }
+            IM_CHECK_EQ((int)combinedProbe().ticks.size(), kStreams * kCh);
+            ctx->SetRef(cfg.Window);
+            ctx->ItemUncheck("**/Paginate");   // all 64 lanes, as the four stream plots show
+            ctx->WindowFocus(w->ID);   // docked with the stream plots, in front of them
+            hideCfg(w);
+        } else {
+            for (int i = 0; i < kStreams; ++i) {
+                ImGuiWindow* w = ctx->GetWindowByRef(wins[(std::size_t)i].c_str());
+                place(w, ImVec2(a0.x + (i % 2) * area.x * 0.5f, a0.y + (i / 2) * area.y * 0.5f),
+                      ImVec2(area.x * 0.5f, area.y * 0.5f));
+                hideCfg(w);
+            }
+        }
+        ctx->MouseMoveToPos(ImVec2(5, 5));
+        ctx->Yield(10);
+        if (std::getenv("LSL_PERF_CAPTURE")) {
+            ctx->CaptureReset();
+            ctx->CaptureScreenshot(ImGuiCaptureFlags_HideMouseCursor);
+        }
+        const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(secs);
+        while (std::chrono::steady_clock::now() < end) ctx->Yield();
+        ctx->LogInfo("published %llu samples per stream", (unsigned long long)sent.load());
+    };
+
     t = IM_REGISTER_TEST(e, "bench", "soak");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         const char* soak = std::getenv("LSL_PERF_SOAK");
@@ -1723,6 +2598,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
             ctx->SetRef(cfg.Window);
             ctx->ItemOpen("Channels");
             ctx->ItemClick("All");
+            ctx->ItemUncheck("Paginate");               // every channel at once, not a page
             ctx->ItemClose("Channels");
             if (std::getenv("LSL_PERF_RASTER")) {
                 ctx->ItemOpen("Display");

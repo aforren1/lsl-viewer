@@ -34,6 +34,7 @@
 
 #include <SDL3/SDL.h>
 
+#include "combined_plot.hpp"
 #include "hf_stream_source.hpp"
 #include "mock_streams.hpp"
 #include "recorder.hpp"
@@ -45,6 +46,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include "fft.hpp"
 #include "heatmap_image.hpp"   // raster / spectrogram / ERP heatmaps as one textured quad
 #include "profiler.hpp"
@@ -239,6 +241,16 @@ template <class Src>
 static std::string streamKeyOf(const Src& s) {
     return !s.sourceId().empty() ? s.sourceId() + "|" + s.name() : s.uid();
 }
+// streamKeyOf(s) == key, without building the key: combined plots resolve every trace by key
+// every frame.
+template <class Src>
+static bool keyMatches(const Src& s, const std::string& key) {
+    const std::string& sid = s.sourceId();
+    if (sid.empty()) return s.uid() == key;
+    const std::string& nm = s.name();
+    return key.size() == sid.size() + 1 + nm.size() && key.compare(0, sid.size(), sid) == 0 &&
+           key[sid.size()] == '|' && key.compare(sid.size() + 1, nm.size(), nm) == 0;
+}
 
 // Per-stream override of the marker-vs-data classification (keyed by stream key). Present = the user
 // explicitly chose (true = marker, false = data); absent = follow the isMarkerStream() default.
@@ -360,13 +372,19 @@ struct PlotScratch {
     std::vector<double>      tvals;   // stacked-mode Y tick positions
     std::vector<const char*> tlabs;   // stacked-mode Y tick labels (-> tstr)
     std::vector<std::string> tstr;    // backing storage for tick labels
-    std::vector<int>         visIdx;  // indices of visible channels
+    std::vector<int>         visIdx;  // indices of plotted channels (the current page when paginating)
+    std::vector<int>         enabledIdx;  // indices of every enabled channel, which pagination slices
     std::vector<MarkerEvent> markers; // merged enabled marker events for this plot
     std::vector<float>       raster;  // channels x pixels p2p image (raster mode)
     std::vector<int>         pmap;    // raster: pixel-column -> summary-bin index
     std::vector<float>       ampScratch;  // reorderable copy for on-demand Auto-gain amplitude
     std::vector<double>      xShared;      // raw-path time axis, built once per frame (same for every channel)
     std::vector<HfStreamSource::BreakMark> breaks;   // replay seek / loop marks in view
+    std::vector<int>         laneSlot;     // drawSourceLanes: lane slot per drawn channel
+    std::vector<float>       laneGain;     // drawSourceLanes: value multiplier per drawn channel
+    std::vector<float>       ampOut;       // drawSourceLanes: measured amplitude per drawn channel
+    std::vector<const char*> legend;       // drawSourceLanes: overlay item label per drawn channel
+    std::vector<std::pair<double, double>> bands;    // dropout intervals in display time
 };
 
 struct DisplayOpts {
@@ -386,6 +404,9 @@ struct DisplayOpts {
     float lineWidth   = 1.0f;   // trace line weight (px)
     std::vector<unsigned char> visible;  // per-channel show flags (sized lazily)
     ImGuiTextFilter            chanFilter;  // pattern filter for the channel list
+    bool  paginate    = true;   // plot the enabled channels one page at a time
+    int   pageSize    = 16;     // channels per page, 1..256
+    int   page        = 0;      // clamped each frame to the current page count
     bool overlayMarkers = false;           // master marker-overlay toggle for this plot (off by default)
     std::unordered_map<std::string, bool> markerOn;  // per-stream (id -> show; absent = on)
     bool cfgShown = true;                  // show the left config strip (else plot is full-width)
@@ -394,6 +415,7 @@ struct DisplayOpts {
     bool  synced      = false;             // pushed our filter/reference state to the source yet?
     bool  autoGainReq = false;             // transient: Auto-gain clicked; measure amplitude this frame (not persisted)
     int   hlLocked    = -1;                // channel whose lane highlight was pinned by a label click (not persisted)
+    int   laneDrag    = -1;                // channel whose lane label the left button went down on (not persisted)
 };
 
 // ---- Workspace (de)serialization: DisplayOpts <-> a compact "k=v ..." payload --
@@ -409,10 +431,11 @@ static std::string serializeOpts(const DisplayOpts& o) {
     char b[320];
     std::snprintf(b, sizeof b,
         "hist=%.3f stk=%d ras=%d gain=%.3f spc=%.3f hp=%d hphz=%.4f no=%d nohz=%.1f "
-        "lp=%d lphz=%.1f ref=%d refc=%d lw=%.2f ovm=%d cfg=%d nch=%zu",
+        "lp=%d lphz=%.1f ref=%d refc=%d lw=%.2f ovm=%d cfg=%d pg=%d pgn=%d pgi=%d nch=%zu",
         o.history, o.stacked ? 1 : 0, o.raster ? 1 : 0, o.gainUv, o.spacing, o.highpass ? 1 : 0,
         o.hpHz, o.notch ? 1 : 0, o.notchHz, o.lowpass ? 1 : 0, o.lpHz, o.refMode, o.refChan,
-        o.lineWidth, o.overlayMarkers ? 1 : 0, o.cfgShown ? 1 : 0, o.visible.size());
+        o.lineWidth, o.overlayMarkers ? 1 : 0, o.cfgShown ? 1 : 0,
+        o.paginate ? 1 : 0, o.pageSize, o.page, o.visible.size());
     std::string s = b;
     s += " vis=";
     for (std::size_t i = 0; i < o.visible.size(); ++i) if (o.visible[i]) { s += std::to_string(i); s += ','; }
@@ -436,6 +459,10 @@ static DisplayOpts parseOpts(const std::string& p) {
     o.lineWidth = (float)wsField(p, "lw",   o.lineWidth);
     o.overlayMarkers = wsField(p, "ovm", 0) != 0;
     o.cfgShown  = wsField(p, "cfg", 1) != 0;
+    // Absent from workspaces saved before pagination existed: those load with it off.
+    o.paginate  = wsField(p, "pg",  0) != 0;
+    o.pageSize  = (int)std::clamp(wsField(p, "pgn", o.pageSize), 1.0, 256.0);
+    o.page      = (int)std::clamp(wsField(p, "pgi", 0), 0.0, 1e6);
     const int nch = (int)wsField(p, "nch", 0);
     if (nch > 0 && nch < 100000) {
         o.visible.assign(nch, 0);
@@ -451,6 +478,40 @@ static DisplayOpts parseOpts(const std::string& p) {
     o.synced = false;   // force the filter/reference state to be re-pushed to the worker
     return o;
 }
+
+// Channel pagination: pages of `pageSize` over the enabled list. An empty list still has one
+// (empty) page, so the page index is always valid.
+static int pageCount(int enabled, int pageSize) {
+    const int n = std::max(1, pageSize);
+    return std::max(1, (enabled + n - 1) / n);
+}
+// Writes the page slice of `enabled` into `out`; returns the clamped page. `out` keeps its
+// capacity, so a steady page size allocates nothing per frame.
+static int pageSlice(const std::vector<int>& enabled, int pageSize, int page, std::vector<int>& out) {
+    const int n     = std::max(1, pageSize);
+    const int total = (int)enabled.size();
+    page = std::clamp(page, 0, pageCount(total, n) - 1);
+    const int b = std::min(total, page * n), e = std::min(total, b + n);
+    out.assign(enabled.begin() + b, enabled.begin() + e);
+    return page;
+}
+#ifdef LSL_VIEWER_TESTS
+int lslViewerPageSlice(const std::vector<int>& enabled, int pageSize, int page, std::vector<int>& out) {
+    return pageSlice(enabled, pageSize, page, out);
+}
+// The workspace payload of a plot with these pagination fields and `nch` channels, all
+// enabled (the longest "vis=" list), and the fields read back from any payload.
+std::string lslViewerSerializePaging(bool paginate, int pageSize, int page, int nch) {
+    DisplayOpts o;
+    o.paginate = paginate; o.pageSize = pageSize; o.page = page;
+    o.visible.assign((std::size_t)nch, 1);
+    return serializeOpts(o);
+}
+void lslViewerParsePaging(const std::string& payload, bool& paginate, int& pageSize, int& page, int& nch) {
+    const DisplayOpts o = parseOpts(payload);
+    paginate = o.paginate; pageSize = o.pageSize; page = o.page; nch = (int)o.visible.size();
+}
+#endif
 
 // Stable per-channel color (by absolute channel index, so a channel keeps its
 // color across stacked/overlay and regardless of which others are selected).
@@ -562,6 +623,52 @@ static void followEdge(EdgeState& e, double target, double feedForward, double u
     }
 }
 
+// Right edge of a plot that shows several streams: "Lock time axes" (all of them) and a
+// combined plot (its own). It follows the least advanced flowing stream's trajectory (see
+// edgeTarget), so none of them shows its wait for the next block as a dropout; that stream's
+// slope is the speed to glide at. Smoothed like a stream's own edge, else the scroll snaps
+// per chunk. Steps `e` only when `step` (not paused); `w` is the window width. Returns the
+// newest data time over the streams (0: none has data yet).
+template <class Held>
+static double groupEdge(std::span<HfStreamSource* const> srcs, EdgeState& e, double w, bool step,
+                        double nowLsl, double edgeDt, const Held& replayHeld) {
+    double gNewest = 0.0, gSpeed = 1.0;
+    double gTarget = std::numeric_limits<double>::infinity();
+    double gUpper  = std::numeric_limits<double>::infinity();   // just behind the least advanced
+    bool   anyLive = false;                 // a stream not held by a replay pause
+    double gDeliv  = 1.0;                   // the fastest flowing stream's delivery speed
+    for (HfStreamSource* s : srcs)
+        if (s->anchored()) {
+            gNewest = std::max(gNewest, s->newestTime());
+            if (replayHeld(*s)) continue;
+            anyLive = true;
+            if (!overdue(*s, 0.5)) {
+                const double nw = s->newestTime();
+                double tgt = nw - edgeLagOf(*s), ff = dataSpeedOf(*s);
+                edgeTarget(*s, nowLsl, tgt, ff);
+                if (tgt < gTarget) { gTarget = tgt; gSpeed = ff; }
+                gUpper = std::min(gUpper, nw - 0.05);
+                gDeliv = std::max(gDeliv, s->deliverySpeed());
+            }
+        }
+    if (!step || gNewest <= 0.0) return gNewest;
+    const bool   flowing = std::isfinite(gTarget);
+    const double target  = flowing ? gTarget : gNewest - 0.15;
+    if (e.pos <= 0.0 || target - e.pos > w) {                           // init / far behind
+        e.pos = target; e.vel = gSpeed;
+    } else if (!anyLive) {                                               // held: no live red
+        e.pos = std::min(e.pos, target + 0.05); e.vel = 0.0;
+    } else if (!flowing) {                                               // all stale: red grows
+        e.vel = 1.0;
+        e.pos = std::min(e.pos + edgeDt, target + w);
+    } else {
+        // As a stream's own edge (see followEdge): never back, never into a live-dropout
+        // strip, and smooth through speed changes.
+        followEdge(e, target, gSpeed, gUpper, edgeDt, kEdgeStiff, edgeAccelOf(gDeliv));
+    }
+    return gNewest;
+}
+
 // Missing-data red, OPAQUE so the hue is identical regardless of what's underneath
 // (time-series plot background vs the spectrogram's dark colormap floor) — they must
 // match across views.
@@ -575,18 +682,13 @@ static constexpr ImU32 kDropoutRed = IM_COL32(200, 45, 45, 255);
 // (use 0 to only fuse exactly-touching spans, avoiding a seam, while still SHOWING any
 // real data between two dropouts rather than masking it). Producer records the gap
 // before publishing samples, so resumed data is never transiently covered by the red.
-// Call inside an active plot, after the data. Spans the full Y extent.
-static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap,
+// Call inside an active plot, after the data. Spans the full Y extent. `iv` is reused.
+static void drawDropoutRed(HfStreamSource& s, std::vector<std::pair<double, double>>& iv,
+                           double extraEnd, double mergeGap,
                            std::uint64_t headFreeze = 0, double frozenEdge = 0.0) {
     const ImPlotRect lim = ImPlot::GetPlotLimits();
-    std::vector<std::pair<double, double>> iv;
-    auto [base, gv] = s.gapSnapshot();    // {folded base offset, recent gaps}, one lock
-    double prior = base;
-    for (auto& g : gv) {
-        const double a = g.first + prior;
-        prior += g.second;
-        iv.push_back({a, a + g.second + extraEnd});   // recorded gap (display time)
-    }
+    s.gapBands(iv);                       // recorded gaps in display time, drift included
+    for (auto& b : iv) b.second += extraEnd;
     // Live edge gap, if the edge ran ahead. A paused display shows the moment it froze: red
     // only where the frozen edge had run past the frozen data, and none beyond that edge when
     // the view is panned or zoomed out (data arriving since is not drawn, but not missing).
@@ -614,18 +716,56 @@ static void drawDropoutRed(HfStreamSource& s, double extraEnd, double mergeGap,
     flush(cs, ce);
 }
 
+// drawDropoutRed's intervals (recorded and live) for a plot that draws them over part of its
+// height: a combined plot paints a stream's dropout over that stream's lanes only. Display
+// time, oldest first, into the reused `iv`.
+static void dropoutIntervals(const HfStreamSource& s, std::uint64_t headFreeze, double frozenEdge,
+                             std::vector<std::pair<double, double>>& iv) {
+    s.gapBands(iv);
+    if (headFreeze) {
+        const double frozen = s.realTime(s.time0() + (double)headFreeze * s.dt());
+        if (frozenEdge - frozen > 0.05) iv.push_back({frozen, frozenEdge});
+    } else {
+        const double live = s.newestTime();
+        const double xMax = ImPlot::GetPlotLimits().X.Max;
+        if (xMax - live > 0.05) iv.push_back({live, xMax});
+    }
+}
+// Fills `iv` between pixel rows yTop and yBot, merging spans that touch (no seam).
+static void fillDropouts(const std::vector<std::pair<double, double>>& iv, float yTop, float yBot, ImU32 col) {
+    if (iv.empty()) return;
+    const ImPlotRect lim = ImPlot::GetPlotLimits();
+    ImDrawList*      dl  = ImPlot::GetPlotDrawList();
+    auto flush = [&](double s0, double s1) {
+        if (s1 < lim.X.Min || s0 > lim.X.Max) return;
+        const double x0 = std::max(s0, lim.X.Min), x1 = std::min(s1, lim.X.Max);
+        if (x1 > x0) dl->AddRectFilled(ImVec2(ImPlot::PlotToPixels(x0, lim.Y.Max).x, yTop),
+                                       ImVec2(ImPlot::PlotToPixels(x1, lim.Y.Max).x, yBot), col);
+    };
+    double cs = iv[0].first, ce = iv[0].second;
+    for (std::size_t i = 1; i < iv.size(); ++i) {
+        if (iv[i].first - ce <= 0.0) ce = std::max(ce, iv[i].second);
+        else { flush(cs, ce); cs = iv[i].first; ce = iv[i].second; }
+    }
+    flush(cs, ce);
+}
+
 // A replay's seeks and loop wraps (see HfStreamSource::markBreak). Blue and dashed, so it
 // reads as neither a marker event (solid, the stream's color) nor missing data (red): the
 // data on each side is complete, it just comes from two different parts of the recording.
 // The label sits at the bottom, clear of the marker labels at the top.
 static constexpr ImU32 kBreakBlue = IM_COL32(70, 160, 255, 255);
-static void drawBreaks(const HfStreamSource& s, std::vector<HfStreamSource::BreakMark>& marks) {
+// Spans the plot's full Y extent, or only [yLo, yHi] (plot units) when given: in a combined
+// plot a break belongs to the lanes of one stream.
+static void drawBreaks(const HfStreamSource& s, std::vector<HfStreamSource::BreakMark>& marks,
+                       double yLo = std::numeric_limits<double>::quiet_NaN(),
+                       double yHi = std::numeric_limits<double>::quiet_NaN()) {
     s.breakTimes(marks);
     if (marks.empty()) return;
     const ImPlotRect lim = ImPlot::GetPlotLimits();
     ImDrawList*      dl  = ImPlot::GetPlotDrawList();
-    const float yTop = ImPlot::PlotToPixels(lim.X.Min, lim.Y.Max).y;
-    const float yBot = ImPlot::PlotToPixels(lim.X.Min, lim.Y.Min).y;
+    const float yTop = ImPlot::PlotToPixels(lim.X.Min, std::isnan(yHi) ? lim.Y.Max : yHi).y;
+    const float yBot = ImPlot::PlotToPixels(lim.X.Min, std::isnan(yLo) ? lim.Y.Min : yLo).y;
     const float lh   = ImGui::GetTextLineHeight();
     const float dash = uiScaled(6.0f), w = uiScaled(2.0f);
     ImPlot::PushPlotClipRect();
@@ -661,8 +801,12 @@ static int laneHighlightRow(DisplayOpts& o, const std::vector<int>& visIdx, int 
     if (ImPlot::IsAxisHovered(ImAxis_Y1)) {
         const int j = (int)std::lround(c0 - ImPlot::GetPlotMousePos(IMPLOT_AUTO, ImAxis_Y1).y);
         if (j >= 0 && j < show) hov = j;
+        // Pinned on release, and only without a drag: a label dragged away carries its channel
+        // to a combined plot (laneDragSource) and leaves the pin alone.
+        const ImGuiIO& io = ImGui::GetIO();
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) o.hlLocked = -1;
-        else if (hov >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        else if (hov >= 0 && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+                 io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < io.MouseDragThreshold * io.MouseDragThreshold)
             o.hlLocked = (o.hlLocked == visIdx[hov]) ? -1 : visIdx[hov];
     }
     if (hov >= 0) return hov;
@@ -684,6 +828,70 @@ static void drawLaneLabelHighlight(const char* label, int c, double c0, int j) {
     dl->AddRectFilled(ImVec2(txt.x - 3.0f, txt.y - 1.0f), ImVec2(xr - 1.0f, txt.y + sz.y + 1.0f),
                       ImGui::ColorConvertFloat4ToU32(col), 3.0f);
     dl->AddText(txt, ImGui::GetColorU32(ImGuiCol_Text), label);
+}
+
+// Page label in the plot's top-right corner, e.g. "17-32 / 58". It says the plot is paged, so
+// a channel that is not shown is not taken for a bug, and it steps pages while the Channels
+// section is closed: a click goes to the next page and wraps after the last. PgUp / PgDn step
+// only the plot under the pointer, so plots that share a time-axis lock keep their own pages.
+// The label is an item over the plot (as an ImPlot drag point is), so a click on it does not
+// also start a pan. Call inside an active plot, after the data; `o.page` is already clamped.
+// Callers skip it with one page: nothing is hidden then, so the label would only be clutter.
+static void drawPageCorner(DisplayOpts& o, int enabled, int pages) {
+    if (ImPlot::IsPlotHovered() && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) o.page = std::min(o.page + 1, pages - 1);
+        if (ImGui::IsKeyPressed(ImGuiKey_PageUp))   o.page = std::max(o.page - 1, 0);
+    }
+    const int b = o.page * o.pageSize;
+    char buf[40];
+    std::snprintf(buf, sizeof buf, "%d-%d / %d", b + 1, std::min(enabled, b + o.pageSize), enabled);
+    const ImVec2 sz  = ImGui::CalcTextSize(buf);
+    const float  pad = uiScaled(4.0f);
+    const ImVec2 pp  = ImPlot::GetPlotPos(), ps = ImPlot::GetPlotSize();
+    const ImRect r(ImVec2(pp.x + ps.x - pad - sz.x - 2.0f * pad, pp.y + pad),
+                   ImVec2(pp.x + ps.x - pad, pp.y + pad + sz.y + pad));
+    // Rooted at the child window, not at ImPlot's item scope, so tests can name it.
+    const ImGuiID id = ImHashStr("##pgcorner", 0, ImGui::GetCurrentWindow()->ID);
+    bool hov = false, held = false;
+    if (ImGui::ItemAdd(r, id) && ImGui::ButtonBehavior(r, id, &hov, &held))
+        o.page = (o.page + 1) % pages;
+    if (hov) ImGui::SetTooltip("next page (PgDn / PgUp with the pointer on the plot)");
+    ImPlot::PushPlotClipRect();
+    ImDrawList* dl = ImPlot::GetPlotDrawList();
+    dl->AddRectFilled(r.Min, r.Max, IM_COL32(0, 0, 0, hov ? 210 : 150), 3.0f);
+    dl->AddText(ImVec2(r.Min.x + pad, r.Min.y + 0.5f * pad), IM_COL32(235, 235, 235, 255), buf);
+    ImPlot::PopPlotClipRect();
+}
+
+// The pager of a plot's control strip: Paginate, the page size, the arrows and the range shown.
+// `noun` names the lanes in the range ("ch 17-32 of 58"); `what` the list ("all 58 enabled").
+static void pagerUi(DisplayOpts& o, int enabled, int pages, const char* noun, const char* what,
+                    const char* tip) {
+    ImGui::Checkbox("Paginate", &o.paginate);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!o.paginate);
+    ImGui::SetNextItemWidth(uiScaled(40));
+    int perPage = o.pageSize;
+    if (ImGui::InputInt("per page", &perPage, 0, 0)) {
+        perPage = std::clamp(perPage, 1, 256);
+        if (perPage != o.pageSize) {
+            o.page     = (o.page * o.pageSize) / perPage;   // keep the first channel on screen on the page
+            o.pageSize = perPage;
+        }
+    }
+    if (ImGui::ArrowButton("##pgprev", ImGuiDir_Left))  o.page = std::max(o.page - 1, 0);
+    ImGui::SameLine();
+    ImGui::Text("%d / %d", o.paginate ? o.page + 1 : 1, o.paginate ? pages : 1);
+    ImGui::SameLine();
+    if (ImGui::ArrowButton("##pgnext", ImGuiDir_Right)) o.page = std::min(o.page + 1, pages - 1);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    const int pageFirst = o.page * o.pageSize;   // after this frame's clicks, unlike `show`
+    if (!o.paginate)       ImGui::TextDisabled("all %d %s", enabled, what);
+    else if (enabled == 0) ImGui::TextDisabled("none %s", what);
+    else                   ImGui::TextDisabled("%s %d-%d of %d", noun, pageFirst + 1,
+                                               std::min(enabled, pageFirst + o.pageSize), enabled);
 }
 
 // Overlay marker events on the current plot as vertical lines + labels. `evs` must be
@@ -759,7 +967,7 @@ static void drawMarkers(const std::vector<MarkerEvent>& evs, bool contrast = fal
 // head). Either way the start is clamped to what's still resident, using THIS ring's own
 // head as the lower bound — so it's correct for any ring (the raw ring and the filtered
 // ring publish their heads at slightly different times). Returns a contiguous pointer
-// (the magic ring guarantees no wrap split) and sets count/start. Shared by fillRaw + FFT.
+// (the magic ring guarantees no wrap split) and sets count/start. Shared by the plots + FFT.
 static const float* readWindow(InterleavedRing& rg, std::uint64_t endHead,
                                std::size_t want, std::size_t& count, std::uint64_t& start) {
     if (endHead == 0) return rg.recent(want, count, start);                 // live edge
@@ -784,16 +992,263 @@ static ImPlotCond fitCond(bool changed) { return changed ? ImPlotCond_Always : I
 // width. Off -> each plot follows its own edge with its own o.history (the pointers are unused).
 struct AxisLock { bool on = false; double* xMin = nullptr; double* xMax = nullptr; float* history = nullptr; };
 
+// Above this many visible line points (samples-in-view x channels) the stacked/overlay
+// views fall back to the min/max envelope; below it they draw the raw trace (which looks
+// better but costs a point per sample). ~200k keeps even a 32 ch x 10 s @ 500 Hz montage
+// on the raw path while still capping audio / high-density streams.
+constexpr double kRawPointBudget = 200000.0;
+
+// How drawSourceLanes draws one source's channels. The spans are indexed like its `chans`.
+struct LaneStyle {
+    bool  stacked   = true;    // lane + value * gain (stacked) or value + slot * spacing (overlay)
+    int   laneCount = 0;       // stacked: slot k is centered at y = laneCount - 1 - k
+    bool  filtered  = false;   // read the display-filter ring and envelope, else the raw ones
+    bool  useEnv    = false;   // the min/max envelope instead of the raw trace (the caller's
+                               // call: the point budget is shared by every source in the plot)
+    float lineWidth = 1.0f;
+    int   hlLane    = -1;      // stacked: highlighted slot (the others dim), -1 none
+    float spacing   = 0.0f;    // overlay: vertical offset per slot
+    ImAxis yAxis    = ImAxis_Y1;
+    std::span<const float>       gain;     // stacked: value multiplier
+    std::span<const float>       center;   // stacked: subtracted before the gain (auto-fit); empty: 0
+    std::span<const int>         color;    // colormap index, also the plot item id
+    std::span<const char* const> legend;   // overlay: item label
+    std::span<float>             amp;      // out, if not empty: robust half-range (Auto gain)
+    std::span<float>             lo, hi;   // out, if not empty: min / max of the values read
+};
+
+// Draws `chans` of `s` into lane slots `lane` of the current plot. The source's window read,
+// x axis and applyGaps (a gap-mutex lock and an O(n) walk) are done once for all of them, so
+// a 32-channel montage does not repeat them 32 times. Call inside an active plot, after its
+// axes are set up. `headFreeze` (0 = live) ends the read at a frozen head while paused.
+static void drawSourceLanes(HfStreamSource& s, std::span<const int> chans, std::span<const int> lane,
+                            const LaneStyle& st, std::uint64_t headFreeze, PlotScratch& sc) {
+    LSL_ZONE("source lanes");
+    if (chans.empty()) return;
+    const int    C  = s.channels();
+    const double dt = s.dt(), t0 = s.time0(), rate = s.srate();
+    const int    B  = s.binSamples();
+    // Paused: anchor the summary read to the bin holding the frozen head.
+    const std::uint64_t endBin = headFreeze ? headFreeze / (std::uint64_t)B : 0;
+    // Samples to read so the data covers the plot's whole x range: from its left limit to the
+    // end of the read (the newest sample, or the frozen head while paused), plus a margin so
+    // the trace runs past the edge. Taken from the actual limits, not the history width: the
+    // edge trails the newest data by up to a block of samples, and a paused plot can be
+    // panned or zoomed out. Capped at the ring, which also bounds the scratch buffers.
+    auto viewSamples = [&]() -> double {
+        const double endIdx = (double)(headFreeze ? headFreeze : s.head());
+        const double idx0   = (s.oldFrameTime(ImPlot::GetPlotLimits().X.Min) - t0) / dt;
+        return std::clamp(endIdx - idx0 + 0.5 * rate, 0.5 * rate, (double)s.ring().capacity());
+    };
+    MinMaxSummary& summ = st.filtered ? s.summaryHp() : s.summary();
+    if (st.yAxis != ImAxis_Y1) ImPlot::SetAxes(ImAxis_X1, st.yAxis);
+
+    // The x axis is the same for every channel; only the y gather differs.
+    int          n    = 0;
+    const float* rawP = nullptr;
+    MinMaxSummary::Span espan;
+    if (st.useEnv) {
+        const std::size_t bins = std::max<std::size_t>(1, (std::size_t)(viewSamples() / B) + 4);
+        espan = summ.span(bins, endBin);
+        n = espan.n;
+        sc.xShared.resize(std::max(n, 0));
+        summ.binTimes(espan, dt, t0, sc.xShared.data());
+        if (n > 0) s.applyGaps(sc.xShared.data(), n);
+    } else {
+        // The raw window resolves the actual waveform when zoomed in: the min/max band can't
+        // (its midline is flat for signals oscillating faster than a bin, e.g. a 40 Hz sine).
+        // The filtered ring holds the full chain's output; both rings share indices (written
+        // in lockstep), so no per-frame filtering or warm-up is needed.
+        InterleavedRing& rg = st.filtered ? s.ringHp() : s.ring();
+        const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples(), rg.capacity());
+        std::size_t   count = 0;
+        std::uint64_t start = 0;
+        rawP = readWindow(rg, headFreeze, want, count, start);
+        n    = (int)count;
+        sc.xShared.resize(std::max(n, 0));
+        for (int j = 0; j < n; ++j)
+            sc.xShared[j] = t0 + (double)(start + (std::size_t)j) * dt;  // double: absolute LSL time
+        if (n > 0) s.applyGaps(sc.xShared.data(), n);
+    }
+
+    for (std::size_t k = 0; k < chans.size(); ++k) {
+        const int   c     = chans[k];
+        const int   col   = st.color[k];
+        const int   slot  = lane[k];
+        const bool  hl    = st.hlLane >= 0 && slot == st.hlLane;
+        const bool  dim   = st.hlLane >= 0 && !hl;   // fade the rest so the highlight reads
+        const float laneY = (float)(st.laneCount - 1 - slot);
+        if (st.useEnv) {
+            LSL_ZONE("envelope");
+            sc.mn.resize(n); sc.mx.resize(n);
+            summ.binValues(espan, c, sc.mn.data(), sc.mx.data());
+            if (!st.amp.empty() && n > 0) {              // measure amplitude only on request
+                sc.ampScratch.resize(n);
+                for (int i = 0; i < n; ++i) sc.ampScratch[i] = 0.5f * (float)(sc.mx[i] - sc.mn[i]);
+                const int q = std::min(n - 1, (int)(0.8 * n));
+                std::nth_element(sc.ampScratch.begin(), sc.ampScratch.begin() + q, sc.ampScratch.begin() + n);
+                st.amp[k] = sc.ampScratch[q];
+            }
+            if (!st.lo.empty() && n > 0) {
+                double a = sc.mn[0], b = sc.mx[0];
+                for (int i = 1; i < n; ++i) { a = std::min(a, sc.mn[i]); b = std::max(b, sc.mx[i]); }
+                st.lo[k] = (float)a; st.hi[k] = (float)b;
+            }
+            if (st.stacked) {
+                const float g = st.gain[k];
+                if (st.center.empty()) {
+                    for (int i = 0; i < n; ++i) {
+                        sc.mn[i] = laneY + sc.mn[i] * g;
+                        sc.mx[i] = laneY + sc.mx[i] * g;
+                    }
+                } else {
+                    const double m = st.center[k];
+                    for (int i = 0; i < n; ++i) {
+                        sc.mn[i] = laneY + (sc.mn[i] - m) * g;
+                        sc.mx[i] = laneY + (sc.mx[i] - m) * g;
+                    }
+                }
+                char id[12]; std::snprintf(id, sizeof(id), "##b%d", col);
+                ImPlotSpec sp = bandSpec(col);
+                if (hl)       sp.FillAlpha = 0.9f;
+                else if (dim) sp.FillAlpha = 0.2f;
+                ImPlot::PlotShaded(id, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, sp);
+            } else {
+                const float yoff = (float)slot * st.spacing;
+                if (yoff != 0.0f) for (int i = 0; i < n; ++i) { sc.mn[i] += yoff; sc.mx[i] += yoff; }
+                ImPlot::PlotShaded(st.legend[k], sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, bandSpec(col));
+            }
+        } else {
+            LSL_ZONE("raw");
+            sc.y.resize(std::max(n, 0));
+            for (int j = 0; j < n; ++j) sc.y[j] = rawP[(std::size_t)j * (std::size_t)C + c];
+            if (!st.amp.empty() && n > 0) {              // robust half-range from raw samples
+                sc.ampScratch.resize(n);
+                for (int i = 0; i < n; ++i) sc.ampScratch[i] = (float)sc.y[i];
+                const int qlo = std::clamp((int)(0.1 * n), 0, n - 1);
+                const int qhi = std::clamp((int)(0.9 * n), 0, n - 1);
+                std::nth_element(sc.ampScratch.begin(), sc.ampScratch.begin() + qlo, sc.ampScratch.begin() + n);
+                const float ylo = sc.ampScratch[qlo];
+                std::nth_element(sc.ampScratch.begin() + qlo, sc.ampScratch.begin() + qhi, sc.ampScratch.begin() + n);
+                st.amp[k] = 0.5f * (sc.ampScratch[qhi] - ylo);
+            }
+            if (!st.lo.empty() && n > 0) {
+                double a = sc.y[0], b = sc.y[0];
+                for (int i = 1; i < n; ++i) { a = std::min(a, sc.y[i]); b = std::max(b, sc.y[i]); }
+                st.lo[k] = (float)a; st.hi[k] = (float)b;
+            }
+            if (st.stacked) {
+                const float g = st.gain[k];
+                if (st.center.empty()) {
+                    for (int i = 0; i < n; ++i) sc.y[i] = laneY + sc.y[i] * g;
+                } else {
+                    const double m = st.center[k];
+                    for (int i = 0; i < n; ++i) sc.y[i] = laneY + (sc.y[i] - m) * g;
+                }
+                char id[12]; std::snprintf(id, sizeof(id), "##l%d", col);
+                ImPlotSpec sp = lineSpec(col, hl ? 2.0f * st.lineWidth : st.lineWidth);
+                if (dim) sp.LineColor.w = 0.3f;
+                ImPlot::PlotLine(id, sc.xShared.data(), sc.y.data(), n, sp);
+            } else {
+                const float yoff = (float)slot * st.spacing;
+                if (yoff != 0.0f) for (int i = 0; i < n; ++i) sc.y[i] += yoff;
+                ImPlot::PlotLine(st.legend[k], sc.xShared.data(), sc.y.data(), n, lineSpec(col, st.lineWidth));
+            }
+        }
+    }
+    if (st.yAxis != ImAxis_Y1) ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
+}
+
+// ---- Markers: overlay event lines from selected marker streams (a plot's "Markers" section).
+static void markerOverlayUi(DisplayOpts& o, const std::vector<MarkerStreamView>& markerViews) {
+    if (!markerViews.empty() && ImGui::CollapsingHeader("Markers")) {
+        ImGui::Checkbox("Overlay markers", &o.overlayMarkers);
+        ImGui::BeginDisabled(!o.overlayMarkers);
+        for (const auto& mv : markerViews) {
+            bool on = o.markerOn.count(mv.id) ? o.markerOn[mv.id] : true;  // default on
+            // Scope by the stream's stable id: the label is the (user-chosen) stream name, which
+            // can collide with this section's own widgets — e.g. a stream literally named
+            // "Markers" would share the "Markers" header's ID — or with another same-named stream.
+            ImGui::PushID(mv.id.c_str());
+            ImGui::PushStyleColor(ImGuiCol_Text, mv.col);
+            if (ImGui::Checkbox(mv.name.c_str(), &on)) o.markerOn[mv.id] = on;
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::EndDisabled();
+    }
+}
+// Merge the enabled streams' events into one time-sorted list for decluttered
+// drawing (mv.events points into the MarkerSource's cache, which outlives this call).
+static void mergeMarkers(DisplayOpts& o, const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
+    sc.markers.clear();
+    if (o.overlayMarkers) {
+        for (std::size_t vi = 0; vi < markerViews.size(); ++vi) {
+            const auto& mv = markerViews[vi];
+            const bool on = o.markerOn.count(mv.id) ? o.markerOn[mv.id] : true;
+            if (!on) continue;
+            for (const auto& e : *mv.events)           // stable row from event seq (+stream offset)
+                sc.markers.push_back({e.t, &e.text, mv.col, (int)((e.seq + vi) % kMarkerRows)});
+        }
+        std::sort(sc.markers.begin(), sc.markers.end(),
+                  [](const MarkerEvent& a, const MarkerEvent& b) { return a.t < b.t; });
+    }
+}
+
+// ---- Drag and drop of channels into combined plots ----------------------------------------
+// The payload names the stream by key, not by pointer: a drag lasts several frames, and the
+// stream can disconnect meanwhile. Fixed size, as ImGui copies it.
+struct ChannelDrag { char key[480]; int channel; };
+static constexpr const char* kChannelDrag = "LSL_CHANNEL";
+static void setChannelDrag(const HfStreamSource& s, int c) {
+    ChannelDrag d{};
+    std::snprintf(d.key, sizeof d.key, "%s", streamKeyOf(s).c_str());   // while dragging only
+    d.channel = c;
+    ImGui::SetDragDropPayload(kChannelDrag, &d, sizeof d);
+    const auto& labels = s.labels();
+    ImGui::Text("%s (%s)", c >= 0 && c < (int)labels.size() ? labels[(std::size_t)c].c_str() : "?", s.name().c_str());
+}
+static const ChannelDrag* acceptChannelDrag() {
+    const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kChannelDrag);
+    return (p && p->DataSize == (int)sizeof(ChannelDrag)) ? (const ChannelDrag*)p->Data : nullptr;
+}
+// A stream plot's lane label as a drag source. ImPlot tick labels are not ImGui items, so the
+// source is made by hand from laneHighlightRow's hit test: a left press on a label arms it,
+// and a drag while the button stays down carries that channel. Call after the Y ticks are set.
+static void laneDragSource(const HfStreamSource& s, DisplayOpts& o, const std::vector<int>& visIdx, int show, double c0) {
+    if (ImPlot::IsAxisHovered(ImAxis_Y1) && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        const int j = (int)std::lround(c0 - ImPlot::GetPlotMousePos(IMPLOT_AUTO, ImAxis_Y1).y);
+        o.laneDrag = (j >= 0 && j < show) ? visIdx[(std::size_t)j] : -1;
+    }
+    if (o.laneDrag < 0) return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) { o.laneDrag = -1; return; }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceExtern)) {
+        setChannelDrag(s, o.laneDrag);
+        ImGui::EndDragDropSource();
+    }
+}
+// A channel dropped on a stream plot leaves that plot as it is; the main loop opens a combined
+// plot with the stream's enabled channels and then the dropped one.
+struct StreamDrop { bool pending = false; std::string targetKey; ChannelDrag drag{}; };
+static StreamDrop g_streamDrop;
+static void streamPlotDropTarget(const HfStreamSource& s) {
+    const ImGuiPayload* cur = ImGui::GetDragDropPayload();
+    if (cur == nullptr || !cur->IsDataType(kChannelDrag) || !ImPlot::BeginDragDropTargetPlot()) return;
+    if (const ChannelDrag* d = acceptChannelDrag()) {
+        g_streamDrop.pending   = true;
+        g_streamDrop.targetKey = streamKeyOf(s);
+        g_streamDrop.drag      = *d;
+    } else {
+        ImGui::SetTooltip("Drop to open a combined plot");
+    }
+    ImPlot::EndDragDropTarget();
+}
+
 static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool followX,
                        std::uint64_t headFreeze, const AxisLock& lock,
                        const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
     LSL_ZONE("drawStream");
     const float kCfgWidth = uiScaled(230.0f);
-    // Above this many visible line points (samples-in-view x channels) the stacked/overlay
-    // views fall back to the min/max envelope; below it they draw the raw trace (which looks
-    // better but costs a point per sample). ~200k keeps even a 32 ch x 10 s @ 500 Hz montage
-    // on the raw path while still capping audio / high-density streams.
-    constexpr double kRawPointBudget = 200000.0;
 
     const std::string err = s.error();
     if (!err.empty())
@@ -819,18 +1274,29 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     const auto& units  = s.units();
     const char* streamUnit = "a.u.";           // representative unit for labels
     for (auto& u : units) if (!u.empty()) { streamUnit = u.c_str(); break; }
-    if ((int)o.visible.size() != C) {          // default: first 16 channels visible
-        o.visible.assign(C, 0);
-        for (int c = 0; c < std::min(C, 16); ++c) o.visible[c] = 1;
+    // Default: every channel enabled. Pagination (on by default) keeps a wide stream readable
+    // without hiding channels the user would have to find and enable by hand.
+    if ((int)o.visible.size() != C) {
+        o.visible.assign(C, 1);
+        o.page = 0;                            // a page of another channel list means nothing here
+        o.pageSize = std::clamp(C, 1, 16);     // a narrow stream shows as one page, at full height
     }
     std::vector<float>& gain = s.chanGain();
     std::vector<float>& amp  = s.chanAmp();
 
-    // Visible-channel index list — needed by both the config UI and the plot, so
+    // Plotted-channel index list — needed by both the config UI and the plot, so
     // compute it before the (collapsible) config strip.
-    sc.visIdx.clear();
-    for (int c = 0; c < C; ++c) if (o.visible[c]) sc.visIdx.push_back(c);
+    sc.enabledIdx.clear();
+    for (int c = 0; c < C; ++c) if (o.visible[c]) sc.enabledIdx.push_back(c);
+    const int enabled = (int)sc.enabledIdx.size();
+    const int pages   = pageCount(enabled, o.pageSize);
+    if (o.paginate) o.page = pageSlice(sc.enabledIdx, o.pageSize, o.page, sc.visIdx);
+    else            sc.visIdx.assign(sc.enabledIdx.begin(), sc.enabledIdx.end());
     const int show = (int)sc.visIdx.size();
+    // Lane slots: a short last page keeps the full page's lane height (empty slots at the
+    // bottom), so a signal does not look larger on it than on the pages before. With one page
+    // there is nothing to match, so fewer enabled channels than a page fill the plot.
+    const int slots = o.paginate ? std::min(o.pageSize, enabled) : show;
 
     // ---- left column: config (collapsible so the plot can go full-width) ----
     if (!o.cfgShown) {
@@ -949,11 +1415,17 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::SetTooltip(filtering ? "deselect channels matching the filter"
                                         : "deselect all channels");
         o.chanFilter.Draw("filter", 140.0f);       // own line; e.g. "Cz" or "Cz,Pz" or "-EOG"
+        // Pages slice the enabled channels only; the filter above just narrows the list below.
+        pagerUi(o, enabled, pages, "ch", "enabled", "plot the enabled channels one page at a time");
         ImGui::BeginChild("chsel", ImVec2(0, uiScaled(120)), ImGuiChildFlags_Borders);
         for (int c = 0; c < C; ++c) {
             if (!pass(c)) continue;
             bool on = o.visible[c] != 0;
             if (ImGui::Checkbox(labels[c].c_str(), &on)) o.visible[c] = on ? 1 : 0;
+            if (ImGui::BeginDragDropSource()) {   // drag into a combined plot
+                setChannelDrag(s, c);
+                ImGui::EndDragDropSource();
+            }
         }
         ImGui::EndChild();
     }
@@ -974,23 +1446,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             ImGui::PopID();
         }
     }
-    // ---- Markers: overlay event lines from selected marker streams ----------
-    if (!markerViews.empty() && ImGui::CollapsingHeader("Markers")) {
-        ImGui::Checkbox("Overlay markers", &o.overlayMarkers);
-        ImGui::BeginDisabled(!o.overlayMarkers);
-        for (const auto& mv : markerViews) {
-            bool on = o.markerOn.count(mv.id) ? o.markerOn[mv.id] : true;  // default on
-            // Scope by the stream's stable id: the label is the (user-chosen) stream name, which
-            // can collide with this section's own widgets — e.g. a stream literally named
-            // "Markers" would share the "Markers" header's ID — or with another same-named stream.
-            ImGui::PushID(mv.id.c_str());
-            ImGui::PushStyleColor(ImGuiCol_Text, mv.col);
-            if (ImGui::Checkbox(mv.name.c_str(), &on)) o.markerOn[mv.id] = on;
-            ImGui::PopStyleColor();
-            ImGui::PopID();
-        }
-        ImGui::EndDisabled();
-    }
+    markerOverlayUi(o, markerViews);
     // ---- Info / health: stream metadata + live delivery quality -------------
     if (ImGui::CollapsingHeader("Info")) {
         const ImVec4 warn(1.0f, 0.6f, 0.2f, 1.0f);
@@ -1033,8 +1489,9 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             if (meas > 0.0) {
                 const double pct = (nom > 0.0) ? (meas - nom) / nom * 100.0 : 0.0;
                 const bool bad = std::fabs(pct) > 5.0;
+                // Three decimals: a crystal a few ppm off shows only there.
                 ImGui::TextColored(bad ? warn : ImGui::GetStyleColorVec4(ImGuiCol_Text),
-                                   "measured: %.1f Hz (%+.2f%%)", meas, pct);
+                                   "measured: %.3f Hz (%+.2f%%)", meas, pct);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Samples per second of the stream's own timestamps, over the last 5 s.\n"
                                       "Missing samples or a device off its declared rate show here.\n"
@@ -1053,25 +1510,32 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         ImGui::Text("clock offset: %+.2f ms", s.clockOffset() * 1000.0);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("LSL time_correction (remote -> local clock)");
+        if (!s.irregular()) {
+            if (!s.driftEnabled()) {
+                ImGui::TextDisabled("drift correction: off");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("LSL_DRIFT_CORR=0: sample i is drawn at t0 + i / nominal rate.");
+            } else {
+                ImGui::Text("drift correction: %+.1f ppm, %+.2f ms", s.driftPpm(), s.driftMs());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("The time axis follows the stream's own timestamps, mapped to the\n"
+                                      "local clock: the rate correction now applied, and the total\n"
+                                      "correction at the newest sample. Times already drawn never move.");
+                if (s.driftMismatch()) {
+                    ImGui::TextColored(warn, "rate mismatch: not followed");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("The timestamps advance at a rate far from the nominal rate (for\n"
+                                          "example, a replay with timestamps scaled by its speed). The time\n"
+                                          "axis keeps its last rate correction and does not follow them.");
+                }
+            }
+        }
         ImGui::Text("dropouts: %llu", (unsigned long long)s.dropouts());
         const double st = s.staleSeconds();
         if (overdue(s, 0.5)) ImGui::TextColored(warn, "no data for %.1f s", st);
     }
 
-    // Merge the enabled streams' events into one time-sorted list for decluttered
-    // drawing (mv.events points into the MarkerSource's cache, which outlives this call).
-    sc.markers.clear();
-    if (o.overlayMarkers) {
-        for (std::size_t vi = 0; vi < markerViews.size(); ++vi) {
-            const auto& mv = markerViews[vi];
-            const bool on = o.markerOn.count(mv.id) ? o.markerOn[mv.id] : true;
-            if (!on) continue;
-            for (const auto& e : *mv.events)           // stable row from event seq (+stream offset)
-                sc.markers.push_back({e.t, &e.text, mv.col, (int)((e.seq + vi) % kMarkerRows)});
-        }
-        std::sort(sc.markers.begin(), sc.markers.end(),
-                  [](const MarkerEvent& a, const MarkerEvent& b) { return a.t < b.t; });
-    }
+    mergeMarkers(o, markerViews, sc);
 
     ImGui::EndChild();  // cfg
     ImGui::SameLine();
@@ -1094,12 +1558,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     const int    B  = s.binSamples();
     // Paused: anchor the summary read to the bin holding the frozen head.
     const std::uint64_t endBin = headFreeze ? headFreeze / (std::uint64_t)B : 0;
-    // Samples to read so the data covers the plot's whole x range: from its left limit to the
-    // end of the read (the newest sample, or the frozen head while paused), plus a margin so
-    // the trace runs past the edge. Taken from the actual limits, not the history width: the
-    // edge trails the newest data by up to a block of samples, and a paused plot can be
-    // panned or zoomed out. Capped at the ring, which also bounds the scratch buffers.
-    // Only valid inside the plot (after its axes are set up), where every read happens.
+    // The raster reads the plot's whole x range, as drawSourceLanes does. Only valid inside
+    // the plot (after its axes are set up).
     auto viewSamples = [&]() -> double {
         const double endIdx = (double)(headFreeze ? headFreeze : s.head());
         const double idx0   = (s.oldFrameTime(ImPlot::GetPlotLimits().X.Min) - t0) / dt;
@@ -1110,38 +1570,6 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
     MinMaxSummary& summ = filtered ? s.summaryHp() : s.summary();
     auto envelopeBins = [&]() {
         return std::max<std::size_t>(1, (std::size_t)(viewSamples() / B) + 4);
-    };
-
-    // Fill xs (real time) + ys (raw, or high-pass filtered on the fly) for one
-    // channel over the visible window. Used when zoomed in enough to resolve the
-    // actual waveform — the min/max band can't (its midline is flat for signals
-    // oscillating faster than a bin, e.g. a 40 Hz sine).
-    // The raw window and its real-time x axis are identical for every channel in a plot; only
-    // the y gather differs. Build the window read + x axis + applyGaps (a gap-mutex lock and an
-    // O(n) walk) ONCE per frame and reuse, so a 32-channel montage doesn't repeat them 32x.
-    int          rawVis   = -1;      // <0 until built this frame; 0 = no data
-    const float* rawP     = nullptr;
-    std::uint64_t rawStart = 0;
-    // Returns the sample count; the x axis is sc.xShared (shared by every channel, so not copied).
-    auto fillRaw = [&](int c, std::vector<double>& ys) -> int {
-        if (rawVis < 0) {
-            // Read the pre-filtered ring when the display filter is on (full chain:
-            // high-pass -> notch -> low-pass), else the raw ring. Both rings share indices
-            // (written in lockstep), so no per-frame filtering or warm-up is needed.
-            InterleavedRing& rg = filtered ? s.ringHp() : s.ring();
-            const std::size_t want = std::min<std::size_t>((std::size_t)viewSamples(), rg.capacity());
-            std::size_t count = 0;
-            rawP   = readWindow(rg, headFreeze, want, count, rawStart);
-            rawVis = (int)count;
-            sc.xShared.resize(std::max(rawVis, 0));
-            for (int j = 0; j < rawVis; ++j)
-                sc.xShared[j] = t0 + (double)(rawStart + (std::size_t)j) * dt;  // double: absolute LSL time
-            if (rawVis > 0) s.applyGaps(sc.xShared.data(), rawVis);
-        }
-        if (rawVis <= 0) return 0;
-        ys.resize(rawVis);
-        for (int j = 0; j < rawVis; ++j) ys[j] = rawP[(std::size_t)j * (std::size_t)C + c];
-        return rawVis;
     };
 
     // Pixel-snap the scrolling right edge (using last frame's plot width) so the
@@ -1167,7 +1595,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             setupTimeAxisX();
             if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
             else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, (double)show, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, (double)(show - slots), (double)show, ImPlotCond_Always);
             sc.tvals.resize(show); sc.tlabs.resize(show); sc.tstr.resize(show);
             for (int j = 0; j < show; ++j) {                  // channel names at row centers
                 sc.tvals[j] = (double)show - 0.5 - (double)j;  // row j (0 = top = first visible)
@@ -1176,6 +1604,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             }
             ImPlot::SetupAxisTicks(ImAxis_Y1, sc.tvals.data(), show, sc.tlabs.data());
             const double hlC0  = (double)show - 0.5;
+            laneDragSource(s, o, sc.visIdx, show, hlC0);
             const int    hlRow = laneHighlightRow(o, sc.visIdx, show, hlC0);
             const int px = std::max(64, (int)ImPlot::GetPlotSize().x);
             o.lastPlotPx = ImPlot::GetPlotSize().x;
@@ -1219,7 +1648,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                 ImPlot::PushColormap(ImPlotColormap_Plasma);
                 heat::plotValues("##r", sc.raster.data(), show, px, 0.0, 1.0,
                                  ImPlotPoint(bMin, 0.0), ImPlotPoint(bMax, (double)show));
-                drawDropoutRed(s, 0.0, 0.0, headFreeze, edge);
+                drawDropoutRed(s, sc.bands, 0.0, 0.0, headFreeze, edge);
                 drawBreaks(s, sc.breaks);
                 if (hlRow >= 0) {   // a heatmap row can't be dimmed per-row, so outline it instead
                     const double yc = hlC0 - hlRow;
@@ -1231,6 +1660,8 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                     drawLaneLabelHighlight(sc.tlabs[hlRow], sc.visIdx[hlRow], hlC0, hlRow);
                 }
                 drawMarkers(sc.markers, /*contrast=*/true);   // over the heatmap fill
+                if (o.paginate && pages > 1) drawPageCorner(o, enabled, pages);
+                streamPlotDropTarget(s);
                 ImPlot::EndPlot();
                 ImGui::SameLine();
                 ImPlot::ColormapScale("p2p", 0.0, (double)o.gainUv, ImVec2(60, -1), "%.0f");
@@ -1250,7 +1681,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             setupTimeAxisX();
             if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
             else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -0.6, (double)show - 0.4, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, (double)(show - slots) - 0.6, (double)show - 0.4, ImPlotCond_Always);
 
             // Y ticks at lane centers labelled with channel names (top = first
             // visible). Append "(Gx)" when scaled, so the display stays honest.
@@ -1269,6 +1700,7 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             }
             ImPlot::SetupAxisTicks(ImAxis_Y1, sc.tvals.data(), show, sc.tlabs.data());
             const double hlC0  = (double)(show - 1);
+            laneDragSource(s, o, sc.visIdx, show, hlC0);
             const int    hlRow = laneHighlightRow(o, sc.visIdx, show, hlC0);
             if (hlRow >= 0) {   // faint lane band under the traces + tinted label
                 const ImPlotRect lim = ImPlot::GetPlotLimits();
@@ -1292,69 +1724,27 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
             // ribbon for noise. The visible range (not the whole history) is what's measured, so
             // zooming in also drops to raw. Live, the visible range == history.
             const double visSamples = ImPlot::GetPlotLimits().X.Size() * rate;
-            const bool   useEnv = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
             const float  inv    = (o.gainUv > 0.0f) ? 1.0f / o.gainUv : 0.0f;
-            const std::size_t bins = envelopeBins();
-            // Envelope path: the bin span and its time axis are the same for every channel, and
-            // applyGaps (a gap-mutex lock + O(n) walk) would otherwise run per channel. Resolve
-            // the span + build the shared x + apply gaps ONCE here, then per channel read only
-            // its min/max (binValues). Raw path does the analogous hoist inside fillRaw.
-            MinMaxSummary::Span espan;
-            if (useEnv) {
-                espan = summ.span(bins, endBin);
-                sc.xShared.resize(std::max(espan.n, 0));
-                summ.binTimes(espan, dt, t0, sc.xShared.data());
-                if (espan.n > 0) s.applyGaps(sc.xShared.data(), espan.n);
+            sc.laneSlot.resize(show); sc.laneGain.resize(show);
+            for (int j = 0; j < show; ++j) { sc.laneSlot[j] = j; sc.laneGain[j] = gain[sc.visIdx[j]] * inv; }
+            LaneStyle st;
+            st.laneCount = show;
+            st.filtered  = filtered;
+            st.useEnv    = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
+            st.lineWidth = o.lineWidth;
+            st.hlLane    = hlRow;
+            st.gain      = sc.laneGain;
+            st.color     = sc.visIdx;
+            if (o.autoGainReq) {   // a lane with no data keeps its last measurement
+                sc.ampOut.resize(show);
+                for (int j = 0; j < show; ++j) sc.ampOut[j] = amp[sc.visIdx[j]];
+                st.amp = sc.ampOut;
             }
-            for (int j = 0; j < show; ++j) {
-                const int   c    = sc.visIdx[j];
-                const float lane = (float)(show - 1 - j);
-                const float g    = gain[c] * inv;
-                const bool  dim  = hlRow >= 0 && j != hlRow;   // fade the rest so the highlight reads
-                if (useEnv) {
-                    LSL_ZONE("envelope");
-                    const int n = espan.n;
-                    sc.mn.resize(n); sc.mx.resize(n);
-                    summ.binValues(espan, c, sc.mn.data(), sc.mx.data());
-                    if (o.autoGainReq && n > 0) {                // measure amplitude only on request
-                        sc.ampScratch.resize(n);
-                        for (int i = 0; i < n; ++i) sc.ampScratch[i] = 0.5f * (float)(sc.mx[i] - sc.mn[i]);
-                        const int k = std::min(n - 1, (int)(0.8 * n));
-                        std::nth_element(sc.ampScratch.begin(), sc.ampScratch.begin() + k, sc.ampScratch.begin() + n);
-                        amp[c] = sc.ampScratch[k];
-                    }
-                    for (int i = 0; i < n; ++i) {
-                        sc.mn[i] = lane + sc.mn[i] * g;
-                        sc.mx[i] = lane + sc.mx[i] * g;
-                    }
-                    char id[12]; std::snprintf(id, sizeof(id), "##b%d", c);
-                    ImPlotSpec sp = bandSpec(c);
-                    if (j == hlRow) sp.FillAlpha = 0.9f;
-                    else if (dim)   sp.FillAlpha = 0.2f;
-                    ImPlot::PlotShaded(id, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, sp);
-                } else {
-                    LSL_ZONE("raw");
-                    const int n = fillRaw(c, sc.y);
-                    if (o.autoGainReq && n > 0) {                // robust half-range from raw samples
-                        sc.ampScratch.resize(n);
-                        for (int i = 0; i < n; ++i) sc.ampScratch[i] = (float)sc.y[i];
-                        const int lo = std::clamp((int)(0.1 * n), 0, n - 1);
-                        const int hi = std::clamp((int)(0.9 * n), 0, n - 1);
-                        std::nth_element(sc.ampScratch.begin(), sc.ampScratch.begin() + lo, sc.ampScratch.begin() + n);
-                        const float ylo = sc.ampScratch[lo];
-                        std::nth_element(sc.ampScratch.begin() + lo, sc.ampScratch.begin() + hi, sc.ampScratch.begin() + n);
-                        amp[c] = 0.5f * (sc.ampScratch[hi] - ylo);
-                    }
-                    for (int i = 0; i < n; ++i) sc.y[i] = lane + sc.y[i] * g;
-                    char id[12]; std::snprintf(id, sizeof(id), "##l%d", c);
-                    ImPlotSpec sp = lineSpec(c, j == hlRow ? 2.0f * o.lineWidth : o.lineWidth);
-                    if (dim) sp.LineColor.w = 0.3f;
-                    ImPlot::PlotLine(id, sc.xShared.data(), sc.y.data(), n, sp);
-                }
-            }
+            drawSourceLanes(s, sc.visIdx, sc.laneSlot, st, headFreeze, sc);
             if (o.autoGainReq) {   // apply measured amplitudes now that every visible lane has one
                 for (int j = 0; j < show; ++j) {
                     const int c = sc.visIdx[j];
+                    amp[c]  = sc.ampOut[j];
                     gain[c] = std::clamp(o.gainUv * 0.4f / std::max(amp[c], 1e-3f), 0.01f, 100.0f);
                 }
                 o.autoGainReq = false;
@@ -1372,9 +1762,11 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
                                    ? units[c0].c_str() : "a.u.";
             ImPlot::Annotation(xbar, 0.0, ImGui::ColorConvertU32ToFloat4(col), ImVec2(6, 0),
                                false, "%.0f %s", o.gainUv, unit);
-            drawDropoutRed(s, 0.0, 0.0, headFreeze, edge);
+            drawDropoutRed(s, sc.bands, 0.0, 0.0, headFreeze, edge);
             drawBreaks(s, sc.breaks);
             drawMarkers(sc.markers);
+            if (o.paginate && pages > 1) drawPageCorner(o, enabled, pages);
+            streamPlotDropTarget(s);
             ImPlot::EndPlot();
         }
         ImGui::EndChild();  // plt
@@ -1396,42 +1788,653 @@ static void drawStream(HfStreamSource& s, DisplayOpts& o, double edge, bool foll
         o.lastPlotPx = ImPlot::GetPlotSize().x;   // for next frame's edge snap
         // Same point-budget decision as the stacked branch (raw unless it'd be heavy).
         const double visSamples = ImPlot::GetPlotLimits().X.Size() * rate;
-        const bool   useEnv = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
-        const std::size_t bins = envelopeBins();
-        // Hoist the shared envelope span + time axis + applyGaps out of the per-channel loop
-        // (same as the stacked branch above).
-        MinMaxSummary::Span espan;
-        if (useEnv) {
-            espan = summ.span(bins, endBin);
-            sc.xShared.resize(std::max(espan.n, 0));
-            summ.binTimes(espan, dt, t0, sc.xShared.data());
-            if (espan.n > 0) s.applyGaps(sc.xShared.data(), espan.n);
-        }
-
-        for (int j = 0; j < show; ++j) {
-            const int   c     = sc.visIdx[j];
-            const float yoff  = (float)j * o.spacing;
-            const char* label = labels[c].c_str();
-            if (useEnv) {
-                LSL_ZONE("envelope");
-                const int n = espan.n;
-                sc.mn.resize(n); sc.mx.resize(n);
-                summ.binValues(espan, c, sc.mn.data(), sc.mx.data());
-                if (yoff != 0.0f) for (int i = 0; i < n; ++i) { sc.mn[i] += yoff; sc.mx[i] += yoff; }
-                ImPlot::PlotShaded(label, sc.xShared.data(), sc.mn.data(), sc.mx.data(), n, bandSpec(c));
-            } else {
-                LSL_ZONE("raw");
-                const int n = fillRaw(c, sc.y);
-                if (yoff != 0.0f) for (int i = 0; i < n; ++i) sc.y[i] += yoff;
-                ImPlot::PlotLine(label, sc.xShared.data(), sc.y.data(), n, lineSpec(c, o.lineWidth));
-            }
-        }
-        drawDropoutRed(s, 0.0, 0.0, headFreeze, edge);
+        sc.laneSlot.resize(show); sc.legend.resize(show);
+        for (int j = 0; j < show; ++j) { sc.laneSlot[j] = j; sc.legend[j] = labels[sc.visIdx[j]].c_str(); }
+        LaneStyle st;
+        st.stacked   = false;
+        st.filtered  = filtered;
+        st.useEnv    = visSamples > 3.0 * (double)px && visSamples * (double)show > kRawPointBudget;
+        st.lineWidth = o.lineWidth;
+        st.spacing   = o.spacing;
+        st.color     = sc.visIdx;
+        st.legend    = sc.legend;
+        drawSourceLanes(s, sc.visIdx, sc.laneSlot, st, headFreeze, sc);
+        drawDropoutRed(s, sc.bands, 0.0, 0.0, headFreeze, edge);
         drawBreaks(s, sc.breaks);
         drawMarkers(sc.markers);
+        if (o.paginate && pages > 1) drawPageCorner(o, enabled, pages);
+        streamPlotDropTarget(s);
         ImPlot::EndPlot();
     }
     ImGui::EndChild();  // plt
+}
+
+// ---- Combined plot: channels from several streams in one plot (View > New combined plot) ----
+// Holds (stream key, channel) references only, resolved every frame (see combined_plot.hpp):
+// the stream windows keep the connections and the display filters. The lanes are drawn by the
+// same drawSourceLanes as a stream plot's, one call per group of traces from one source.
+constexpr int kNotConnected = -1, kChannelMissing = -2, kWaiting = -3;   // CombinedPlot::srcOf
+struct CombinedPlot {
+    int                   id = 0;
+    char                  title[64] = "";
+    std::vector<TraceRef> traces;                  // lane order, top to bottom
+    DisplayOpts           view;                    // history, stacked/overlay, line width, markers
+    // Value units per lane height, per unit. It replaces the stream plot's one gainUv, because
+    // the streams in one plot can carry different units. 0: not set yet, taken from the data.
+    std::unordered_map<std::string, float> unitScale;
+    EdgeState             edge;                    // right edge over the member streams (groupEdge)
+    bool                  open = true, focus = true;
+    // Add popup
+    std::string           addKey;                  // stream picked in the Add popup
+    std::vector<unsigned char> addSel;             // its channels ticked for "Add selected"
+    ImGuiTextFilter       addStreamFilter, addChanFilter;
+    int                   ctxTrace = -1;           // lane whose label was right-clicked
+    bool                  resolvedStacked = true;  // view.stacked when the kinds (Y axes) were set
+    // Per frame, reused (no allocation once grown). srcOf: index in `sources`, or one of
+    // kNotConnected / kChannelMissing / kWaiting. `units` and `members` point into the sources
+    // and are valid for this frame only: a disconnected source is freed later.
+    std::vector<int>                srcOf, kind, unitOf;
+    std::vector<int>                pageSrc, ident;   // srcOf with the traces off the page cleared; slot -> trace
+    std::vector<const std::string*> units;
+    std::vector<HfStreamSource*>    members;
+    std::vector<TraceGroup>         groups;
+    std::vector<int>                order, gChan, gColor, gSlot;
+    std::vector<float>              gGain, gCenter, gLo, gHi;
+    std::vector<const char*>        gLegend;
+    std::vector<unsigned char>      env;
+    std::vector<double>             gPoints;
+    std::vector<std::string>        tick, legend, axisLabel;
+    std::vector<const char*>        tickPtr;
+    std::vector<double>             tickPos;
+    std::vector<std::pair<double, double>> bands;
+};
+
+static const std::string& unitOfChannel(const HfStreamSource& s, int c) {
+    static const std::string kAu = "a.u.";
+    const auto& u = s.units();
+    return (c >= 0 && c < (int)u.size() && !u[(std::size_t)c].empty()) ? u[(std::size_t)c] : kAu;
+}
+// A first lane scale for a unit: the stream plot's default gain for microvolts, else 0 (set
+// from the first data, since "a.u." can mean 0..1 or 0..60000).
+static float defaultUnitScale(const std::string& u) {
+    std::string l = u;
+    for (char& ch : l) ch = (char)std::tolower((unsigned char)ch);
+    if (l == "uv" || l == "microvolt" || l == "microvolts" || l == "\xc2\xb5v" || l == "\xce\xbcv") return 150.0f;
+    return 0.0f;
+}
+// The " #2" of the second same-named stream, as on the stream window titles (0: none).
+static int dupIndexOf(const std::vector<std::unique_ptr<HfStreamSource>>& sources, int si) {
+    int d = 0;
+    for (int j = 0; j < si; ++j) if (sources[(std::size_t)j]->name() == sources[(std::size_t)si]->name()) ++d;
+    return d;
+}
+
+// Binds every trace to a connected source for this frame (groupCombinedPage groups them).
+static void resolveCombined(CombinedPlot& cp, const std::vector<std::unique_ptr<HfStreamSource>>& sources) {
+    const std::size_t T = cp.traces.size();
+    cp.srcOf.resize(T); cp.kind.resize(T); cp.unitOf.resize(T);
+    cp.members.clear(); cp.units.clear();
+    cp.resolvedStacked = cp.view.stacked;
+    for (std::size_t i = 0; i < T; ++i) {
+        TraceRef& t = cp.traces[i];
+        cp.unitOf[i] = -1;
+        int si = kNotConnected;
+        for (std::size_t j = 0; j < sources.size(); ++j)
+            if (keyMatches(*sources[j], t.streamKey)) { si = (int)j; break; }
+        if (si >= 0) {
+            HfStreamSource& s = *sources[(std::size_t)si];
+            if (t.streamName != s.name()) t.streamName = s.name();
+            // The labels are final once data flows: the worker reads the metadata first.
+            if (!s.anchored() || s.head() == 0) {
+                si = kWaiting;
+            } else if (const int c = bindTraceChannel(t, s.labels()); c < 0) {
+                si = kChannelMissing;
+            } else {
+                t.channel = c;
+                const std::string& u = unitOfChannel(s, c);
+                std::size_t ui = 0;
+                while (ui < cp.units.size() && *cp.units[ui] != u) ++ui;
+                if (ui == cp.units.size()) cp.units.push_back(&u);
+                cp.unitOf[i] = (int)ui;
+                if (std::find(cp.members.begin(), cp.members.end(), &s) == cp.members.end()) cp.members.push_back(&s);
+            }
+        }
+        cp.srcOf[i] = si;
+        // Overlay: one Y axis per unit, up to ImPlot's three; the rest share the third.
+        const int axis = cp.view.stacked ? 0 : std::clamp(cp.unitOf[i], 0, 2);
+        cp.kind[i] = (t.filtered ? 1 : 0) + 2 * axis;
+    }
+}
+// Groups the drawable traces of lanes [pb, pe) (the page), and maps lane slot j to trace pb + j.
+static void groupCombinedPage(CombinedPlot& cp, int pb, int pe) {
+    const std::size_t T = cp.srcOf.size();
+    cp.pageSrc.resize(T);
+    for (std::size_t i = 0; i < T; ++i) cp.pageSrc[i] = ((int)i >= pb && (int)i < pe) ? cp.srcOf[i] : kNotConnected;
+    groupTraces(cp.pageSrc, cp.kind, cp.groups, cp.order);
+    cp.ident.resize((std::size_t)std::max(0, pe - pb));
+    for (int j = 0; j < pe - pb; ++j) cp.ident[(std::size_t)j] = pb + j;
+}
+
+// Lane label: "Cz (MockEEG)", with " #2", ", raw", the channel gain, or why it is empty.
+static void traceLabel(const CombinedPlot& cp, const std::vector<std::unique_ptr<HfStreamSource>>& sources,
+                       int i, bool withGain, char* buf, std::size_t n) {
+    const TraceRef& t  = cp.traces[(std::size_t)i];
+    const int       si = cp.srcOf[(std::size_t)i];
+    int w = std::snprintf(buf, n, "%s (%s", t.label.c_str(), t.streamName.c_str());
+    auto app = [&](const char* fmt, auto... a) {
+        if (w >= 0 && (std::size_t)w < n) w += std::snprintf(buf + w, n - (std::size_t)w, fmt, a...);
+    };
+    if (si >= 0) {
+        if (const int d = dupIndexOf(sources, si)) app(" #%d", d + 1);
+    }
+    if (!t.filtered) app("%s", ", raw");
+    if (si == kNotConnected)        app("%s", ", not connected");
+    else if (si == kChannelMissing) app("%s", ", channel missing");
+    else if (si == kWaiting)        app("%s", ", waiting");
+    else if (withGain && t.autoFit) app("%s", ", fit");
+    else if (withGain) {
+        const float g = sources[(std::size_t)si]->chanGain()[(std::size_t)t.channel];
+        if (g > 1.005f || g < 0.995f) app(", %.2gx", g);
+    }
+    app("%s", ")");
+}
+
+// Picks the envelope for the groups whose raw traces would cost the most, until the plot's
+// raw points fit kRawPointBudget: a 48 kHz trace goes to the envelope, not every lane. A
+// group needs more than 3 samples per pixel to take it, as in a stream plot.
+static void pickEnvelopes(CombinedPlot& cp, const std::vector<std::unique_ptr<HfStreamSource>>& sources,
+                          double xSpan, int px) {
+    const std::size_t G = cp.groups.size();
+    cp.env.assign(G, 0);
+    cp.gPoints.resize(G);
+    double total = 0.0;
+    for (std::size_t g = 0; g < G; ++g) {
+        cp.gPoints[g] = xSpan * sources[(std::size_t)cp.groups[g].src]->srate() * cp.groups[g].count;
+        total += cp.gPoints[g];
+    }
+    while (total > kRawPointBudget) {
+        std::size_t best = G;
+        for (std::size_t g = 0; g < G; ++g) {
+            const double vis = xSpan * sources[(std::size_t)cp.groups[g].src]->srate();
+            if (!cp.env[g] && vis > 3.0 * (double)px && (best == G || cp.gPoints[g] > cp.gPoints[best])) best = g;
+        }
+        if (best == G) break;
+        cp.env[best] = 1;
+        total -= cp.gPoints[best];
+    }
+}
+
+// Lays out the per-group spans (aligned with cp.order) for drawSourceLanes.
+static void gatherCombined(CombinedPlot& cp, const std::vector<std::unique_ptr<HfStreamSource>>& sources, int pb) {
+    const std::size_t N = cp.order.size();
+    cp.gChan.resize(N); cp.gColor.resize(N); cp.gSlot.resize(N); cp.gGain.resize(N); cp.gCenter.resize(N);
+    cp.gLo.resize(N); cp.gHi.resize(N); cp.gLegend.resize(N);
+    for (std::size_t k = 0; k < N; ++k) {
+        const int       i = cp.order[k];
+        const TraceRef& t = cp.traces[(std::size_t)i];
+        HfStreamSource& s = *sources[(std::size_t)cp.srcOf[(std::size_t)i]];
+        cp.gChan[k]  = t.channel;
+        cp.gColor[k] = i;   // the trace's color and plot item id follow it through a reorder
+        cp.gSlot[k]  = i - pb;
+        cp.gLo[k] = std::numeric_limits<float>::infinity();
+        cp.gHi[k] = -std::numeric_limits<float>::infinity();
+        cp.gLegend[k] = (std::size_t)i < cp.legend.size() ? cp.legend[(std::size_t)i].c_str() : "";
+        if (t.autoFit && t.fitValid) {   // ignores the unit scale and the channel gain
+            cp.gGain[k]   = 0.8f / std::max(t.fitHi - t.fitLo, 1e-12f);
+            cp.gCenter[k] = 0.5f * (t.fitHi + t.fitLo);
+        } else {
+            const auto  it = cp.unitScale.find(*cp.units[(std::size_t)cp.unitOf[(std::size_t)i]]);
+            float scale = it != cp.unitScale.end() ? it->second : 0.0f;
+            if (scale <= 0.0f) scale = t.fitValid ? 1.25f * (t.fitHi - t.fitLo) : 1.0f;
+            cp.gGain[k]   = s.chanGain()[(std::size_t)t.channel] / std::max(scale, 1e-12f);
+            cp.gCenter[k] = 0.0f;
+        }
+    }
+}
+
+// After drawing: keep each trace's visible range for auto-fit with hysteresis (grow at once,
+// shrink only below half, so the lane doesn't pump), and give a new unit its first scale.
+static void updateFits(CombinedPlot& cp) {
+    for (std::size_t k = 0; k < cp.order.size(); ++k) {
+        TraceRef&   t  = cp.traces[(std::size_t)cp.order[k]];
+        const float lo = cp.gLo[k], hi = cp.gHi[k];
+        if (!(lo <= hi)) continue;   // not measured (no data in view)
+        const float span = std::max(hi - lo, 1e-9f);
+        if (!t.fitValid || lo < t.fitLo || hi > t.fitHi || span < 0.5f * (t.fitHi - t.fitLo)) {
+            t.fitLo = lo - 0.05f * span; t.fitHi = hi + 0.05f * span; t.fitValid = true;
+        }
+    }
+    for (std::size_t k = 0; k < cp.order.size(); ++k) {
+        const int i  = cp.order[k];
+        const int ui = cp.unitOf[(std::size_t)i];
+        auto it = cp.unitScale.find(*cp.units[(std::size_t)ui]);
+        const TraceRef& t = cp.traces[(std::size_t)i];
+        if (it != cp.unitScale.end() && it->second <= 0.0f && t.fitValid) it->second = 1.25f * (t.fitHi - t.fitLo);
+    }
+}
+
+// Scale that fits the traces of unit `ui` (the "Fit" button): the widest of their ranges.
+static float fitUnitScale(const CombinedPlot& cp, int ui) {
+    float w = 0.0f;
+    const std::size_t n = std::min(cp.traces.size(), cp.unitOf.size());   // traces added this frame are not resolved yet
+    for (std::size_t i = 0; i < n; ++i)
+        if (cp.unitOf[i] == ui && cp.traces[i].fitValid) w = std::max(w, 1.25f * (cp.traces[i].fitHi - cp.traces[i].fitLo));
+    return w;
+}
+
+// Adds channel `c` of `s` as a filtered trace at lane `at` (-1: last), unless the plot has it.
+static bool addTrace(CombinedPlot& cp, const HfStreamSource& s, const std::string& key, int c, int at = -1) {
+    if (c < 0 || c >= s.channels() || hasTrace(cp.traces, key, c, true)) return false;
+    TraceRef t;
+    t.streamKey = key; t.channel = c; t.label = s.labels()[(std::size_t)c]; t.streamName = s.name();
+    const int n = (int)cp.traces.size();
+    cp.traces.insert(cp.traces.begin() + ((at < 0 || at > n) ? n : at), std::move(t));
+    cp.view.overlayYFit = true;
+    cp.view.hlLocked    = -1;
+    return true;
+}
+// "Add all enabled": a copy of the channels the stream's own plot shows, made once.
+static void addEnabledTraces(CombinedPlot& cp, const HfStreamSource& s, const std::string& key,
+                             const std::unordered_map<const HfStreamSource*, DisplayOpts>& dispOpts) {
+    const int C = s.channels();
+    auto it = dispOpts.find(&s);
+    for (int c = 0; c < C; ++c) {
+        const bool on = (it != dispOpts.end() && (int)it->second.visible.size() == C)
+                            ? it->second.visible[(std::size_t)c] != 0 : true;   // the stream plot's default: all
+        if (on) addTrace(cp, s, key, c);
+    }
+}
+// A dropped channel, resolved by key now: its stream may have gone during the drag.
+static void addDroppedTrace(CombinedPlot& cp, const std::vector<std::unique_ptr<HfStreamSource>>& sources,
+                            const ChannelDrag& d, int at) {
+    const std::string key(d.key, strnlen(d.key, sizeof d.key));
+    for (const auto& src : sources)
+        if (keyMatches(*src, key)) { addTrace(cp, *src, key, d.channel, at); return; }
+}
+
+static void combinedAddPopup(CombinedPlot& cp, std::vector<std::unique_ptr<HfStreamSource>>& sources,
+                             std::unordered_map<const HfStreamSource*, DisplayOpts>& dispOpts) {
+    if (!ImGui::BeginPopup("add")) return;
+    int pi = -1;
+    for (int j = 0; j < (int)sources.size(); ++j)
+        if (keyMatches(*sources[(std::size_t)j], cp.addKey)) { pi = j; break; }
+    if (pi < 0 && !sources.empty()) { pi = 0; cp.addKey = streamKeyOf(*sources[0]); cp.addSel.clear(); }
+    if (pi < 0) {
+        ImGui::TextDisabled("Connect a stream first.");
+        ImGui::EndPopup();
+        return;
+    }
+    char nm[160];
+    auto display = [&](int j) {
+        const int d = dupIndexOf(sources, j);
+        if (d) std::snprintf(nm, sizeof nm, "%s #%d", sources[(std::size_t)j]->name().c_str(), d + 1);
+        else   std::snprintf(nm, sizeof nm, "%s", sources[(std::size_t)j]->name().c_str());
+        return nm;
+    };
+    ImGui::SetNextItemWidth(uiScaled(260));
+    if (ImGui::BeginCombo("##stream", display(pi))) {
+        cp.addStreamFilter.Draw("##sf", -1.0f);   // searchable
+        for (int j = 0; j < (int)sources.size(); ++j) {
+            if (!cp.addStreamFilter.PassFilter(sources[(std::size_t)j]->name().c_str())) continue;
+            // display() names are unique (" #2"), so they serve as the ids.
+            if (ImGui::Selectable(display(j), j == pi)) { pi = j; cp.addKey = streamKeyOf(*sources[(std::size_t)j]); cp.addSel.clear(); }
+        }
+        ImGui::EndCombo();
+    }
+    HfStreamSource& s = *sources[(std::size_t)pi];
+    const int C = s.channels();
+    const auto& labels = s.labels();
+    if ((int)cp.addSel.size() != C) cp.addSel.assign((std::size_t)C, 0);
+    auto pass = [&](int c) { return cp.addChanFilter.PassFilter(labels[(std::size_t)c].c_str()); };
+    cp.addChanFilter.Draw("##chf", uiScaled(260));
+    if (ImGui::SmallButton("All"))  for (int c = 0; c < C; ++c) if (pass(c)) cp.addSel[(std::size_t)c] = 1;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("None")) for (int c = 0; c < C; ++c) if (pass(c)) cp.addSel[(std::size_t)c] = 0;
+    ImGui::BeginChild("chans", ImVec2(uiScaled(260), uiScaled(220)), ImGuiChildFlags_Borders);
+    for (int c = 0; c < C; ++c) {
+        if (!pass(c)) continue;
+        bool on = cp.addSel[(std::size_t)c] != 0;
+        ImGui::PushID(c);
+        if (ImGui::Checkbox(labels[(std::size_t)c].c_str(), &on)) cp.addSel[(std::size_t)c] = on ? 1 : 0;
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    if (ImGui::Button("Add selected")) {
+        for (int c = 0; c < C; ++c) if (cp.addSel[(std::size_t)c]) addTrace(cp, s, cp.addKey, c);
+        cp.addSel.assign((std::size_t)C, 0);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add all enabled")) {
+        addEnabledTraces(cp, s, cp.addKey, dispOpts);
+        ImGui::CloseCurrentPopup();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add the channels shown in the stream's own plot (a copy).");
+    ImGui::EndPopup();
+}
+
+static void drawCombined(CombinedPlot& cp, std::vector<std::unique_ptr<HfStreamSource>>& sources,
+                         std::unordered_map<const HfStreamSource*, DisplayOpts>& dispOpts,
+                         bool paused, bool followX, const AxisLock& lock,
+                         const std::vector<MarkerStreamView>& markerViews, PlotScratch& sc) {
+    LSL_ZONE("drawCombined");
+    const float kCfgWidth = uiScaled(230.0f);
+    DisplayOpts& o = cp.view;
+    o.raster = false;   // not for a combined plot: its sources have different summary bins
+    int T = (int)cp.traces.size();
+
+    // Lane labels, also the list rows and the overlay legend.
+    char buf[192];
+    cp.tick.resize((std::size_t)T); cp.legend.resize((std::size_t)T);
+    for (int i = 0; i < T; ++i) {
+        traceLabel(cp, sources, i, o.stacked, buf, sizeof buf);
+        cp.tick[(std::size_t)i] = buf;   // assigned in place: no allocation once grown
+        std::snprintf(buf + std::strlen(buf), sizeof buf - std::strlen(buf), "##%d", i);
+        cp.legend[(std::size_t)i] = buf;
+    }
+    for (int u = 0; u < (int)cp.units.size(); ++u)
+        if (cp.unitScale.find(*cp.units[(std::size_t)u]) == cp.unitScale.end())
+            cp.unitScale.emplace(*cp.units[(std::size_t)u], defaultUnitScale(*cp.units[(std::size_t)u]));
+
+    // ---- left column: config ----------------------------------------------------------------
+    if (!o.cfgShown) {
+        if (ImGui::SmallButton(">")) o.cfgShown = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("show controls");
+        ImGui::SameLine();
+    }
+    int moveFrom = -1, moveTo = -1, removeAt = -1;
+    int dropAt = -1;                  // a channel dragged in from a stream plot goes here
+    ChannelDrag dropped{};
+    if (o.cfgShown) {
+        ImGui::BeginChild("cfg", ImVec2(kCfgWidth, 0), ImGuiChildFlags_Borders);
+        if (ImGui::SmallButton("< hide")) o.cfgShown = false;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##title", "title", cp.title, sizeof cp.title);
+        if (ImGui::Button("Add...")) ImGui::OpenPopup("add");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Add channels of a connected stream.");
+        combinedAddPopup(cp, sources, dispOpts);
+        T = (int)cp.traces.size();   // the popup may have added some; they are drawn next frame
+        if (ImGui::CollapsingHeader("Traces", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const float h = ImGui::GetFrameHeight();
+            const int   resolved = (int)cp.tick.size();
+            pagerUi(o, resolved, pageCount(resolved, o.pageSize), "lanes", "traces",
+                    "plot the traces one page at a time");
+            for (int i = 0; i < T && i < (int)cp.tick.size(); ++i) {
+                TraceRef& t = cp.traces[(std::size_t)i];
+                ImGui::PushID(i);
+                ImGui::ColorButton("##sw", ImPlot::GetColormapColor(i),
+                                   ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop, ImVec2(h * 0.6f, h));
+                ImGui::SameLine();
+                const ImGuiStyle& sty = ImGui::GetStyle();
+                const float btnW = ImGui::CalcTextSize("filt").x + ImGui::CalcTextSize("fit").x +
+                                   ImGui::CalcTextSize("x").x + 6.0f * sty.FramePadding.x + 3.0f * sty.ItemSpacing.x;
+                std::snprintf(buf, sizeof buf, "%s: %s", t.streamName.c_str(), t.label.c_str());
+                const bool empty = cp.srcOf[(std::size_t)i] < 0;   // not connected, channel missing, waiting
+                if (empty) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::Selectable(buf, cp.view.hlLocked == i, 0,
+                                  ImVec2(std::max(1.0f, ImGui::GetContentRegionAvail().x - btnW), h));
+                if (empty) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\ndrag to reorder", cp.tick[(std::size_t)i].c_str());
+                if (ImGui::BeginDragDropSource()) {
+                    ImGui::SetDragDropPayload("LSL_TRACE_ROW", &i, sizeof i);
+                    ImGui::TextUnformatted(buf);
+                    ImGui::EndDragDropSource();
+                }
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("LSL_TRACE_ROW")) {
+                        moveFrom = *(const int*)p->Data; moveTo = i;
+                    }
+                    if (const ChannelDrag* d = acceptChannelDrag()) { dropped = *d; dropAt = i; }   // insert here
+                    ImGui::EndDragDropTarget();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton(t.filtered ? "filt" : "raw")) {
+                    if (!hasTrace(cp.traces, t.streamKey, t.channel, !t.filtered)) { t.filtered = !t.filtered; o.overlayYFit = true; }
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(t.filtered ? "Filtered: as set in the %s window. Click for raw."
+                                                 : "Raw samples of %s. Click for filtered.", t.streamName.c_str());
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!o.stacked);   // overlay: traces on one axis share its scale
+                // Pop by what was pushed: the click flips autoFit in between.
+                const bool fitOn = t.autoFit;
+                if (fitOn) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::SmallButton("fit")) t.autoFit = !t.autoFit;
+                if (fitOn) ImGui::PopStyleColor();
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Auto-fit: scale this lane to its visible range\n(ignores the unit scale and the channel gain)");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x")) removeAt = i;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove");
+                ImGui::PopID();
+            }
+            if (T == 0) ImGui::TextDisabled("No traces yet.");
+        }
+        if (ImGui::CollapsingHeader("Display")) {
+            ImGui::SetNextItemWidth(uiScaled(110));
+            ImGui::SliderFloat("History (s)", lock.on ? lock.history : &o.history, 1.0f, 60.0f, "%.0f");
+            if (lock.on && ImGui::IsItemHovered()) ImGui::SetTooltip("shared while \"Lock time axes\" is on");
+            if (ImGui::Checkbox("Stacked lanes", &o.stacked)) o.overlayYFit = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off: overlay, with one Y axis per unit.");
+            ImGui::SetNextItemWidth(uiScaled(110));
+            ImGui::SliderFloat("Line width", &o.lineWidth, 0.5f, 4.0f, "%.1f");
+            ImGui::BeginDisabled(!o.stacked);   // overlay: each unit's axis scales itself
+            for (int u = 0; u < (int)cp.units.size(); ++u) {
+                const std::string& un = *cp.units[(std::size_t)u];
+                auto it = cp.unitScale.find(un);
+                if (it == cp.unitScale.end()) continue;
+                ImGui::PushID(u);
+                ImGui::SetNextItemWidth(uiScaled(110));
+                float& v = it->second;
+                ImGui::DragFloat(un.c_str(), &v, std::max(v * 0.01f, 1e-6f), 1e-6f, 1e9f, "%.3g",
+                                 ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s per lane height", un.c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Fit")) { const float f = fitUnitScale(cp, u); if (f > 0.0f) v = f; }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fit the widest %s trace to one lane", un.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndDisabled();
+        }
+        markerOverlayUi(o, markerViews);
+        ImGui::EndChild();  // cfg
+        ImGui::SameLine();
+    }
+    mergeMarkers(o, markerViews, sc);
+
+    // ---- right column: the plot -----------------------------------------------------------
+    ImGui::BeginChild("plt", ImVec2(0, 0));
+    T = (int)cp.tick.size();   // what was resolved this frame (edits apply below, after drawing)
+    // The page: lanes [pb, pb + show). Slot j of the plot shows trace pb + j. A short last page
+    // keeps the full page's lane height, as a stream plot's does.
+    const int pages = pageCount(T, o.pageSize);
+    if (o.paginate) o.page = std::clamp(o.page, 0, pages - 1);
+    const int pb    = o.paginate ? o.page * o.pageSize : 0;
+    const int show  = o.paginate ? std::min(T, pb + o.pageSize) - pb : T;
+    const int slots = o.paginate ? std::min(o.pageSize, T) : show;
+    groupCombinedPage(cp, pb, pb + show);
+    if (T == 0) {
+        ImGui::TextDisabled("Add channels with Add, or drag a channel here.");
+        ImGuiWindow* pw = ImGui::GetCurrentWindow();
+        if (ImGui::BeginDragDropTargetCustom(pw->InnerRect, pw->ID)) {
+            if (const ChannelDrag* d = acceptChannelDrag()) { dropped = *d; dropAt = (int)cp.traces.size(); }
+            ImGui::EndDragDropTarget();
+        }
+    } else {
+        // Pixel-snap the scrolling right edge, as a stream plot does.
+        double xedge = cp.edge.pos;
+        if (followX && o.lastPlotPx > 1.0f && o.history > 0.0f) {
+            const double secPerPx = (double)o.history / (double)o.lastPlotPx;
+            xedge = std::round(xedge / secPerPx) * secPerPx;
+        }
+        if (o.stacked) o.overlayYFit = true;   // re-fit once on entering overlay
+        bool openLaneCtx = false;
+        const ImPlotFlags pf = o.stacked ? ImPlotFlags_NoLegend : ImPlotFlags_None;
+        if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1), pf)) {
+            const int nAx = std::clamp((int)cp.units.size(), 1, 3);
+            if (o.stacked) {
+                ImPlot::SetupAxes("time (s)", nullptr, ImPlotAxisFlags_None, kLaneAxisFlags);
+            } else {
+                // One Y axis per unit; a fourth unit and up share the third, and its label says so.
+                cp.axisLabel.resize(3);
+                for (int a = 0; a < 3; ++a) cp.axisLabel[(std::size_t)a].clear();
+                for (int u = 0; u < (int)cp.units.size(); ++u) {
+                    std::string& l = cp.axisLabel[(std::size_t)std::min(u, 2)];
+                    if (!l.empty()) l += ", ";
+                    l += *cp.units[(std::size_t)u];
+                }
+                if (cp.units.size() > 3) cp.axisLabel[2] += " (shared axis)";
+                const ImPlotAxisFlags yf = o.overlayYFit ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
+                ImPlot::SetupAxes("time (s)", cp.units.empty() ? nullptr : cp.axisLabel[0].c_str(), ImPlotAxisFlags_None, yf);
+                if (nAx >= 2) ImPlot::SetupAxis(ImAxis_Y2, cp.axisLabel[1].c_str(), ImPlotAxisFlags_AuxDefault | yf);
+                if (nAx >= 3) ImPlot::SetupAxis(ImAxis_Y3, cp.axisLabel[2].c_str(), ImPlotAxisFlags_AuxDefault | yf);
+                // On the frame of the switch every trace is still on Y1; fit once they are on theirs.
+                if (cp.resolvedStacked == o.stacked && !cp.groups.empty()) o.overlayYFit = false;   // and not before data
+            }
+            setupTimeAxisX();
+            if (lock.on)      ImPlot::SetupAxisLinks(ImAxis_X1, lock.xMin, lock.xMax);
+            else if (followX) ImPlot::SetupAxisLimits(ImAxis_X1, xedge - o.history, xedge, ImPlotCond_Always);
+
+            int hlRow = -1;   // a slot
+            const double hlC0 = (double)(show - 1);
+            if (o.stacked) {
+                ImPlot::SetupAxisLimits(ImAxis_Y1, (double)(show - slots) - 0.6, (double)show - 0.4, ImPlotCond_Always);
+                cp.tickPos.resize((std::size_t)show); cp.tickPtr.resize((std::size_t)show);
+                for (int j = 0; j < show; ++j) {
+                    cp.tickPos[(std::size_t)j] = (double)(show - 1 - j);
+                    cp.tickPtr[(std::size_t)j] = cp.tick[(std::size_t)(pb + j)].c_str();
+                }
+                ImPlot::SetupAxisTicks(ImAxis_Y1, cp.tickPos.data(), show, cp.tickPtr.data());
+                if (ImPlot::IsAxisHovered(ImAxis_Y1) && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                    const int j = (int)std::lround(hlC0 - ImPlot::GetPlotMousePos(IMPLOT_AUTO, ImAxis_Y1).y);
+                    if (j >= 0 && j < show) { cp.ctxTrace = pb + j; openLaneCtx = true; }
+                }
+                hlRow = laneHighlightRow(o, cp.ident, show, hlC0);
+                if (hlRow >= 0) {   // faint lane band under the traces + tinted label
+                    const ImPlotRect lim = ImPlot::GetPlotLimits();
+                    const double     yc  = hlC0 - hlRow;
+                    ImVec4 bg = ImPlot::GetColormapColor(pb + hlRow);
+                    bg.w = 0.10f;
+                    ImPlot::PushPlotClipRect();
+                    ImPlot::GetPlotDrawList()->AddRectFilled(ImPlot::PlotToPixels(lim.X.Min, yc + 0.5),
+                                                             ImPlot::PlotToPixels(lim.X.Max, yc - 0.5),
+                                                             ImGui::ColorConvertFloat4ToU32(bg));
+                    ImPlot::PopPlotClipRect();
+                    drawLaneLabelHighlight(cp.tickPtr[(std::size_t)hlRow], pb + hlRow, hlC0, hlRow);
+                }
+            }
+
+            const int px = std::max(64, (int)ImPlot::GetPlotSize().x);
+            o.lastPlotPx = ImPlot::GetPlotSize().x;
+            pickEnvelopes(cp, sources, ImPlot::GetPlotLimits().X.Size(), px);
+            gatherCombined(cp, sources, pb);
+            for (std::size_t g = 0; g < cp.groups.size(); ++g) {
+                const TraceGroup& gr = cp.groups[g];
+                HfStreamSource&   s  = *sources[(std::size_t)gr.src];
+                const std::size_t f = (std::size_t)gr.first, n = (std::size_t)gr.count;
+                LaneStyle st;
+                st.stacked   = o.stacked;
+                st.laneCount = show;
+                st.filtered  = (gr.kind & 1) != 0;
+                st.useEnv    = cp.env[g] != 0;
+                st.lineWidth = o.lineWidth;
+                st.hlLane    = hlRow;
+                // The kinds were set before the Display toggles of this frame: stacked takes Y1.
+                st.yAxis     = o.stacked ? ImAxis_Y1 : (ImAxis)(ImAxis_Y1 + std::min(gr.kind / 2, nAx - 1));
+                st.gain      = std::span<const float>(cp.gGain).subspan(f, n);
+                st.center    = std::span<const float>(cp.gCenter).subspan(f, n);
+                st.color     = std::span<const int>(cp.gColor).subspan(f, n);
+                st.legend    = std::span<const char* const>(cp.gLegend).subspan(f, n);
+                st.lo        = std::span<float>(cp.gLo).subspan(f, n);
+                st.hi        = std::span<float>(cp.gHi).subspan(f, n);
+                const std::uint64_t hf = (paused && s.frozen()) ? s.snapHead() : 0;
+                drawSourceLanes(s, std::span<const int>(cp.gChan).subspan(f, n),
+                                std::span<const int>(cp.gSlot).subspan(f, n), st, hf, sc);
+            }
+            updateFits(cp);
+
+            // Dropouts and replay breaks belong to one stream: over its lanes when stacked, as a
+            // strip along the bottom in the stream's color in overlay.
+            const ImPlotRect lim = ImPlot::GetPlotLimits();
+            for (std::size_t m = 0; m < cp.members.size(); ++m) {
+                HfStreamSource& s  = *cp.members[m];
+                const std::uint64_t hf = (paused && s.frozen()) ? s.snapHead() : 0;
+                dropoutIntervals(s, hf, cp.edge.pos, cp.bands);
+                auto mine = [&](int j) {   // slot j shows this stream
+                    const int si = cp.pageSrc[(std::size_t)(pb + j)];
+                    return si >= 0 && sources[(std::size_t)si].get() == &s;
+                };
+                if (o.stacked) {
+                    ImPlot::PushPlotClipRect();
+                    for (int a = 0; a < show;) {
+                        if (!mine(a)) { ++a; continue; }
+                        int b = a;
+                        while (b + 1 < show && mine(b + 1)) ++b;
+                        const double yHi = hlC0 - a + 0.5, yLo = hlC0 - b - 0.5;
+                        fillDropouts(cp.bands, ImPlot::PlotToPixels(lim.X.Min, yHi).y,
+                                     ImPlot::PlotToPixels(lim.X.Min, yLo).y, kDropoutRed);
+                        drawBreaks(s, sc.breaks, yLo, yHi);
+                        a = b + 1;
+                    }
+                    ImPlot::PopPlotClipRect();
+                } else {
+                    int first = 0;
+                    while (first < show && !mine(first)) ++first;
+                    if (first == show) continue;   // none of its traces on this page
+                    ImVec4 col = ImPlot::GetColormapColor(pb + first);
+                    const float yBot = ImPlot::PlotToPixels(lim.X.Min, lim.Y.Min).y - 1.0f - 5.0f * (float)m;
+                    ImPlot::PushPlotClipRect();
+                    fillDropouts(cp.bands, yBot - 4.0f, yBot, ImGui::ColorConvertFloat4ToU32(col));
+                    ImPlot::PopPlotClipRect();
+                    drawBreaks(s, sc.breaks);
+                }
+            }
+            // Empty lanes say why in their label; a faint dash marks the lane itself.
+            if (o.stacked) {
+                ImDrawList* dl = ImPlot::GetPlotDrawList();
+                ImPlot::PushPlotClipRect();
+                for (int j = 0; j < show; ++j)
+                    if (cp.srcOf[(std::size_t)(pb + j)] < 0) {
+                        const ImVec2 a = ImPlot::PlotToPixels(lim.X.Min, hlC0 - j), b = ImPlot::PlotToPixels(lim.X.Max, hlC0 - j);
+                        for (float x = a.x; x < b.x; x += 12.0f)
+                            dl->AddLine(ImVec2(x, a.y), ImVec2(std::min(x + 6.0f, b.x), a.y), ImGui::GetColorU32(ImGuiCol_TextDisabled));
+                    }
+                ImPlot::PopPlotClipRect();
+            }
+            drawMarkers(sc.markers);
+            if (o.paginate && pages > 1) drawPageCorner(o, T, pages);
+            if (ImPlot::BeginDragDropTargetPlot()) {   // a channel dropped on the plot goes last
+                if (const ChannelDrag* d = acceptChannelDrag()) { dropped = *d; dropAt = (int)cp.traces.size(); }
+                ImPlot::EndDragDropTarget();
+            }
+            ImPlot::EndPlot();
+        }
+        if (openLaneCtx) ImGui::OpenPopup("lanectx");
+        if (ImGui::BeginPopup("lanectx")) {
+            if (cp.ctxTrace >= 0 && cp.ctxTrace < (int)cp.traces.size()) {
+                ImGui::TextDisabled("%s", cp.tick[(std::size_t)std::min(cp.ctxTrace, T - 1)].c_str());
+                if (ImGui::MenuItem("Remove")) removeAt = cp.ctxTrace;
+            }
+            ImGui::EndPopup();
+        }
+    }
+    ImGui::EndChild();  // plt
+
+    // Edits last: this frame's per-trace scratch was laid out for the old list.
+    if (moveFrom >= 0 && moveTo >= 0 && moveFrom != moveTo && moveFrom < (int)cp.traces.size()) {
+        TraceRef t = std::move(cp.traces[(std::size_t)moveFrom]);
+        cp.traces.erase(cp.traces.begin() + moveFrom);
+        cp.traces.insert(cp.traces.begin() + std::min(moveTo, (int)cp.traces.size()), std::move(t));
+        o.hlLocked = -1;
+    }
+    if (removeAt >= 0 && removeAt < (int)cp.traces.size()) {
+        cp.traces.erase(cp.traces.begin() + removeAt);
+        o.hlLocked = -1;
+        o.overlayYFit = true;
+    }
+    if (dropAt >= 0) addDroppedTrace(cp, sources, dropped, dropAt);
 }
 
 // Apply VSync vs uncapped present mode, falling back gracefully if the requested
@@ -2029,13 +3032,44 @@ bool lslViewerStreamProbe(const char* name, bool& anchored, unsigned long long& 
 }
 // The newest ERP window (an earlier test may have opened others): its id, the streams it is
 // bound to, the events its trigger stream has received, and what it averaged or left out.
-struct ErpProbe { int id = 0, count = 0, rejected = 0; std::size_t markerEvents = 0; std::string stream, trigger; };
+struct ErpProbe { int id = 0, count = 0, rejected = 0; std::size_t markerEvents = 0; std::string stream, trigger;
+                  double lastPeakMs = 0.0; };
 static ErpProbe g_erpProbe;
+// The newest single-channel epoch's peak latency (ms after the event) and the epoch count.
+void lslViewerErpLastPeak(double& ms, int& count) { ms = g_erpProbe.lastPeakMs; count = g_erpProbe.count; }
 void lslViewerErpProbe(int& id, std::string& stream, std::string& trigger, std::size_t& markerEvents,
                        int& count, int& rejected) {
     const ErpProbe& p = g_erpProbe;
     id = p.id; stream = p.stream; trigger = p.trigger; markerEvents = p.markerEvents;
     count = p.count; rejected = p.rejected;
+}
+// The newest combined plot, refreshed every frame: its lane labels and each lane's state (an
+// index into the sources, or kNotConnected / kChannelMissing / kWaiting).
+// `edges`: per lane, the display times at which its trace (a 0/1 square wave in the alignment
+// test) rises within the last 5 s: the time axis the lane is drawn on, from the samples.
+struct CombinedProbe { int id = 0, groups = 0; std::vector<std::string> ticks; std::vector<int> state;
+                       std::vector<std::vector<double>> edges; };
+static CombinedProbe g_combinedProbe;
+void lslViewerCombinedProbe(int& id, std::vector<std::string>& ticks, std::vector<int>& state, int& groups) {
+    id = g_combinedProbe.id; ticks = g_combinedProbe.ticks; state = g_combinedProbe.state; groups = g_combinedProbe.groups;
+}
+void lslViewerCombinedEdges(std::vector<std::vector<double>>& edges) { edges = g_combinedProbe.edges; }
+// Rising edges of channel `c` of `s` in its last 5 s, on the same x axis drawSourceLanes uses
+// for the raw trace: t0 + index * dt, then applyGaps (dropouts and the drift map).
+static void probeRisingEdges(HfStreamSource& s, int c, bool filtered, std::vector<double>& out) {
+    out.clear();
+    if (!s.anchored() || s.head() == 0 || c < 0 || c >= s.channels()) return;
+    InterleavedRing& rg = filtered ? s.ringHp() : s.ring();
+    std::size_t count = 0;
+    std::uint64_t start = 0;
+    const float* p = readWindow(rg, 0, (std::size_t)(5.0 * s.srate()), count, start);
+    const std::size_t C = (std::size_t)s.channels();
+    for (std::size_t j = 1; j < count; ++j)
+        if (p[(j - 1) * C + (std::size_t)c] < 0.5f && p[j * C + (std::size_t)c] >= 0.5f) {
+            double x = s.time0() + (double)(start + j) * s.dt();
+            s.applyGaps(&x, 1);
+            out.push_back(x);
+        }
 }
 #endif
 
@@ -2384,6 +3418,7 @@ int main(int argc, char** argv) {
     double lockEdge = 0.0;       // smoothed shared right-edge (glides like the per-stream edges)
     double lockVel  = 1.0;       // its velocity (see followEdge)
     float  lockHistory = 10.0f;
+    std::vector<HfStreamSource*> edgeSrcs;   // groupEdge's member list for Lock time axes, reused
     // Spectrum, Spectrogram and ERP are multi-instance: "New ..." in the View menu adds a
     // window; closing one removes it. Separate windows let you compare channels/streams/
     // conditions side by side (heatmaps/averages don't overlay, and one spectrum can only
@@ -2392,6 +3427,9 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<Spectro>>  spectros;
     std::vector<std::unique_ptr<Erp>>      erps;
     int nextSpectrumId = 1, nextSpectroId = 1, nextErpId = 1;
+    // Combined plots (View > New combined plot): time series, so they dock with the stream plots.
+    std::vector<std::unique_ptr<CombinedPlot>> combined;
+    int nextCombinedId = 1;
     bool showMarkers  = false;   // Marker events log (View menu) — see events with no data stream
     bool markersRelTime = true;  // Marker log: time relative to the stream's first event vs absolute LSL clock
     int  markerDepth    = 500;   // events shown per stream in the marker log (runtime-adjustable)
@@ -2476,6 +3514,15 @@ int main(int argc, char** argv) {
             s += "E\t" + streamKeyOf(*sources[ep->streamIdx]) + "\t" + streamKeyOf(*markerSources[ep->markerIdx])
                + "\t" + b + "\t" + ep->labelFilter.InputBuf + "\n";
         }
+        for (auto& cp : combined) {
+            CombinedRecord r;
+            r.id = cp->id; r.title = cp->title; r.view = serializeOpts(cp->view);
+            for (const auto& [u, v] : cp->unitScale) r.unitScale.emplace_back(u, v);
+            std::sort(r.unitScale.begin(), r.unitScale.end());
+            r.traces = cp->traces;
+            for (const TraceRef& t : cp->traces) require(t.streamKey, t.streamName);
+            s += toLine(r) + "\n";
+        }
         s += "---IMGUI---\n";
         s += layoutOnly(ImGui::SaveIniSettingsToMemory());
         return s;
@@ -2492,9 +3539,9 @@ int main(int argc, char** argv) {
             if (const std::size_t w = ini.find("[Window][Spectrum]\n"); w != std::string::npos)
                 ini.replace(w, 19, "[Window][Spectrum 1]\n");
         // Rebuild analysis windows + pending per-stream settings from the workspace.
-        spectra.clear(); spectros.clear(); erps.clear(); savedOpts.clear();
+        spectra.clear(); spectros.clear(); erps.clear(); combined.clear(); savedOpts.clear();
         wsRequired.clear(); wsConnectedOnce.clear();
-        nextSpectrumId = nextSpectroId = nextErpId = 1;
+        nextSpectrumId = nextSpectroId = nextErpId = nextCombinedId = 1;
         auto split = [](const std::string& l) {              // tab-delimited fields
             std::vector<std::string> f; std::string cur; std::istringstream is(l);
             while (std::getline(is, cur, '\t')) f.push_back(cur);
@@ -2508,6 +3555,19 @@ int main(int argc, char** argv) {
                 wsRequired.emplace_back(f[1], f[2]);   // (source_id, name) to re-connect / report
             } else if (f[0] == "S" && f.size() >= 3) {
                 savedOpts[f[1]] = parseOpts(f[2]);
+            } else if (f[0] == "C") {
+                // Keeps its saved id: the window's place in the saved layout is keyed by it.
+                CombinedRecord r;
+                if (!fromLine(line, r)) continue;
+                auto cp = std::make_unique<CombinedPlot>();
+                cp->id = std::max(1, r.id);
+                std::snprintf(cp->title, sizeof cp->title, "%s", r.title.c_str());
+                cp->view = parseOpts(r.view);
+                for (auto& [u, v] : r.unitScale) cp->unitScale[u] = v;
+                cp->traces = std::move(r.traces);   // bound to their streams as these connect
+                cp->focus = false;
+                nextCombinedId = std::max(nextCombinedId, cp->id + 1);
+                combined.push_back(std::move(cp));
             } else if (f[0] == "F" && f.size() >= 3) {
                 auto fp = std::make_unique<Spectrum>();
                 fp->id = nextSpectrumId++; fp->wantSid = f[1];
@@ -2706,6 +3766,13 @@ int main(int argc, char** argv) {
                     // These toggle visibility, but a click also raises the window so it
                     // can't stay buried behind a stream plot.
                     if (ImGui::MenuItem("Marker events", nullptr, showMarkers)) { showMarkers = true; focusMarkers = true; wantBottom = true; }
+                    if (ImGui::MenuItem("New combined plot")) {
+                        auto c = std::make_unique<CombinedPlot>(); c->id = nextCombinedId++;
+                        std::snprintf(c->title, sizeof c->title, "Combined %d", c->id);
+                        combined.push_back(std::move(c));
+                    }
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("A plot for channels of several streams, side by side in time.");
                     if (ImGui::MenuItem("New spectrum")) {
                         auto s = std::make_unique<Spectrum>(); s->id = nextSpectrumId++; spectra.push_back(std::move(s));
                         wantBottom = true;
@@ -3128,9 +4195,7 @@ int main(int argc, char** argv) {
                 if (sp.anchored) sp.newest = s->newestTime();
                 sp.dt = g_probeFrameDt;
                 sp.rate = s->measuredRate(); sp.speed = s->deliverySpeed();
-                auto [base, gv] = s->gapSnapshot();
-                sp.gapSec = base;
-                for (const auto& g : gv) sp.gapSec += g.second;
+                sp.gapSec = s->missingSeconds();
                 g_streamProbes.push_back(std::move(sp));
             }
             g_erpProbe = {};
@@ -3138,6 +4203,10 @@ int main(int argc, char** argv) {
                 const Erp& e = *erps.back();
                 ErpProbe& p = g_erpProbe;
                 p.id = e.id; p.count = e.count; p.rejected = e.rejected;
+                if (!e.epochs.empty() && e.epochs.back().size() == e.taxis.size()) {
+                    const auto& ep = e.epochs.back();
+                    p.lastPeakMs = e.taxis[(std::size_t)(std::max_element(ep.begin(), ep.end()) - ep.begin())];
+                }
                 if (e.streamIdx >= 0 && e.streamIdx < (int)sources.size()) p.stream = sources[(std::size_t)e.streamIdx]->name();
                 if (e.markerIdx >= 0 && e.markerIdx < (int)markerSources.size()) {
                     p.trigger      = markerSources[(std::size_t)e.markerIdx]->name();
@@ -3944,46 +5013,13 @@ int main(int argc, char** argv) {
             // is SMOOTHED the same way the per-stream edges are (glide at the data's rate + ease
             // toward the chunky newestTime), else the scroll snaps per chunk. (Re)init if empty.
             if (lockTimeAxes) {
-                double gNewest = 0.0, gSpeed = 1.0;
-                double gTarget = std::numeric_limits<double>::infinity();
-                double gUpper  = std::numeric_limits<double>::infinity();   // just behind the least advanced
-                bool   anyLive = false;                 // a stream not held by a replay pause
-                double gDeliv  = 1.0;                   // the fastest flowing stream's delivery speed
-                for (auto& s : sources)
-                    if (s->anchored()) {
-                        gNewest = std::max(gNewest, s->newestTime());
-                        if (replayHeld(*s)) continue;
-                        anyLive = true;
-                        if (!overdue(*s, 0.5)) {
-                            // Follow the least advanced flowing stream's trajectory (see
-                            // edgeTarget), so none of them shows its wait for the next block as
-                            // a dropout; its slope is the speed to glide at.
-                            const double nw = s->newestTime();
-                            double tgt = nw - edgeLagOf(*s), ff = dataSpeedOf(*s);
-                            edgeTarget(*s, nowLsl, tgt, ff);
-                            if (tgt < gTarget) { gTarget = tgt; gSpeed = ff; }
-                            gUpper = std::min(gUpper, nw - 0.05);
-                            gDeliv = std::max(gDeliv, s->deliverySpeed());
-                        }
-                    }
+                edgeSrcs.clear();
+                for (auto& s : sources) edgeSrcs.push_back(s.get());
                 const double w = std::clamp(lockHistory, 1.0f, 60.0f);
+                EdgeState le{lockEdge, lockVel};
+                const double gNewest = groupEdge(edgeSrcs, le, w, !paused, nowLsl, edgeDt, replayHeld);
+                lockEdge = le.pos; lockVel = le.vel;
                 if (!paused && gNewest > 0.0) {
-                    const bool   flowing = std::isfinite(gTarget);
-                    const double target  = flowing ? gTarget : gNewest - 0.15;
-                    if (lockEdge <= 0.0 || target - lockEdge > w) {                     // init / far behind
-                        lockEdge = target; lockVel = gSpeed;
-                    } else if (!anyLive) {                                               // held: no live red
-                        lockEdge = std::min(lockEdge, target + 0.05); lockVel = 0.0;
-                    } else if (!flowing) {                                               // all stale: red grows
-                        lockVel = 1.0;
-                        lockEdge = std::min(lockEdge + edgeDt, target + w);
-                    } else {
-                        // As a stream's own edge (see followEdge): never back, never into a
-                        // live-dropout strip, and smooth through speed changes.
-                        EdgeState es{lockEdge, lockVel};
-                        followEdge(es, target, gSpeed, gUpper, edgeDt, kEdgeStiff, edgeAccelOf(gDeliv));
-                        lockEdge = es.pos; lockVel = es.vel;
-                    }
                     lockXMax = lockEdge;
                     lockXMin = lockEdge - w;
                 } else if (lockXMax <= lockXMin && gNewest > 0.0) {   // first-frame init while paused
@@ -4110,6 +5146,60 @@ int main(int argc, char** argv) {
                 disconnectKey(streamKeyOf(*toRemove));
             }
             std::erase_if(closing, [](const std::unique_ptr<HfStreamSource>& p) { return p->finished(); });
+
+            // A channel dropped on a stream plot (see streamPlotDropTarget): a new combined plot
+            // with that stream's enabled channels, then the dropped channel.
+            if (g_streamDrop.pending) {
+                g_streamDrop.pending = false;
+                auto c = std::make_unique<CombinedPlot>(); c->id = nextCombinedId++;
+                std::snprintf(c->title, sizeof c->title, "Combined %d", c->id);
+                for (auto& src : sources)
+                    if (keyMatches(*src, g_streamDrop.targetKey)) { addEnabledTraces(*c, *src, g_streamDrop.targetKey, dispOpts); break; }
+                addDroppedTrace(*c, sources, g_streamDrop.drag, -1);
+                combined.push_back(std::move(c));
+            }
+            // ---- Combined plots (View > New combined plot) -------------------------------------
+            // After the stream windows: they freeze the sources on pause, and their dock node is
+            // where a new combined plot goes.
+            for (auto& cpp : combined) {
+                CombinedPlot& cp = *cpp;
+                LSL_ZONE("combined win");
+                resolveCombined(cp, sources);
+                // Stepped with Lock time axes on too: a paused plot's live-dropout band ends at it.
+                const double gNewest = groupEdge(cp.members, cp.edge, (double)cp.view.history, !paused,
+                                                 nowLsl, edgeDt, replayHeld);
+                if (paused && cp.edge.pos <= 0.0 && gNewest > 0.0) cp.edge.pos = gNewest - 0.15;   // opened while paused
+                const bool sib = streamDockNode && ImGui::DockBuilderGetNode(streamDockNode);
+                ImGui::SetNextWindowDockID(sib ? streamDockNode : dockCenter, dockCond);
+                ImGui::SetNextWindowSize(ImVec2(uiScaled(680), uiScaled(420)), ImGuiCond_FirstUseEver);
+                if (cp.focus) { ImGui::SetNextWindowFocus(); cp.focus = false; }
+                char title[96];   // the id after ### stays put while the title is edited
+                std::snprintf(title, sizeof title, "%s###combined%d", cp.title[0] ? cp.title : "Combined", cp.id);
+                pushPanelAccent(PanelKind::signal);
+                ImGui::Begin(title, &cp.open);
+                popPanelAccent();
+                drawFloatingPanelAccent(PanelKind::signal);
+                drawCombined(cp, sources, dispOpts, paused, /*followX=*/(!paused || justPaused), axisLock,
+                             markerViews, scratch);
+                ImGui::End();
+            }
+#ifdef LSL_VIEWER_TESTS
+            g_combinedProbe = {};
+            if (!combined.empty()) {
+                const CombinedPlot& cp = *combined.back();
+                g_combinedProbe.id = cp.id;
+                g_combinedProbe.ticks = cp.tick;
+                g_combinedProbe.state.assign(cp.srcOf.begin(), cp.srcOf.begin() + std::min(cp.srcOf.size(), cp.tick.size()));
+                g_combinedProbe.groups = (int)cp.groups.size();
+                g_combinedProbe.edges.resize(g_combinedProbe.state.size());
+                for (std::size_t i = 0; i < g_combinedProbe.state.size(); ++i) {
+                    const int si = g_combinedProbe.state[i];
+                    if (si >= 0) probeRisingEdges(*sources[(std::size_t)si], cp.traces[i].channel, cp.traces[i].filtered,
+                                                  g_combinedProbe.edges[i]);
+                }
+            }
+#endif
+            std::erase_if(combined, [](const std::unique_ptr<CombinedPlot>& c) { return !c->open; });
 
             // ---- Spectra (multi-instance; View > New spectrum) ---------
             for (auto& fpp : spectra) {
@@ -4553,7 +5643,7 @@ int main(int argc, char** argv) {
                             // half a column so the red ends at the last blank column) plus
                             // the live edge gap scrolling in — same opaque red as the time
                             // series; real data between dropouts is shown (not masked).
-                            drawDropoutRed(*src,
+                            drawDropoutRed(*src, scratch.bands,
                                 (double)spectro.nfft * src->dt() - 0.5 * spectro.hopSec, 0.0);
                             drawBreaks(*src, scratch.breaks);
                             ImPlot::EndPlot();
@@ -5058,6 +6148,17 @@ int main(int argc, char** argv) {
 #endif
 
             if (swapchain && !minimized) {
+                // The draw data has the window size of NewFrame, and the swapchain has the size at
+                // acquire. A resize that another process makes in between (a window manager, or
+                // Windows moving the window off a detached display) leaves the draw data larger
+                // than the target. Since SDL 3.4.18, debug mode (LSL_GPU_DEBUG) asserts on a
+                // viewport or scissor larger than the target. A smaller DisplaySize crops the frame
+                // at the same pixel scale, which is what the GPU did with the larger viewport.
+                const ImVec2 fbScale = draw_data->FramebufferScale;
+                if (fbScale.x > 0.0f && fbScale.y > 0.0f) {
+                    draw_data->DisplaySize.x = std::min(draw_data->DisplaySize.x, (float)sw / fbScale.x);
+                    draw_data->DisplaySize.y = std::min(draw_data->DisplaySize.y, (float)sh / fbScale.y);
+                }
                 ImGui_ImplSDLGPU3_PrepareDrawData(draw_data, cmd);  // MANDATORY, pre-pass
 
                 SDL_GPUColorTargetInfo target = {};

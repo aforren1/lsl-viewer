@@ -9,7 +9,8 @@
 //
 // The producer is the ONLY writer to the ring and the summary (DESIGN invariant 1).
 // For a regular-rate stream we do NOT store per-sample timestamps: x is derived
-// from absolute sample index + srate using a single (index <-> LSL clock) anchor
+// from absolute sample index + srate using a single (index <-> LSL clock) anchor,
+// and a drift map (drift_map.hpp) carries it onto the stream's own timestamps
 // (DESIGN invariant 5).
 //
 // Discovery is unchanged from lsl_source.hpp (kept here so the new path has no
@@ -17,6 +18,7 @@
 
 #include <lsl_cpp.h>
 
+#include "drift_map.hpp"
 #include "magic_ring_buffer.hpp"
 #include "minmax_summary.hpp"
 #include "filter.hpp"
@@ -31,6 +33,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -107,6 +110,9 @@ public:
         chanAmp_.assign(channels_, 0.0f);    // measured µV amplitude (render-only)
 
         chunkSamples_ = std::max<std::size_t>(1024, (std::size_t)(rate * 0.5));
+
+        // LSL_DRIFT_CORR=0 keeps D at 0: the plain index mapping, for A/B checks.
+        if (const char* e = std::getenv("LSL_DRIFT_CORR")) driftOn_ = std::strcmp(e, "0") != 0;
     }
 
     ~HfStreamSource() { stop(); }   // joins worker before the buffers it uses go away
@@ -190,56 +196,60 @@ public:
     // Wall-clock time (s) of the newest sample, accounting for dropouts.
     double newestTime() const { return realTime(time0() + (double)head() * dt_); }
 
-    // --- dropout-aware time mapping ------------------------------------------
-    // Map an index-derived ("old-frame") time to real time by adding the duration
-    // of every recorded dropout that occurred at/before it. Keeps the time axis
-    // honest so a stream that was down shows a gap rather than collapsing.
+    // --- dropout- and drift-aware time mapping --------------------------------
+    // Map an index-derived ("old-frame") time x = t0 + i * dt to display time: add the
+    // duration of every recorded dropout at/before it (so a stream that was down shows a gap
+    // rather than collapsing) and the drift correction D(x) (so the axis follows the stream's
+    // own timestamps when the device is off its nominal rate). See drift_map.hpp.
     double realTime(double oldT) const {
+        LSL_ZONE("realTime");
         std::lock_guard<std::mutex> lk(gapMtx_);
-        double off = gapBase_;   // gaps pruned from the list contribute a constant base
-        for (auto& g : gaps_) if (g.first <= oldT) off += g.second;
-        return oldT + off;
+        return map_.realTime(oldT);
     }
-    // Inverse of realTime: map a real (wall-clock) time back to the index-derived
-    // "old-frame" time, subtracting every dropout that precedes it. Needed to turn a
-    // marker's real timestamp into a sample index (idx = (oldFrameTime(T) - t0) / dt).
-    // A T landing inside a dropout interval maps to the resumption boundary.
+    // Inverse of realTime. Needed to turn a marker's real timestamp into a sample index
+    // (idx = (oldFrameTime(T) - t0) / dt). A T inside a dropout maps to the resumption boundary.
     double oldFrameTime(double realT) const {
         std::lock_guard<std::mutex> lk(gapMtx_);
-        double off = gapBase_;
-        for (auto& g : gaps_) {
-            // Real-time position of this gap's far edge = g.first + off + g.second.
-            if (realT >= g.first + off + g.second) { off += g.second; continue; }
-            // Inside the dropout no sample exists, so clamp to the first one after it.
-            // Subtracting only the earlier gaps would land up to one gap length past it, in
-            // data recorded later: a marker a microsecond before the resumption would be
-            // matched to samples taken seconds after it.
-            if (realT > g.first + off) return g.first;
-            break;
-        }
-        return realT - off;
+        return map_.oldFrameTime(realT);
     }
     // In-place old-frame -> real time for a monotonically increasing array.
     void applyGaps(double* x, int n) const {
+        LSL_ZONE("applyGaps");
         std::lock_guard<std::mutex> lk(gapMtx_);
-        double off = gapBase_; std::size_t gi = 0;
-        if (gaps_.empty() && off == 0.0) return;
-        for (int i = 0; i < n; ++i) {
-            while (gi < gaps_.size() && gaps_[gi].first <= x[i]) { off += gaps_[gi].second; ++gi; }
-            x[i] += off;
-        }
+        map_.apply(x, n);
     }
     // Snapshot of recorded dropouts as (old-frame time, seconds).
     std::vector<std::pair<double, double>> gaps() const {
         std::lock_guard<std::mutex> lk(gapMtx_);
-        return gaps_;
+        return map_.gaps();
     }
-    // Consistent (folded-base offset, recent gaps) for display positioning — taken
-    // under one lock so a concurrent prune can't double-count a just-folded gap.
-    std::pair<double, std::vector<std::pair<double, double>>> gapSnapshot() const {
+    // Recorded dropouts as display-time intervals [start, end), drift included, taken under one
+    // lock so a concurrent prune can't double-count a just-folded gap. `out` is reused.
+    void gapBands(std::vector<std::pair<double, double>>& out) const {
         std::lock_guard<std::mutex> lk(gapMtx_);
-        return {gapBase_, gaps_};
+        map_.bands(out);
     }
+    // Seconds of every recorded dropout, the folded ones included.
+    double missingSeconds() const {
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        return map_.missingSeconds();
+    }
+    // The drift correction now applied: the newest segment's slope (ppm; negative when the
+    // device runs fast, so the index time runs ahead of its stamps), and D at the newest
+    // sample (ms).
+    double driftPpm() const {
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        return map_.headSlope() * 1e6;
+    }
+    double driftMs() const {
+        const double x = time0() + (double)head() * dt_;
+        std::lock_guard<std::mutex> lk(gapMtx_);
+        return map_.drift(x) * 1e3;
+    }
+    bool driftEnabled() const { return driftOn_ && !irregular_; }
+    // The stamps run at a rate no crystal has (a replay with stamps scaled by its speed):
+    // the map holds its slope instead of following.
+    bool driftMismatch() const { return driftMismatch_.load(std::memory_order_relaxed); }
     float hpR() const { return hpR_.load(std::memory_order_relaxed); }  // for on-the-fly filtering
 
     // --- replay breaks ---------------------------------------------------------
@@ -268,7 +278,7 @@ public:
         const double t0 = t0_.load(std::memory_order_acquire);
         const double a  = t0 + ((double)i0 + 0.5) * dt_, b = t0 + ((double)i1 - 0.5) * dt_;
         std::lock_guard<std::mutex> lk(gapMtx_);
-        for (const auto& g : gaps_)   if (g.first > a && g.first < b) return true;
+        for (const auto& g : map_.gaps()) if (g.first > a && g.first < b) return true;
         for (const auto& m : breaks_) if (m.t > a && m.t < b)         return true;
         return false;
     }
@@ -278,14 +288,15 @@ public:
     void breakTimes(std::vector<BreakMark>& out) const {
         out.clear();
         std::lock_guard<std::mutex> lk(gapMtx_);
-        double off = gapBase_;
+        const auto& gaps = map_.gaps();
+        double off = map_.gapBase();
         std::size_t gi = 0;
         // Strictly earlier gaps only: a seek into a part with no data records its dropout at
         // the same index, and the mark belongs at the start of that red band, not its end.
         for (const BreakMark& b : breaks_) {
-            while (gi < gaps_.size() && gaps_[gi].first < b.t) off += gaps_[gi++].second;
+            while (gi < gaps.size() && gaps[gi].first < b.t) off += gaps[gi++].second;
             out.push_back(b);
-            out.back().t = b.t + off;
+            out.back().t = b.t + off + map_.drift(b.t);
         }
     }
 
@@ -576,6 +587,12 @@ private:
                     const std::uint64_t absLast = headBefore + n - 1;
                     const double t = (ts[n - 1] + offset) - (double)absLast * dt_;
                     t0_.store(t, std::memory_order_release);
+                    // The drift map starts here with D = 0.
+                    if (driftOn_) {
+                        const double xa = t + (double)absLast * dt_;
+                        { std::lock_guard<std::mutex> lk(gapMtx_); map_.addKnot(xa, 0.0); }
+                        drift_.start(xa);
+                    }
                     anchored_.store(true, std::memory_order_release);
                 }
 
@@ -597,24 +614,47 @@ private:
                     // subscribes late misses what was sent before, and that is not missing data.
                     const bool brk0 = !brkHere_.empty() && brkHere_[0].first == 0;
                     const double expect = brk0 ? brkHere_[bk++].second : lastTs_ + dt_;
+                    // Detection stays on the raw stamps; the length comes from the drift fit
+                    // when it can steer (see DriftServo::gapLength). A replay break measures
+                    // from its own stamp. The producer is the map's only writer: no lock to read.
+                    auto gapLen = [&](std::size_t i, double raw) {
+                        if (!driftOn_) return raw;
+                        const double x = t0_.load(std::memory_order_relaxed) + (double)(headBefore + i) * dt_;
+                        return drift_.gapLength(x, ts[i] + offset, map_.gapOffset(x), raw);
+                    };
                     if (lastTsValid_) {
                         const double g = ts[0] - expect;
-                        if (g > 0.25) recordGap(headBefore, g);   // s; above jitter, below real dropouts
+                        if (g > 0.25) recordGap(headBefore, brk0 ? g : gapLen(0, g));   // s; above jitter, below real dropouts
                     }
                     // Within the pull as well: a pull that spans a dropout (the viewer fell
                     // behind by more than the gap, or the sender pushed both sides at once) has
                     // the jump between two of its samples, and checking only its first sample
                     // would join the two sides as if no time had passed. One pass in sample
-                    // order keeps gaps_ sorted; at a replay break the new part is measured from
-                    // the break stamp, not from the sample before it.
+                    // order keeps the gap list sorted; at a replay break the new part is measured
+                    // from the break stamp, not from the sample before it.
                     for (std::size_t i = 1; i < n; ++i) {
-                        double g;
-                        if (bk < brkHere_.size() && brkHere_[bk].first == i) g = ts[i] - brkHere_[bk++].second;
-                        else                                                  g = ts[i] - (ts[i - 1] + dt_);
-                        if (g > 0.25) recordGap(headBefore + i, g);
+                        const bool brk = bk < brkHere_.size() && brkHere_[bk].first == i;
+                        const double g = brk ? ts[i] - brkHere_[bk++].second : ts[i] - (ts[i - 1] + dt_);
+                        if (g > 0.25) recordGap(headBefore + i, brk ? g : gapLen(i, g));
                     }
                     lastTs_ = ts[n - 1];
                     lastTsValid_ = true;
+
+                    // Drift: one residual per pull, from the newest sample (liblsl back-fills
+                    // the others from the nominal rate), after the dropout check so G includes
+                    // any gap just found and r stays continuous across it. A knot lands only at
+                    // this newest sample, which is not published yet, so no sample on screen
+                    // moves. The producer is the map's only writer, so it reads without the lock.
+                    if (driftOn_) {
+                        const double xh = t0_.load(std::memory_order_relaxed) + (double)(headBefore + n - 1) * dt_;
+                        const double r  = (ts[n - 1] + offset) - (xh + map_.gapOffset(xh));
+                        double sNew = 0.0;
+                        if (drift_.update(xh, r, map_, sNew)) {
+                            std::lock_guard<std::mutex> lk(gapMtx_);
+                            map_.addKnot(xh, sNew);
+                        }
+                        driftMismatch_.store(drift_.mismatch(), std::memory_order_relaxed);
+                    }
                 }
 
                 // Conditioned chain + publish (derived structures first, raw head last).
@@ -802,14 +842,11 @@ private:
         const double oldTime = t0_.load(std::memory_order_acquire) + (double)idx * dt_;
         dropouts_.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(gapMtx_);
-        gaps_.push_back({oldTime, g});
-        // Fold gaps far older than any visible window into a constant
-        // base (a gap offsets ALL later times), so the per-frame walk in
-        // realTime/applyGaps stays bounded over an hours-long session.
-        const double cutoff = oldTime - 120.0;   // > max history + ring reach
-        std::size_t k = 0;
-        while (k < gaps_.size() && gaps_[k].first < cutoff) gapBase_ += gaps_[k++].second;
-        if (k > 0) gaps_.erase(gaps_.begin(), gaps_.begin() + k);
+        // Gaps far older than any visible window fold into a constant base (a gap offsets ALL
+        // later times), so the per-frame walk in realTime/applyGaps stays bounded over an
+        // hours-long session.
+        map_.addGap(oldTime, g);
+        const double cutoff = oldTime - driftmap::kRetention;   // > max history + ring reach
         // breakTimes counts only the gaps still listed; a break before a folded gap would
         // be placed without it.
         std::erase_if(breaks_, [&](const BreakMark& b) { return b.t < cutoff; });
@@ -929,11 +966,13 @@ private:
     std::size_t                gapHead_ = 0, gapCount_ = 0;
     std::atomic<double>        arrivalGap_{0.0};     // their 80th percentile
 
-    // Dropout tracking. gaps_ is producer-appended / render-read under gapMtx_;
-    // lastTs_/lastTsValid_ are producer-only.
+    // Dropout and drift tracking. map_ (gaps + drift knots) is producer-written / render-read
+    // under gapMtx_; lastTs_/lastTsValid_ and drift_ are producer-only.
     mutable std::mutex                          gapMtx_;
-    std::vector<std::pair<double, double>>      gaps_;   // (old-frame time, seconds), recent only
-    double                                      gapBase_ = 0.0;   // folded offset of pruned gaps
+    TimeMap                                     map_;
+    DriftServo                                  drift_;
+    bool                                        driftOn_ = true;   // LSL_DRIFT_CORR=0 turns it off
+    std::atomic<bool>                           driftMismatch_{false};
     double                                      lastTs_ = 0.0;
     bool                                        lastTsValid_ = false;
     std::vector<BreakMark>                      breaks_;   // placed replay breaks (old-frame time), under gapMtx_
