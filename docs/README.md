@@ -4,7 +4,7 @@ The pages in this folder are for people who use the viewer. The pages in [techni
 
 ## Tutorial
 
-- [Get started](getting-started.md): install the viewer, look at the demo streams, and make a first recording.
+- [Get started](getting-started.md): install the viewer, and run the built-in walkthrough.
 
 ## How-to guides
 

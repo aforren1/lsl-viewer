@@ -90,11 +90,11 @@ Hover over a channel name in the stacked montage or the raster. The viewer highl
 
 ## Apply filters
 
-The filters are in the **Display** section. You can use them in any combination. When all of them are off, the plot shows the raw signal.
+The filters are in the **Display** section. You can use them in any combination. A new plot has the high-pass filter on and the others off. When all of them are off, the plot shows the raw signal.
 
 | Control | Effect |
 |---|---|
-| **High-pass** | Removes DC and slow drift. The cutoff is 0.1 Hz to 5 Hz. |
+| **High-pass** | Removes DC and slow drift. The cutoff is 0.1 Hz to 5 Hz. This filter is on by default. |
 | **Notch** | Removes the mains frequency. The button beside the slider changes between 50 Hz and 60 Hz. |
 | **Low-pass** | Removes the content above the cutoff, such as muscle activity. The cutoff is 5 Hz to 120 Hz. |
 | **Reference** | **Avg (CAR)** subtracts the common average. **Channel** subtracts one channel that you select. |

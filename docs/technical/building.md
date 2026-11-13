@@ -132,11 +132,12 @@ uv run tools/make_doc_screenshots.py --shots plot,combined
 
 | Shot | File | Page |
 |------|------|------|
+| `walkthrough` | `walkthrough.png` | [Get started](../getting-started.md) |
 | `overview` | `overview.png` | [Get started](../getting-started.md) |
 | `plot` | `stream-plot.png` | [View streams](../view-streams.md) |
 | `combined` | `combined-plot.png` | [View streams](../view-streams.md) |
 | `markers` | `marker-events.png` | [View streams](../view-streams.md) |
-| `recording` | `rail-recording.png` | [Get started](../getting-started.md), [Record and replay](../record-and-replay.md) |
+| `recording` | `rail-recording.png` | [Record and replay](../record-and-replay.md) |
 | `playback` | `rail-playback.png` | [Record and replay](../record-and-replay.md) |
 
 To add a shot, add it to the usage-pages block of `capture_readme` in
@@ -150,6 +151,26 @@ The script does not take the README images (`montage.png`, `spectrum.png`,
 `spectrogram.png`, `erp.png`, and `live.gif`). They need the streams of
 `tools/lsl_test_streams.py` and a larger display. The comment above `capture_readme`
 gives the commands.
+
+## Walkthrough
+
+**Tools > Walkthrough** is in `src/walkthrough.hpp`. Each step has a text, a condition on
+the application state (`tour::Facts`, which `main()` fills each frame), and one or more
+`tour::anchor()` calls beside the widgets that do the step. The step completes when its
+condition is true, and the highlight goes to the anchor with the lowest rank that is on
+the screen.
+
+The `ui/walkthrough` test does all steps in the real UI. It fails if a step cannot
+complete, or if the widget of a step has no anchor. Thus, when you change a part of the UI
+that a step uses, run it:
+
+```bash
+lsl_viewer --tests walkthrough
+```
+
+To add a step: add it to `tour::Step` and `tour::kSteps`, add what it needs to
+`tour::Facts`, put a `tour::anchor()` call after its widget, and add the step to the test.
+Nothing checks the text of a step, so read it when you rename a control.
 
 ## Optional CMake flags
 
@@ -267,6 +288,7 @@ src/                     the viewer — one translation unit + header-only modul
   xdf_player.hpp           XDF replay engine (outlets, playback clock, pause/seek/speed/loop)
   remote_control.hpp       TCP remote-control server (start/stop/status)
   theme.hpp                UI theme + embedded font
+  walkthrough.hpp          Tools > Walkthrough: the steps, the panel, and the highlight
   profiler.hpp             zone-profiling macros (text profiler / Tracy / no-op)
 
 tools/                   standalone helpers (not linked into the viewer)

@@ -1,6 +1,6 @@
 # Get started
 
-This tutorial takes about ten minutes. You install the viewer, look at the built-in demo streams, apply a filter, and make a short recording. You do not need an amplifier or other LSL source.
+This tutorial takes about ten minutes. You install the viewer, and then the built-in walkthrough takes you through the demo streams, a filter, an analysis window, and a short recording. You do not need an amplifier or other LSL source.
 
 ## 1. Install the viewer
 
@@ -22,12 +22,46 @@ On macOS 15 (Sequoia) and later, the system asks if the viewer can find devices 
 
 For the hardware and system requirements, see the [README](../README.md#system-requirements).
 
-## 2. Start the demo streams
+## 2. Run the walkthrough
 
-1. Start the viewer. The **Streams** rail is on the left side of the window. It shows the streams that LSL finds on the network.
-2. Select **Tools > Emit demo streams**.
+The viewer has a built-in walkthrough. It takes you through the main features on synthetic demo streams, in the real window.
 
-The viewer now publishes five synthetic streams and connects to them:
+1. Start the viewer.
+2. Select **Tools > Walkthrough**.
+3. Do the step that the **Walkthrough** panel shows. An amber frame shows the control or the menu to use.
+
+![The Walkthrough panel, with a frame around the control for the current step](images/walkthrough.png)
+
+The walkthrough completes a step when you do it, and then shows the next one. There is no button to confirm a step. You can move the panel, and you can close it at any time.
+
+| Button | Effect |
+|---|---|
+| **Skip step** | Goes to the next step. Use it for a step that you do not want to do, such as the recording. |
+| **Start again** | Goes back to the first step. A step whose result is already there completes immediately. |
+
+The walkthrough has these steps:
+
+1. Show the demo streams.
+2. Apply a filter.
+3. Pause the display, and continue it.
+4. Open an analysis window.
+5. Start a recording, and stop it.
+6. Check the recording in **Playback**.
+
+The recording step writes a small file to your recording folder. The default folder is `Documents/lsl-recordings`.
+
+## 3. Look around
+
+When the walkthrough is complete, the window looks almost the same as this image:
+
+![The viewer window with the demo streams, a stream plot, and a spectrum](images/overview.png)
+
+- The **Streams** rail on the left lists the streams that LSL finds on the network. A connected stream has `[on]` before its name.
+- Each data stream is a plot tab. The control strip on the left side of a plot has the display settings, the filters, and the channels.
+- The analysis windows are in the row below the plots.
+- The **Recording** and **Playback** sections are at the bottom of the rail.
+
+The demo has these streams:
 
 | Stream | Contents |
 |---|---|
@@ -37,46 +71,7 @@ The viewer now publishes five synthetic streams and connects to them:
 | `MockEvoked` | One channel with an evoked response. |
 | `MockEvokedMarkers` | The markers that go with `MockEvoked`. |
 
-Each data stream opens as a plot tab. A connected stream has `[on]` before its name in the rail.
-
-![The viewer window with the demo streams, a stream plot, and a spectrum](images/overview.png)
-
-The window in this image also has a spectrum, which you open in step 4.
-
-## 3. Look at a stream
-
-1. In the rail, click `MockEEG`. The viewer brings its plot to the front.
-2. In the control strip on the left side of the plot, open **Display**.
-3. Move **History (s)** to change the length of the time window.
-4. Select **High-pass**. The slow drift goes out of the traces.
-5. Push the **P** key. The plots stop. Push **P** again to continue.
-
-The marker events show as labeled vertical lines on the plots.
-
-## 4. Open an analysis window
-
-1. Select **View > New spectrum**.
-2. In the **stream** list of the new window, select `MockAudio`.
-3. Select **Fit Hz**. The frequency axis now shows only the band that holds the tones.
-
-## 5. Make a recording
-
-The **Recording** section is below the stream list in the rail.
-
-1. Look at the line that starts with `->`. It shows the full path of the file that the viewer will write.
-2. Select **Record**. The right side of the menu bar shows `[REC ...]` with the time and the file size.
-3. After some seconds, select **Stop recording**.
-
-The recording holds all connected streams. The default folder is `Documents/lsl-recordings`.
-
-![The Streams rail with the Recording section](images/rail-recording.png)
-
-## 6. Check the recording
-
-1. Select **Tools > Emit demo streams** again to stop the demo streams.
-2. In the **Playback** section of the rail, select **Open XDF file...** and then the file that you recorded.
-
-The viewer plays the file back as live streams. Use the position slider, the speed list, and **Loop** to examine the recording.
+To stop the demo streams, select **Tools > Emit demo streams** again.
 
 ## Next steps
 

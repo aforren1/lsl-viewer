@@ -7,10 +7,10 @@ A real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreamin
 ## Quick start
 
 1. Download the viewer for your system from the [Releases page](https://github.com/aforren1/lsl-viewer/releases).
-2. Start the viewer, and select **Tools > Emit demo streams**. The viewer then publishes a synthetic set of streams and shows them: EEG with EOG, a 1 Hz to 40 Hz chirp, a 48 kHz stereo tone, and an evoked-response stream with markers.
+2. Start the viewer, and select **Tools > Walkthrough**. The walkthrough takes you through the main features on synthetic demo streams: EEG with EOG, a 1 Hz to 40 Hz chirp, a 48 kHz stereo tone, and an evoked-response stream with markers.
 3. To use your own devices, click a stream in the **Streams** rail to connect it.
 
-The [tutorial](docs/getting-started.md) goes through the installation, the plots, and a first recording.
+The [tutorial](docs/getting-started.md) has the installation notes for each system.
 
 ## Features
 
@@ -85,6 +85,7 @@ See [Control the recording from a script](docs/remote-control.md).
 - A docking layout, and saved workspaces that hold the streams, the filters, the analysis windows, and the layout.
 - Information for each stream: the metadata, the measured rate, the clock offset, and the dropouts.
 - A light theme and a dark theme, and an adjustable UI scale.
+- A built-in walkthrough and demo streams, to learn the viewer with no hardware.
 
 See [Workspaces and settings](docs/settings.md).
 

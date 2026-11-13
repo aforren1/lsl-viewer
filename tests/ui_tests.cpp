@@ -17,6 +17,7 @@
 #include "fft.hpp"               // Psd (KissFFT-backed) under test
 #include "heatmap_image.hpp"     // heatmaps as one textured quad, under test
 #include "remote_control.hpp"   // TCP control server under test (+ its rc_socket_t layer)
+#include "walkthrough.hpp"      // tour::g, the walkthrough's state (one inline object, shared with main.cpp)
 #include "xdf_player.hpp"       // XdfPlayer::State, for the replay test
 #include "xdf_writer.hpp"       // writes the replay test's file
 #include <algorithm>
@@ -2272,6 +2273,124 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         ctx->Yield(3);
     };
 
+    // Tools > Walkthrough, from the first step to the last, each one done in the real UI. This is
+    // what keeps the walkthrough from going stale: a step whose state the UI can no longer reach
+    // times out here, and a step whose widget lost its tour::anchor() call fails the `seen` check.
+    // Needs no other streams: it starts the demo streams itself, as the first step asks. Run with
+    // other tests before it, a step can be complete from the start (a stream is connected already);
+    // such a step is logged and not checked.
+    t = IM_REGISTER_TEST(e, "ui", "walkthrough");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        using tour::Step;
+        auto waitFor = [&](auto pred, double seconds) {   // wall clock: discovery and the recorder run in real time
+            const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+            while (!pred() && std::chrono::steady_clock::now() < end) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                ctx->Yield();
+            }
+            return pred();
+        };
+        // The state that the cheap steps ask for must not hold yet.
+        ctx->MenuUncheck("//##MainMenuBar/View/Pause display");
+        for (int i = 0; i < 16; ++i) {
+            std::string ref;
+            if (openSpectra(&ref) == 0) break;
+            ctx->WindowClose(ref.c_str());
+            ctx->Yield(2);
+        }
+        const bool demoWasOn = ctx->GetWindowByRef("//MockEEG") != nullptr;
+        auto mockEegCfg = [&] {
+            ctx->WindowFocus("//MockEEG"); ctx->Yield(2);
+            ImGuiTestItemInfo cfg = ctx->WindowInfo("//MockEEG/cfg");
+            if (cfg.Window == nullptr) { IM_ERRORF("%s", "no cfg child in MockEEG"); return false; }
+            ctx->SetRef(cfg.Window);
+            ctx->ItemOpen("Display");
+            return true;
+        };
+        if (demoWasOn) { if (!mockEegCfg()) return; ctx->ItemUncheck("Notch"); }
+
+        tour::g.open = false;
+        ctx->MenuClick("//##MainMenuBar/Tools/Walkthrough");
+        ctx->Yield(3);
+        IM_CHECK(tour::g.open);
+        IM_CHECK(ctx->GetWindowByRef("//Walkthrough") != nullptr);
+
+        unsigned pre = 0;                                 // steps that were complete before the test did them
+        auto step = [&](Step s, const char* name, auto act) {
+            ctx->Yield(3);
+            if (tour::g.cur > (int)s) { ctx->LogInfo("step '%s' was complete already", name); pre |= 1u << (int)s; return true; }
+            if (tour::g.cur != (int)s) { IM_ERRORF("at step %d, expected '%s'", tour::g.cur, name); return false; }
+            act();
+            if (!waitFor([&] { return tour::g.cur > (int)s; }, 20.0)) { IM_ERRORF("step '%s' did not complete", name); return false; }
+            return true;
+        };
+
+        const std::filesystem::path dir  = std::filesystem::temp_directory_path() / "lsl_viewer_walkthrough_test";
+        const std::filesystem::path file = dir / "replay.xdf";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        bool ok =
+            step(Step::demo, "demo", [&] { ctx->MenuClick("//##MainMenuBar/Tools/Emit demo streams"); }) &&
+            step(Step::filter, "filter", [&] {
+                // Each plot takes the focus as its stream connects, which closes an open menu:
+                // let them all arrive before the menu steps below.
+                auto have = [&](const char* w) { return ctx->GetWindowByRef(w) != nullptr; };
+                if (!waitFor([&] { return have("//MockEEG") && have("//MockChirp") && have("//MockAudio") &&
+                                          have("//MockEvoked"); }, 20.0)) return;
+                waitFor([] { return false; }, 2.0);
+                if (mockEegCfg()) ctx->ItemCheck("Notch");
+            }) &&
+            step(Step::pause,    "pause",    [&] { ctx->MenuCheck("//##MainMenuBar/View/Pause display"); }) &&
+            step(Step::resume,   "resume",   [&] { ctx->MenuUncheck("//##MainMenuBar/View/Pause display"); }) &&
+            step(Step::spectrum, "spectrum", [&] { ctx->MenuClick("//##MainMenuBar/View/New spectrum"); }) &&
+            step(Step::record,   "record",   [&] {
+                ctx->SetRef("//Streams");
+                ctx->ItemInputValue("##recdir", dir.string().c_str());   // not the test run's data folder
+                ctx->ItemClick("Record");
+            }) &&
+            step(Step::stop, "stop", [&] {
+                waitFor([] { return false; }, 1.0);
+                ctx->SetRef("//Streams");
+                ctx->ItemClick("Stop recording");
+            }) &&
+            step(Step::replay, "replay", [&] {
+                // The file dialog is native, so the hook stands in for the click and the choice.
+                writeReplayTestFile(file.string());
+                lslViewerRequestReplay(file.string().c_str());
+            });
+        if (ok) {
+            ctx->Yield(3);
+            IM_CHECK_EQ(tour::g.cur, (int)Step::count);
+            const unsigned all = (1u << (int)Step::count) - 1u;
+            ctx->LogInfo("anchors seen: 0x%02x, complete before the test: 0x%02x", tour::g.seen, pre);
+            IM_CHECK_EQ((tour::g.seen | pre), all);
+            ctx->SetRef("//Walkthrough");
+            IM_CHECK(ctx->ItemExists("Close"));
+            IM_CHECK(!ctx->ItemExists("Skip step"));
+            ctx->ItemClick("Close");
+            ctx->Yield(2);
+            IM_CHECK(!tour::g.open);
+        }
+
+        // Leave the view as it was, also after a failure.
+        tour::g.open = false;
+        ctx->MenuUncheck("//##MainMenuBar/View/Pause display");
+        ctx->SetRef("//Streams");
+        if (ctx->ItemExists("Stop recording")) ctx->ItemClick("Stop recording");
+        if (ctx->ItemExists("Stop")) {
+            ctx->ItemClick("Stop");
+            waitFor([] { return replayProbe().shown == 0; }, 3.0);
+        }
+        if (ctx->ItemExists("###replayclose")) ctx->ItemClick("###replayclose");
+        ctx->ItemInputValue("##recdir", "");
+        std::string ref;
+        if (openSpectra(&ref) > 0) ctx->WindowClose(ref.c_str());
+        if (ctx->GetWindowByRef("//MockEEG") != nullptr && mockEegCfg()) ctx->ItemUncheck("Notch");
+        if (!demoWasOn) ctx->MenuUncheck("//##MainMenuBar/Tools/Emit demo streams");
+        waitFor([] { return false; }, 1.0);               // the recorder closes its file on its own thread
+        std::filesystem::remove_all(dir, ec);
+    };
+
     // The README images in docs/images/, opt-in: LSL_README_SHOTS lists the ones to take, from
     // montage,spectrum,spectrogram,erp,live (unset: the test returns at once). Streams are connected
     // by source_id, not autoconnect, so a stray stream on the network neither shows up as a tab nor
@@ -2376,7 +2495,7 @@ void RegisterAppTests(ImGuiTestEngine* e) {
         // so tools/make_doc_screenshots.py can take them with no other process. Each shot leaves
         // the view as the next one expects it, so the order here is the order they are taken in.
         if (want("overview") || want("plot") || want("combined") || want("markers") ||
-            want("recording") || want("playback")) {
+            want("recording") || want("playback") || want("walkthrough")) {
             auto have = [&](const char* w) { return ctx->GetWindowByRef(w) != nullptr; };
             if (!waitFor([&] { return have("//MockEEG") && have("//MockChirp") && have("//MockAudio") &&
                                       have("//MockEvoked"); }, 20.0)) {
@@ -2386,6 +2505,15 @@ void RegisterAppTests(ImGuiTestEngine* e) {
             pause(2.0);                                   // the marker stream opens no window to wait on
             ctx->SetRef("//Streams");                     // the rail would show this machine's folder
             ctx->ItemInputValue("##recdir", "");
+            if (want("walkthrough")) {                    // first: no step but the demo one is complete yet
+                ctx->MenuClick("//##MainMenuBar/Tools/Walkthrough");
+                ctx->WindowFocus("//MockEEG");
+                pause(8.0);                               // most of the 10 s history
+                shot(ImGuiTestRef(), "walkthrough");
+                tour::g.open = false;
+                ctx->Yield(2);
+                ctx->SetRef("//Streams");
+            }
             if (want("recording")) {
                 ctx->ItemOpen("filename fields");
                 shot("//Streams", "recording");
@@ -2396,7 +2524,6 @@ void RegisterAppTests(ImGuiTestEngine* e) {
                 const std::string spectrum = newWindow("New spectrum", "Spectrum ");
                 if (!bindSpectrum(spectrum, "MockAudio")) return;
                 if (!openHeaders("MockEEG", {"Display"})) return;
-                ctx->ItemCheck("High-pass");              // else the drift takes the lanes off center
                 pause(11.0);                              // fill the 10 s history
                 if (!cfgOf(spectrum)) return;
                 ctx->ItemClick("Fit Hz");

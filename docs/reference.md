@@ -17,6 +17,7 @@
 
 | Item | Effect |
 |---|---|
+| **Walkthrough** | Opens a guided tour of the main features. See [Get started](getting-started.md#2-run-the-walkthrough). |
 | **Emit demo streams** | Publishes synthetic streams and connects to them. |
 
 ### View

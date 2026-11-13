@@ -34,6 +34,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 # Shot name in LSL_README_SHOTS -> file name in docs/images/.
 SHOTS = {
+    "walkthrough": "walkthrough.png",
     "overview": "overview.png",
     "plot": "stream-plot.png",
     "combined": "combined-plot.png",
