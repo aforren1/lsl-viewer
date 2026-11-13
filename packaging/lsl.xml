@@ -9,7 +9,7 @@
   The ports, not the program: firewalld matches on ports only. This is sufficient
   because liblsl keeps to a bounded range.
 
-  For how to install this file, see docs/network.md.
+  For how to install this file, see docs/technical/network.md.
 -->
 <service>
   <short>Lab Streaming Layer</short>

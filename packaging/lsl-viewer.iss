@@ -38,7 +38,7 @@ ArchitecturesInstallIn64BitMode=x64
 ; port) to work across machines. Without a rule, the first launch raises the Windows Defender
 ; prompt, and a user who cancels it (or who cannot elevate) gets a persistent BLOCK rule that
 ; silently breaks stream resolution afterwards. Adding the rule here uses the elevation the
-; installer already has. Deselect with /TASKS="" for an unattended install. See docs/network.md.
+; installer already has. Deselect with /TASKS="" for an unattended install. See docs/technical/network.md.
 Name: firewall;       Description: "Allow LSL network discovery (private and domain networks)"; GroupDescription: "Windows Firewall:"
 Name: firewall\public; Description: "Also allow on public networks (an isolated lab network is often classified public)"; Flags: unchecked
 

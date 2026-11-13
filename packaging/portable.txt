@@ -7,6 +7,6 @@ your system's app-data and Documents folders. Move this folder anywhere (USB sti
 share, …) and your setup travels with it.
 
 Delete this file to use the standard per-user locations instead
-(see docs/building.md, "Data and config locations").
+(see docs/settings.md, "Where the viewer keeps its files").
 
 The application only checks that this file exists; its contents are ignored.

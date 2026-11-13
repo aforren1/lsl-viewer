@@ -6,7 +6,11 @@ A real-time viewer for [Lab Streaming Layer](https://github.com/sccn/labstreamin
 
 ## Quick start
 
-To try all the views without an external source, launch the application and select **Tools > Emit demo streams**. The viewer then publishes a synthetic set: EEG with EOG, a 1 Hz to 40 Hz chirp, a 48 kHz stereo tone, and an evoked-response stream with markers.
+1. Download the viewer for your system from the [Releases page](https://github.com/aforren1/lsl-viewer/releases).
+2. Start the viewer, and select **Tools > Emit demo streams**. The viewer then publishes a synthetic set of streams and shows them: EEG with EOG, a 1 Hz to 40 Hz chirp, a 48 kHz stereo tone, and an evoked-response stream with markers.
+3. To use your own devices, click a stream in the **Streams** rail to connect it.
+
+The [tutorial](docs/getting-started.md) goes through the installation, the plots, and a first recording.
 
 ## Features
 
@@ -14,22 +18,22 @@ To try all the views without an external source, launch the application and sele
 
 ![Stacked montage of slow drift channels beside a 128-channel raster](docs/images/montage.png)
 
-- A stacked montage that gives each channel its own named lane, or a shared-axis overlay. Each channel has a gain control, and there is an auto-fit.
-- A raster/heatmap mode for high channel counts (32 to 256 or more), where single line traces become too thin to read.
-- To find one channel quickly, hover over its name in the stacked montage or raster. The viewer highlights its lane. Click the name to keep the highlight. To remove it, click the name again or right-click a channel name.
-- A stream connects with all of its channels enabled, shown in pages of up to 16. A stream with 16 channels or fewer fits on one page. To go to the next page, use the arrows in the **Channels** section of the plot, click the page label in the corner of the plot, or put the pointer on the plot and push Page Down. To change the page size, or to show all enabled channels at once, use **Paginate** in the **Channels** section.
-- A pause control, to examine a frozen window.
-- Dropouts show as gaps on the real timeline. The viewer does not join the data across the missing span.
-- **New combined plot** (View menu) shows channels of several streams in one plot, on one time axis. To add channels, select **Add...**, or drag a channel from a stream plot (a row of its **Channels** list or a lane name) to the combined plot. Each trace shows the filtered or the raw signal of its stream. As in a stream plot, the lanes show in pages of 16 (**Paginate** in the **Traces** section). The stream plot keeps the connection and the filters. If you close the stream plot, the lane stays in the combined plot and shows the data again when the stream connects again. Workspaces save the combined plots.
-- **Lock time axes** (View menu) applies one time window to all stream plots. The plots stay aligned, and they pan and zoom together. If a plot becomes difficult to read, **Reset view** in its panel puts it back to the default framing.
-- Marker and event streams show as labeled event lines on the time series. The **Marker events** log (View menu) also lists them as a scrolling `time  value` feed. Thus you can see the events when no continuous stream is running.
+- A stacked montage with one named lane for each channel, or a shared-axis overlay.
+- A raster (heatmap) mode for 32 to 256 channels or more.
+- Pages of channels, a gain for each channel, and an auto-fit.
+- Combined plots that show channels of several streams on one time axis.
+- Locked time axes, so that all plots pan and zoom together.
+- Dropouts that show as gaps at their real position in time.
+- Marker streams that show as labeled event lines, and as a log.
+
+See [View streams](docs/view-streams.md).
 
 ### Signal conditioning
 
-You can apply the filter stages in any combination. The spectrum, spectrogram, and zoomed views use the conditioned signal.
+- High-pass, mains notch (50 Hz or 60 Hz), and low-pass filters, in any combination.
+- Re-referencing to the common average (CAR) or to one channel.
 
-- High-pass (removes DC and drift), mains notch (50 Hz or 60 Hz), and low-pass.
-- Re-referencing to the common average (CAR) or to one reference channel. CAR averages the EEG channels only. It excludes EOG, EMG, and trigger channels, which it identifies from the channel metadata.
+The filters change the display only. A recording holds the raw data.
 
 ### Frequency-domain analysis
 
@@ -37,149 +41,90 @@ You can apply the filter stages in any combination. The spectrum, spectrogram, a
 |---|---|
 | ![FFT spectrum of two audio tones](docs/images/spectrum.png) | ![Spectrogram of a 1 Hz to 120 Hz chirp](docs/images/spectrogram.png) |
 
-- A PSD (in dB or linear units) for each selected channel.
-- A rolling STFT spectrogram with an adjustable frequency range. **Fit Hz** sets the range to the band that holds the signal energy. This helps when the sample rate is high compared to the signal of interest. Audio is an example, because the tones are much lower than the Nyquist frequency.
-- Both views can read the raw signal or the conditioned signal.
+- A PSD for each selected channel, in dB or linear units.
+- A rolling spectrogram with an adjustable frequency range.
 
 ### ERP and marker-aligned averaging
 
 ![ERP average with single-trial traces](docs/images/erp.png)
 
-- Epochs around the events from a marker stream, averaged across trials. The viewer draws the single-trial traces below the average.
-- Optional exact label matching. Give one label, such as `target`, or more than one label with a spaced pipe (` | `) between them, such as `start_a | start_b`.
-- One channel or many channels, and an erpimage view (trials by time, or channels by time).
+- Epochs around the events of a marker stream, averaged across trials, with the single-trial traces.
+- Optional selection of the events by label.
+- One channel or many channels, and a channels-by-time heatmap.
 
-### Recording
+See [Analyze signals](docs/analysis.md).
 
-- XDF recording of all connected streams. The files are compatible with LabRecorder, which was checked against LabRecorder output with `pyxdf`. The viewer keeps the raw timestamps and the clock-offset chunks, thus an importer can align the streams to a common clock.
-- Filename templates, such as `sub-{subject}_task-{task}_run-{run}_eeg.xdf`.
-- A headless CLI, `xdf_record`, that records without the GUI.
-- **Playback** (at the bottom of the Streams rail) plays a recording back as live streams in the viewer, at 0.5 to 20 times real time. Use it to check a recording right after you make it: all streams are present, there are no dropouts, and the markers are in the correct positions. Select **Open XDF file...** to start. Playback has a position slider, pause, speed, loop, and stop. In the stream list, the rows of the replayed streams show the samples sent and the samples in the file. Playback lists the file streams that are not in the viewer, and the warnings for a damaged file. A seek or a loop shows in the plots as a dashed blue line. The viewer does not show it as a dropout.
-- A CLI, `xdf_replay`, that replays an XDF file as live LSL streams, also faster than real time. Use it at the rig to check a recording right after you make it, for example with `xdf_replay rec.xdf --speed 10` and the viewer. Run `xdf_replay --help` for the options.
+### Recording and playback
 
-### Other
+- XDF recording of all connected streams. The files are compatible with LabRecorder.
+- Filename templates with BIDS fields, such as `sub-{subject}_task-{task}_run-{run}_eeg.xdf`.
+- Playback of a recording as live streams, at 0.5 to 20 times real time, to check a recording right after you make it.
+- Two command-line tools that need no GPU or display: `xdf_record` records, and `xdf_replay` replays.
 
-- A docking layout. The Streams rail is on the left. It holds the stream list, and below it the Recording and Playback sections, which stay in the same position when streams come and go. The plots and the analysis windows are tabs that you arrange. Each session starts with the default layout. To use a layout again in a different session, save it in a workspace.
-- Saved workspaces. A workspace holds the current view: the filters, channels, and gains for each stream, the open analysis windows, and the dock layout. A workspace does not hold the theme, the UI scale, or the recording settings, so loading a workspace does not change them. When you load a workspace, the viewer reconnects the streams that the workspace refers to (matched on source ID and name) and lists the streams that are not on the network. It holds the recording until those streams connect or you dismiss the notice.
-- Information for each stream: type, source ID, channels, sensor positions, and live counters for the measured rate, the clock offset, and the dropouts.
-- TCP remote control of the recording, with client libraries for Python, MATLAB, and Octave. See [Remote control](#remote-control).
-- A light theme and a dark theme. The viewer keeps the theme, the UI scale, and the recording folder and file name template between sessions.
+See [Record and replay](docs/record-and-replay.md).
 
-## Remote control
+### Remote control
 
-Turn on a control port with **App > Remote control**, or with `LSL_RC_PORT=22345`. While the port is on, the right side of the menu bar shows its address and the number of connected clients. A client then controls the recording over TCP. The commands end with a newline, and the replies are lines of readable text.
-
-The port binds to loopback (127.0.0.1) only. There is no authentication. To use the port from a different machine, turn on **App > Allow LAN access**, or set `LSL_RC_BIND=all`. Use trusted networks only. Up to four clients can connect at the same time.
-
-### Client libraries
-
-Use a client library instead of a raw socket. The libraries read the replies correctly, give an error when the viewer refuses a command, and copy a recording to your machine.
-
-- **Python:** [clients/python](clients/python/README.md). One file with no dependencies. Copy `lsl_viewer_rc.py` into your project, or install it:
-
-  ```sh
-  uv pip install "git+https://github.com/aforren1/lsl-viewer#subdirectory=clients/python"
-  ```
-
-- **MATLAB and GNU Octave:** [clients/matlab](clients/matlab/README.md). The same code runs in MATLAB R2019b or later and in Octave 6 or later. Add `clients/matlab` to the path.
-
-A script finds the streams, selects the streams it wants, fills the BIDS fields, records, and copies the file:
+A script can select the streams, set the file name, start and stop the recording, and copy the file, through a TCP port. Client libraries are available for Python, MATLAB, and GNU Octave.
 
 ```python
 import lsl_viewer_rc as rc
 
 with rc.Client("127.0.0.1", 22345) as viewer:
-    keys = [s.key for s in viewer.streams() if s.type in ("EEG", "Markers")]
-    viewer.select(keys)                 # An unknown key makes the viewer refuse all of them.
-    viewer.set(subject="01", session="01", task="posner", run=1)
-    viewer.start()                      # Returns when the file is open.
-    # Present the stimuli, and push the markers through LSL.
+    viewer.select("all")
+    viewer.set(subject="01", task="posner", run=1)
+    viewer.start()
+    # Present the stimuli here.
     viewer.stop()
-    viewer.get("data/")                 # Copy the .xdf file to this machine.
 ```
 
-```matlab
-rc = lslrc.Client('127.0.0.1', 22345);
-st = rc.streams();
-rc.select({st(strcmp({st.type}, 'EEG')).key});
-rc.set('subject', '01');
-rc.start();
-% Present the stimuli here.
-rc.stop();
-rc.get(pwd);                        % A folder: the file keeps its name.
-rc.close();
-```
+See [Control the recording from a script](docs/remote-control.md).
 
-### Protocol
+### Other
 
-Read this section if you write a client for a different language. The libraries above follow these rules.
+- A docking layout, and saved workspaces that hold the streams, the filters, the analysis windows, and the layout.
+- Information for each stream: the metadata, the measured rate, the clock offset, and the dropouts.
+- A light theme and a dark theme, and an adjustable UI scale.
 
-| Command | Reply |
-|---|---|
-| `streams` | Lists the streams that LSL can resolve. The header is `ok: <N> streams`. Then come N lines, one for each stream: `key \| name \| type \| <C>ch \| <rate>`. The rate is an integer or `irregular`. A connected stream has `  [rec]` at the end of its line. The first field is the key. |
-| `selected` | Lists the keys that are connected. These streams are the ones that get recorded. The header is `ok: <N> selected`. Then come N lines, one key on each line. |
-| `select all\|none\|<k1,k2,...>` | Selects the streams to connect and record. Each `key` is an identifier from `streams`. If a key is not a stream that the viewer can see, the viewer refuses the whole command. The command is also refused during a recording, because the set is locked until `stop`. |
-| `set <subject\|session\|task\|run\|acq\|modality> <value>` | Fills one field of the filename template. The reply is `ok`. |
-| `filename <path>` | Sets the output path or template directly. The reply is `ok`. |
-| `start [path]` and `stop` | Start and stop the recording. |
-| `get` | Sends the last completed recording to the client. The header is `ok: <bytes> <name>`. Then come exactly `<bytes>` of raw XDF. |
-| `status` | Shows the recording state on one line: `ok: recording=<true\|false> seconds=<s> streams=<n> bytes=<n> file=<path>`. |
-| `help` | Lists the commands. The header is `ok: <N> lines`. Then come N lines of text. |
-| `quit` | Closes the connection. The reply is `bye`. |
-
-The viewer uses protocol 2. When a client connects, the viewer sends one line: ``ok: lsl-viewer remote control, protocol 2. type `help`.`` Read the version from the text `protocol <N>`. If the line does not have this text, the viewer is too old for a protocol 2 client. If four clients are already connected, the viewer sends `error: too many control clients`, and then closes the connection.
-
-These rules apply to the replies:
-
-- The first line of a reply is `ok`, `ok: <text>`, or `error: <text>`. The only exception is `quit`.
-- The `streams`, `selected`, and `help` replies have a header line `ok: <N> <noun>`, then exactly N lines. There is no end marker. If there are no streams, the reply is `ok: 0 streams` and nothing more.
-- In the `status` reply, `file=` is always the last field. The path continues to the end of the line, and it can contain spaces. Split the text before `file=` on spaces, then take all the text after `file=` as the path.
-- In the `get` header, the name continues to the end of the line, and it can contain spaces. If `get` fails, the reply is one `error:` line and no data.
-- The `select`, `filename`, `set`, `start`, and `stop` replies are the same as in protocol 1, for compatibility with LabRecorder remote control clients.
-
-The `select`, `start`, and `stop` commands must go through the viewer. They do not reply until the viewer has done the work, thus the reply gives the result: `ok: recording -> /path/file.xdf`, or `error: no streams connected`. A `status` that comes after such a reply always shows the new state. If the viewer does not answer in 2 seconds, the reply is `error: the viewer did not respond`, and the command is discarded. Thus set the read timeout of your client to more than 2 seconds. For `get`, use a longer timeout, because a large file takes more time.
-
-### Discovery
-
-The viewer also announces the control endpoint through LSL, with the type `ViewerControl`. The client libraries do this for you: `rc.discover()` in Python (needs `pylsl`) and `lslrc.discover()` in MATLAB or Octave (needs liblsl-Matlab). To do it yourself, resolve it to get the host and the port instead of writing `22345` in your code. The `source_id` has the form `lsl-viewer-rc:<host>:<pid>:<port>`, thus the port is the text after the last colon. The host and the process ID make the identifier different for each viewer, because LSL uses `source_id` as the identity of a stream.
-
-```python
-from pylsl import resolve_byprop, StreamInlet
-
-for info in resolve_byprop("type", "ViewerControl", timeout=5.0):
-    port = int(info.source_id().rsplit(":", 1)[1])
-    desc = StreamInlet(info).info(timeout=3).desc()      # port, pid, bind, protocol, protocol_version
-    if desc.child_value("protocol_version") != "2":
-        continue                                         # A viewer that this client cannot talk to.
-    host = "127.0.0.1" if desc.child_value("bind") == "loopback" else info.hostname()
-```
-
-The description also has `protocol_version`. Use it to skip a viewer with a different protocol before you connect to it.
-
-Two things to know when you write a client:
-
-- **The port can move.** If port 22345 is in use, and you did not set `LSL_RC_PORT`, the viewer takes a port from the operating system and announces that one. Thus a second viewer on the same machine also has a control port. If you do set `LSL_RC_PORT`, the viewer uses that port or none, because a script that asks for a port must not get a different one.
-- **The host from `resolve` is not always the address to connect to.** A viewer that binds to loopback only is reachable at `127.0.0.1`, and only from the same machine, but LSL still reports the machine name. The `bind` field in the description says which: `loopback` or `all`.
-
-To examine the endpoint by hand, use `nc localhost 22345`.
+See [Workspaces and settings](docs/settings.md).
 
 ## System requirements
 
-The viewer renders through **SDL_GPU**, the GPU abstraction of SDL3. Thus it needs a GPU and a driver that support one of the SDL_GPU backends, and a desktop display server. The other requirements are small: a few hundred MB of RAM, and any recent multi-core CPU.
+The viewer needs a GPU, a driver for one of the graphics APIs below, and a desktop display. The other requirements are small: a few hundred MB of RAM, and a recent multi-core CPU.
 
-- **Windows:** Windows 10 or later (64-bit), with a GPU and driver that support **Direct3D 12**. If Vulkan is available, SDL_GPU uses Vulkan instead.
-- **macOS:** macOS 11 (Big Sur) or later, on a Mac with **Metal** support. This includes Apple Silicon Macs and Intel Macs with a Metal GPU. The `.app` and `.dmg` files are unsigned. For the first launch, right-click the app and select **Open**. On macOS 15 (Sequoia) and later, permit the local network when the system asks. If you refuse, the viewer finds no streams. See [docs/network.md](docs/network.md).
-- **Linux:** a **Vulkan** loader and driver (`libvulkan` and an ICD for your GPU), and **Wayland or X11**. The AppImage is the easiest way to run the viewer on different distributions.
+| System | Requirement |
+|---|---|
+| Windows | Windows 10 or later (64-bit), with Direct3D 12 or Vulkan. |
+| macOS | macOS 11 (Big Sur) or later, on a Mac with Metal support. |
+| Linux | A Vulkan driver, and Wayland or X11. The AppImage needs glibc 2.34 or later (for example Ubuntu 22.04 or Debian 12). |
 
-**Network:** LSL finds and reads the streams on the local network. It uses UDP broadcast and multicast to resolve the streams, and TCP to transfer the data. Thus the sources must be on the same subnet, and you can be required to permit the viewer through the firewall. The Windows installer adds the firewall rules for you. See [docs/network.md](docs/network.md) for the ports, for the portable build, and for what to do when the viewer finds no streams.
+The downloads are not code-signed. See the [tutorial](docs/getting-started.md#1-install-the-viewer) for the first launch.
 
-**Headless tools:** `xdf_record` and `xdf_replay` have no GPU or display requirements. They link only to liblsl, and the static musl builds for Linux run on all Linux distributions.
+**Network:** LSL finds the streams with UDP broadcast and multicast, and transfers the data with TCP. Thus the sources must be on the same subnet, and the firewall must permit the viewer. The Windows installer adds the firewall rules. On macOS 15 (Sequoia) and later, permit the local network when the system asks. If the viewer finds no streams, see [Troubleshooting](docs/troubleshooting.md).
+
+**Command-line tools:** `xdf_record` and `xdf_replay` have no GPU or display requirements. The static builds for Linux run on all Linux distributions.
 
 ## Documentation
 
-- [docs/building.md](docs/building.md): how to build, the CMake flags, the static and single-file builds, Windows, and the repository layout.
-- [docs/network.md](docs/network.md): the LSL ports, the firewall rules for each platform, the macOS local network permission, and what to do when the viewer finds no streams.
-- [DESIGN.md](DESIGN.md): the architecture and the reasons for it (the ring buffers, the threading, and the rendering path).
+The [documentation index](docs/README.md) lists all pages.
+
+| To do this | Read |
+|---|---|
+| Learn the viewer in ten minutes | [Get started](docs/getting-started.md) |
+| Set up plots, channels, filters, and markers | [View streams](docs/view-streams.md) |
+| Use the spectrum, the spectrogram, and the ERP | [Analyze signals](docs/analysis.md) |
+| Record, name the files, and replay | [Record and replay](docs/record-and-replay.md) |
+| Start the recording from an experiment script | [Control the recording from a script](docs/remote-control.md) |
+| Save a view, or find the files of the viewer | [Workspaces and settings](docs/settings.md) |
+| Correct a problem | [Troubleshooting](docs/troubleshooting.md) |
+| Look up a menu item, a variable, or an option | [Reference](docs/reference.md) |
+
+For developers and administrators:
+
+- [docs/technical/network.md](docs/technical/network.md): the LSL ports and the firewall rules for each platform.
+- [docs/technical/remote-control-protocol.md](docs/technical/remote-control-protocol.md): the TCP protocol of the remote control.
+- [docs/technical/building.md](docs/technical/building.md): how to build from source, the CMake flags, and the repository layout.
+- [DESIGN.md](DESIGN.md): the architecture and the reasons for it.
 
 ## Roadmap
 

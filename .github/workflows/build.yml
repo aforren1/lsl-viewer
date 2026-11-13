@@ -102,7 +102,7 @@ jobs:
         run: strip ${{ matrix.bindir }}/lsl_viewer ${{ matrix.bindir }}/xdf_record ${{ matrix.bindir }}/xdf_replay
 
       # Flat portable package: binaries + licenses + a portable.txt marker, so unzipping and
-      # running keeps config/recordings beside the executable (see docs/building.md).
+      # running keeps config/recordings beside the executable (see docs/settings.md).
       - name: Stage portable package
         shell: bash
         run: |

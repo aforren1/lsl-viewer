@@ -7,14 +7,14 @@ Target: Windows / macOS (incl. Apple Silicon) / Linux. C++20.
 > This is the original design brief. The architecture, ring-buffer, decimation, and
 > invariant sections below still describe the shipping code. The feature checklist near the
 > end has since been fully implemented; it is kept as a record of the original plan. For the
-> current file layout see [docs/building.md](docs/building.md); the source of truth is the code.
+> current file layout see [docs/technical/building.md](docs/technical/building.md); the source of truth is the code.
 
 ---
 
 ## Files in this repo
 
 The signal path lives in single-header modules under `src/` (each documented in
-[docs/building.md](docs/building.md)). The load-bearing ones for this brief:
+[docs/technical/building.md](docs/technical/building.md)). The load-bearing ones for this brief:
 
 | File | Notes |
 |------|-------|

@@ -2,12 +2,12 @@
 
 ## Prebuilt binaries
 
-Every push builds binaries on CI ([.github/workflows/build.yml](../.github/workflows/build.yml)) —
+Every push builds binaries on CI ([.github/workflows/build.yml](../../.github/workflows/build.yml)) —
 grab them from the run's **Artifacts**:
 
 - `lsl-viewer-linux` / `lsl-viewer-linux-aarch64` / `lsl-viewer-macos` / `lsl-viewer-windows`
   — self-contained (static) `lsl_viewer` + `xdf_record` + `xdf_replay` for each OS/arch, plus `LICENSE`,
-  `THIRD_PARTY_LICENSES`, and `portable.txt` (a [portable](#data-and-config-locations) build).
+  `THIRD_PARTY_LICENSES`, and `portable.txt` (a [portable](../settings.md#portable-mode) build).
 - `lsl-viewer-windows-installer` — **`lsl-viewer-setup.exe`**, an Inno Setup installer that
   drops the app into `Program Files` and uses the standard per-user locations.
 - `lsl-viewer-macos-dmg` — **`LSL-Viewer.dmg`**, a drag-to-Applications disk image with an
@@ -77,84 +77,31 @@ uv run tools/xdf_replay.py rec.xdf --streams type:EEG,type:Markers --start 60 --
 
 `xdf_replay` is the same tool as a compiled CLI. It is built with the viewer and in
 an `-DLSL_CLI_ONLY=ON` configure, and it needs no Python. It takes the same options
-and prints the same output. Use it at the rig to check a recording right after you
-make it, for example at 10 times real time with the viewer open:
+and prints the same output. The viewer can also replay a file itself, in the
+**Playback** section of the **Streams** rail, with the same engine. For how to use
+the two, see [Record and replay](../record-and-replay.md).
 
-```bash
-xdf_replay rec.xdf --list
-xdf_replay rec.xdf --speed 10
-```
+At a speed other than 1, `--timestamps scaled` gives the behavior of
+`tools/xdf_replay.py`: the spacing of the timestamps is divided by the speed. The
+default of the compiled tool is `recording`.
 
-At a speed other than 1, `--timestamps` sets how the timestamps follow the speed:
+The outlets are visible on the whole network, as for any LSL source. The liblsl
+configuration cannot make the outlets local only: `ResolveScope = machine` alone
+does not hide them from other hosts, and `ListenAddress = 127.0.0.1` hides them but
+also stops a resolver on the same machine that uses liblsl 1.17 (such as this
+viewer) from finding more than one of them. Use `--suffix` to keep the names apart
+from the live devices.
 
-- `recording` (default): the timestamps keep the recorded spacing. The viewer then
-  shows recording seconds on its time axis, dropouts with their recorded width, and
-  markers on the correct samples. The timestamps run ahead of `local_clock()`.
-- `scaled`: the spacing is divided by the speed, so the timestamps track
-  `local_clock()`. This is what `tools/xdf_replay.py` does. In the viewer, the
-  dropouts become narrower by the speed factor and the markers move away from
-  their samples.
-
-Each source_id gets the prefix `replay-` (`--source-id-prefix`). Thus a recorder
-or a viewer workspace that matches on the source_id does not take the replay for
-the live device.
-
-The outlets are visible on the whole network, as for any LSL source. A recorder
-that selects streams by name and host (LabRecorder's `RequiredStreams`) also
-selects a replay that runs on the host of the device. To prevent this, add a
-suffix to the names with `--suffix _replay`. The liblsl configuration cannot
-make the outlets local only: `ResolveScope = machine` alone does not hide them
-from other hosts, and `ListenAddress = 127.0.0.1` hides them but also stops a
-resolver on the same machine that uses liblsl 1.17 (such as this viewer) from
-finding more than one of them.
-
-At 10 times real time, the viewer's plot edge moves at the speed of the data, so
-the plots show the full time window while the replay runs.
-
-The viewer can also replay a file itself, with no terminal. In the **Playback**
-section at the bottom of the **Streams** rail, select **Open XDF file...** and
-then the file. The viewer creates the streams, shows them, and then starts the
-replay. It uses the same engine as `xdf_replay`, with `recording` timestamps.
-The **Playback** section has these controls:
-
-- The position slider. Release it to seek, or Ctrl+click it to type the seconds.
-  A seek shows in the plots as a dashed blue line. The viewer does not show a
-  seek as a dropout, because no data is missing from the file.
-- **Pause replay** stops the data until you select **Resume replay**. **Pause
-  display** (View menu, or the P key) only freezes the plots, and the replay
-  continues.
-- The speed (0.5 to 20 times real time) and **Loop**. A loop wrap also shows as a
-  dashed blue line.
-- **Stop** closes the streams and removes their plots. After a stop, **Replay
-  again** plays the same file from the start, and the close button (**×**)
-  removes the replay from the section.
-- The warnings for a damaged file. Select the warnings button to see the list.
-
-In the stream list, the rows of the replayed streams have a play mark and show
-two counts: the samples sent and the samples in the file. Hover over a row to
-see the type, the channels, the format, and the rate. Below the controls,
-**Playback** lists the file streams that are not in the viewer: `closed` if you
-disconnected the stream, or `not shown` if it did not connect.
-
-To open a file from a script, set `LSL_REPLAY` to its path. The viewer then opens
-the file at launch, as if you selected it in the dialog.
-
-By default the viewer waits for you to connect streams from the **Streams** rail;
-set `LSL_AUTOCONNECT=1` to auto-connect everything it discovers.
+For a scripted run, set `LSL_REPLAY` to the path of a file, and `LSL_AUTOCONNECT=1`
+to connect all streams that the viewer finds. For the other startup variables, see
+the [Reference](../reference.md#environment-variables).
 
 ## Data and config locations
 
-User data and app state are kept separate:
-
-- **Recordings** default to a visible user folder — `~/Documents/lsl-recordings` (falling back to
-  your home directory); change it per session in the Recording panel.
-- **Config and state** (`imgui.ini`, saved workspaces) go to the OS app-data directory:
-  `%APPDATA%\lsl_viewer\` (Windows), `~/Library/Application Support/lsl_viewer/` (macOS), or
-  `~/.local/share/lsl_viewer/` (Linux).
-
-**Portable mode** instead keeps everything together in a `lsl_viewer_data/` folder beside the
-executable — handy for a self-contained directory or a USB stick. Enable it with `LSL_PORTABLE=1`,
-or by dropping an empty `portable.txt` next to the binary (or next to the `.AppImage`).
+See [Where the viewer keeps its files](../settings.md#where-the-viewer-keeps-its-files)
+and [Portable mode](../settings.md#portable-mode). A `--tests` run always uses
+portable mode, thus it does not change the settings, the workspaces, or the
+recordings of the user.
 
 ## Recording conformance test
 
@@ -246,7 +193,7 @@ static Windows build is a genuinely standalone `lsl_viewer.exe`.
 On Linux the GPU driver and glibc stay dynamic regardless (SDL loads the Vulkan
 loader at runtime), so static linking buys less there — for distribution prefer the
 **AppImage** (the CI `appimage` job wraps the static build with a desktop entry + icon
-from [packaging/](../packaging/), built on an older glibc with both display backends).
+from [packaging/](../../packaging/), built on an older glibc with both display backends).
 The graphics driver is always a system component on both platforms.
 
 **Link-time optimization** is enabled automatically for `Release` builds (but not
@@ -308,4 +255,4 @@ Build trees (`build*/`), the Python venv (`.venv/`), captured screenshots
 (`output/`), recordings (`*.xdf`), and the persisted app settings (`imgui.ini`)
 are generated and git-ignored.
 
-See [DESIGN.md](../DESIGN.md) for the architecture and rationale.
+See [DESIGN.md](../../DESIGN.md) for the architecture and rationale.

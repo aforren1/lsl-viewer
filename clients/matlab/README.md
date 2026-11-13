@@ -13,7 +13,7 @@
 
 ## Quick start
 
-1. Start lsl-viewer with a control port. For example, set `LSL_RC_PORT=22345`, or enable the port in the Recording panel.
+1. Start lsl-viewer with a control port. For example, set `LSL_RC_PORT=22345`, or select **App > Remote control** in the viewer.
 2. Add the folder that contains `+lslrc` to the path:
 
    ```matlab

@@ -1,6 +1,6 @@
 # Verifying the remote-control server on Windows
 
-The recording remote-control server ([`src/remote_control.hpp`](../src/remote_control.hpp))
+The recording remote-control server ([`src/remote_control.hpp`](../../src/remote_control.hpp))
 is a small TCP server. It was rewritten to be cross-platform: a thin socket layer
 (`rc_socket_t` / `rc_close` / `RcWsaInit`) sits over **Winsock** on Windows and BSD
 sockets elsewhere, so the accept/recv/dispatch logic is shared. The POSIX path is
@@ -16,7 +16,7 @@ What's Windows-specific (i.e. what this is really testing):
   `INADDR_ANY`, port **22345** by default).
 
 Build is the usual native build (no special flags): `cmake -S . -B build
--DCMAKE_BUILD_TYPE=Release && cmake --build build`. See the README's Windows section.
+-DCMAKE_BUILD_TYPE=Release && cmake --build build`. See [building.md](building.md#windows).
 
 ---
 

@@ -11,7 +11,7 @@ For the LSL side of the subject, see the [LSL network connectivity guide](https:
 | 16571 | UDP | Service discovery. A resolver sends its query here as a broadcast, as a multicast, or as both, and each provider listens here and replies. |
 | 16572 to 16604 | TCP | Stream data. |
 | 16572 to 16604 | UDP | Service port for each outlet: clock synchronization, and replies about the stream. |
-| 22345 | TCP | The viewer remote-control port, if you turn it on. See the [Remote control](../README.md#remote-control) section. |
+| 22345 | TCP | The viewer remote-control port, if you turn it on. See [Control the recording from a script](../remote-control.md). |
 
 The viewer is both a consumer and a provider: it reads the streams, and it announces its own control endpoint as an LSL stream. Thus it needs the inbound rules that a source needs, not only the rules that a recorder needs.
 
@@ -127,7 +127,7 @@ Debian and Ubuntu leave `ufw` inactive, thus the AppImage needs no change. Fedor
 
 ### firewalld
 
-The repository has a service definition at [packaging/lsl.xml](../packaging/lsl.xml). Install it, and then add the service to your zone:
+The repository has a service definition at [packaging/lsl.xml](../../packaging/lsl.xml). Install it, and then add the service to your zone:
 
 ```sh
 sudo cp packaging/lsl.xml /etc/firewalld/services/
