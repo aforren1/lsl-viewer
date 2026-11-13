@@ -39,6 +39,10 @@ The viewer now publishes five synthetic streams and connects to them:
 
 Each data stream opens as a plot tab. A connected stream has `[on]` before its name in the rail.
 
+![The viewer window with the demo streams, a stream plot, and a spectrum](images/overview.png)
+
+The window in this image also has a spectrum, which you open in step 4.
+
 ## 3. Look at a stream
 
 1. In the rail, click `MockEEG`. The viewer brings its plot to the front.
@@ -64,6 +68,8 @@ The **Recording** section is below the stream list in the rail.
 3. After some seconds, select **Stop recording**.
 
 The recording holds all connected streams. The default folder is `Documents/lsl-recordings`.
+
+![The Streams rail with the Recording section](images/rail-recording.png)
 
 ## 6. Check the recording
 

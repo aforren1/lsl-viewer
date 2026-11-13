@@ -6,6 +6,8 @@ This guide shows how to record streams to an XDF file, how to name the files, an
 
 The **Recording** section is in the **Streams** rail, below the stream list.
 
+![The Streams rail with the Recording section and the filename fields](images/rail-recording.png)
+
 1. Connect the streams that you want to record. The viewer records all connected streams, and only those. There is no separate selection.
 2. Set the folder. Type it in the first field, or select **Browse**. The default is `Documents/lsl-recordings`.
 3. Set the file name. See [Name the files](#name-the-files).
@@ -83,6 +85,8 @@ Use **Playback** to check a recording right after you make it: all streams are p
 2. Select the file. The dialog opens in the recording folder.
 
 The viewer creates the streams of the file, connects to them, and starts the replay. The time axis of the plots shows the seconds of the recording.
+
+![The Streams rail during a replay, with the Playback controls](images/rail-playback.png)
 
 | Control | Effect |
 |---|---|

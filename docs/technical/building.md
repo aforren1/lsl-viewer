@@ -116,6 +116,41 @@ Locally it needs `LabRecorderCLI` on `PATH` and a built `xdf_record`:
 uv run tests/compare_labrecorder.py        # all mock streams, incl. 48 kHz audio
 ```
 
+## Documentation screenshots
+
+`tools/make_doc_screenshots.py` takes the screenshots of the usage pages and writes
+them to `docs/images/`. It starts a `-DLSL_VIEWER_TESTS=ON` build of the viewer with
+the built-in demo streams, and runs the `capture_readme` UI test. Thus it needs a
+GPU and a display, but no other process. Run it again after a change of the UI:
+
+```bash
+cmake -S . -B build-test -DLSL_VIEWER_TESTS=ON
+cmake --build build-test --config Release
+uv run tools/make_doc_screenshots.py                    # all shots
+uv run tools/make_doc_screenshots.py --shots plot,combined
+```
+
+| Shot | File | Page |
+|------|------|------|
+| `overview` | `overview.png` | [Get started](../getting-started.md) |
+| `plot` | `stream-plot.png` | [View streams](../view-streams.md) |
+| `combined` | `combined-plot.png` | [View streams](../view-streams.md) |
+| `markers` | `marker-events.png` | [View streams](../view-streams.md) |
+| `recording` | `rail-recording.png` | [Get started](../getting-started.md), [Record and replay](../record-and-replay.md) |
+| `playback` | `rail-playback.png` | [Record and replay](../record-and-replay.md) |
+
+To add a shot, add it to the usage-pages block of `capture_readme` in
+`tests/ui_tests.cpp`, and add its name to `SHOTS` in the script.
+
+The script limits LSL discovery to the local machine, so that other streams on the
+network do not show in the images. The window is 1280x800. To change the size, use
+`--window`.
+
+The script does not take the README images (`montage.png`, `spectrum.png`,
+`spectrogram.png`, `erp.png`, and `live.gif`). They need the streams of
+`tools/lsl_test_streams.py` and a larger display. The comment above `capture_readme`
+gives the commands.
+
 ## Optional CMake flags
 
 | Flag | Effect |
@@ -236,6 +271,7 @@ src/                     the viewer — one translation unit + header-only modul
 
 tools/                   standalone helpers (not linked into the viewer)
   lsl_test_streams.py      synthetic LSL sources for testing
+  make_doc_screenshots.py  takes the screenshots in docs/images/ for the usage pages
   xdf_replay.py            replays an XDF recording as live LSL outlets (reference implementation)
   xdf_replay.cpp           the same as a compiled CLI, on src/xdf_player.hpp (no GUI deps)
   xdf_record.cpp           headless XDF recorder CLI (no GUI deps)

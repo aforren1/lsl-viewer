@@ -15,6 +15,8 @@ The spectrum and the spectrogram have a **Filtered** checkbox.
 
 **View > New spectrum** shows the power spectral density (PSD) of one or more channels.
 
+![FFT spectrum of two audio tones](images/spectrum.png)
+
 1. In the **stream** list, select the stream.
 2. Select the channels in the list at the bottom of the strip. Use the filter field above the list to find a channel. **All** and **None** apply to the channels that the filter shows.
 
@@ -29,6 +31,8 @@ The spectrum and the spectrogram have a **Filtered** checkbox.
 ## Spectrogram
 
 **View > New spectrogram** shows how the spectrum of one channel changes with time.
+
+![Spectrogram of a 1 Hz to 120 Hz chirp](images/spectrogram.png)
 
 1. In the **stream** list, select the stream.
 2. In the **channel** list, select the channel.
@@ -46,6 +50,8 @@ The spectrogram needs a stream with a regular rate.
 ## ERP (marker-aligned average)
 
 **View > New ERP (marker average)** cuts epochs around the events of a marker stream, and shows the average of the epochs. The single-trial traces show below the average.
+
+![ERP average with single-trial traces](images/erp.png)
 
 The window needs one connected data stream with a regular rate and one connected marker stream.
 

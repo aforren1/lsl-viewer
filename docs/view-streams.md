@@ -34,6 +34,8 @@ The viewer resamples a data stream with an irregular rate to a regular rate when
 
 Each plot has a control strip on its left side. To give the plot the full width, select **< hide**. To show the strip again, select **>**.
 
+![A stream plot with the Display and Channels sections open](images/stream-plot.png)
+
 **Reset view** puts the time window, the gains, and the spacing back to the defaults. It does not change the filters or the selected channels.
 
 ### Select the display mode
@@ -48,6 +50,10 @@ Open **Display** in the control strip.
 | **Gain/lane** | The amplitude that one lane height shows, in the unit of the stream. Stacked montage only. |
 | **Spacing** | The vertical distance between the channels. Overlay only. |
 | **Line width** | The width of the traces. |
+
+This image shows a stacked montage beside a raster of 128 channels:
+
+![Stacked montage of slow drift channels beside a 128-channel raster](images/montage.png)
 
 In overlay mode, zoom and pan the Y axis with the mouse. Double-click the plot to fit the axis to the data again.
 
@@ -113,11 +119,22 @@ A combined plot shows channels of different streams on one time axis.
 1. Select **View > New combined plot**.
 2. Select **Add...**, then the stream and the channels. As an alternative, drag a channel from a stream plot to the combined plot. You can drag a row of the **Channels** list or a lane name.
 
-The **Traces** section lists the traces. Drag a row to change the sequence. **fit** scales one lane to its visible range. **x** removes the trace.
+![A combined plot with channels of three streams](images/combined-plot.png)
+
+The **Traces** section lists the traces. Each row has these controls:
+
+| Control | Effect |
+|---|---|
+| Drag the row | Changes the sequence of the lanes. |
+| **filt** / **raw** | Changes between the filtered signal, with the filters of the stream plot, and the raw signal. |
+| **fit** | Scales the lane to its visible range. |
+| **x** | Removes the trace. |
+
+As in a stream plot, the lanes show in pages of 16. Use **Paginate** and **per page** to change this.
 
 In the **Display** section, **Stacked lanes** gives each trace its own lane. When it is off, the traces overlay each other, with one Y axis for each unit.
 
-Each trace shows what its stream plot shows: the filtered signal if a filter is on, and the raw signal if not. The stream plot keeps the connection and the filters. If you close the stream plot, the lane stays in the combined plot, and it shows data again when the stream connects again.
+The stream plot keeps the connection and the filters. If you close the stream plot, the lane stays in the combined plot, and it shows data again when the stream connects again.
 
 [Workspaces](settings.md#workspaces) save the combined plots.
 
@@ -130,6 +147,8 @@ To select which marker streams a plot shows, open **Markers** in the control str
 ### The Marker events log
 
 **View > Marker events** opens a log of the events of each marker stream. You can use the log when no data stream is connected.
+
+![The Marker events log](images/marker-events.png)
 
 | Control | Effect |
 |---|---|

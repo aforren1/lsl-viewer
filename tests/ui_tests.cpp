@@ -2289,6 +2289,8 @@ void RegisterAppTests(ImGuiTestEngine* e) {
     //   ffmpeg -i readme_live.mp4 -vf "trim=start_frame=2:end_frame=74,setpts=PTS-STARTPTS,
     //     scale=800:500:flags=lanczos,split[a][b];[a]palettegen=stats_mode=full[p];
     //     [b][p]paletteuse=dither=sierra2_4a" -r 12 -loop 0 live.gif
+    // The same list also takes the images of the usage pages (see the block in the test), which
+    // tools/make_doc_screenshots.py runs and copies to docs/images/.
     t = IM_REGISTER_TEST(e, "ui", "capture_readme");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         const char* shotsEnv = std::getenv("LSL_README_SHOTS");
@@ -2324,12 +2326,12 @@ void RegisterAppTests(ImGuiTestEngine* e) {
             ctx->MouseMoveToPos(ImVec2(ImGui::GetMainViewport()->WorkSize.x - 5.0f, 5.0f));
             ctx->Yield(3);
         };
-        auto shot = [&](const char* window, const char* name) {
+        auto shot = [&](ImGuiTestRef window, const char* name) {   // empty ref: the whole viewport
             parkMouse();
             ctx->CaptureReset();
             std::snprintf(ctx->CaptureArgs->InOutputFile, sizeof ctx->CaptureArgs->InOutputFile,
                           "output/captures/readme_%s.png", name);
-            ctx->CaptureAddWindow(window);
+            if (!window.IsEmpty()) ctx->CaptureAddWindow(window);
             ctx->CaptureScreenshot(ImGuiCaptureFlags_HideMouseCursor);
         };
         auto newWindow = [&](const char* menu, const char* prefix) {
@@ -2369,6 +2371,92 @@ void RegisterAppTests(ImGuiTestEngine* e) {
             return true;
         };
 
+        // The images of the usage pages in docs/: overview, plot, combined, markers, recording,
+        // playback. These run on the built-in demo streams (LSL_DEMO=1), which connect themselves,
+        // so tools/make_doc_screenshots.py can take them with no other process. Each shot leaves
+        // the view as the next one expects it, so the order here is the order they are taken in.
+        if (want("overview") || want("plot") || want("combined") || want("markers") ||
+            want("recording") || want("playback")) {
+            auto have = [&](const char* w) { return ctx->GetWindowByRef(w) != nullptr; };
+            if (!waitFor([&] { return have("//MockEEG") && have("//MockChirp") && have("//MockAudio") &&
+                                      have("//MockEvoked"); }, 20.0)) {
+                IM_ERRORF("%s", "the demo streams did not connect: set LSL_DEMO=1");
+                return;
+            }
+            pause(2.0);                                   // the marker stream opens no window to wait on
+            ctx->SetRef("//Streams");                     // the rail would show this machine's folder
+            ctx->ItemInputValue("##recdir", "");
+            if (want("recording")) {
+                ctx->ItemOpen("filename fields");
+                shot("//Streams", "recording");
+                ctx->SetRef("//Streams");
+                ctx->ItemClose("filename fields");
+            }
+            if (want("overview") || want("plot")) {
+                const std::string spectrum = newWindow("New spectrum", "Spectrum ");
+                if (!bindSpectrum(spectrum, "MockAudio")) return;
+                if (!openHeaders("MockEEG", {"Display"})) return;
+                ctx->ItemCheck("High-pass");              // else the drift takes the lanes off center
+                pause(11.0);                              // fill the 10 s history
+                if (!cfgOf(spectrum)) return;
+                ctx->ItemClick("Fit Hz");
+                ctx->WindowFocus("//MockEEG");
+                if (want("overview")) shot(ImGuiTestRef(), "overview");
+                ctx->WindowClose(spectrum.c_str());       // the plot then has the full height
+                ctx->Yield(3);
+                if (want("plot")) {
+                    if (!openHeaders("MockEEG", {"Channels"})) return;
+                    ctx->ScrollToTop(ctx->GetRef());      // the cfg child scrolled down to reach it
+                    shot("//MockEEG", "plot");
+                }
+            }
+            if (want("combined")) {
+                ctx->MenuClick("//##MainMenuBar/View/New combined plot");
+                ctx->Yield(3);
+                ImGuiWindow* w = newestCombinedWindow();
+                if (w == nullptr) { IM_ERRORF("%s", "no combined plot window"); return; }
+                ctx->SetRef(w);
+                ImGuiTestItemInfo cfg = ctx->WindowInfo("cfg");
+                if (cfg.Window == nullptr) { IM_ERRORF("%s", "no cfg child in the combined plot"); return; }
+                combinedAdd(ctx, cfg.Window, "MockEEG", "Cz");
+                combinedAdd(ctx, cfg.Window, "MockEEG", "Pz");
+                combinedAdd(ctx, cfg.Window, "MockChirp", "chirp");
+                combinedAdd(ctx, cfg.Window, "MockEvoked", "Cz");
+                ctx->SetRef(cfg.Window);
+                ctx->ItemOpen("Traces");
+                ctx->WindowFocus(w->ID);
+                pause(11.0);                              // fill the 10 s history
+                shot(w->ID, "combined");
+                ctx->WindowClose(w->ID);
+            }
+            if (want("markers")) {
+                ctx->MenuCheck("//##MainMenuBar/View/Marker events");
+                ctx->Yield(2);
+                ctx->SetRef("//Marker events");
+                if (!ctx->ItemExists("**/Clear all")) { IM_ERRORF("%s", "no marker stream connected"); return; }
+                ctx->ItemOpen("**/###mk");
+                pause(1.0);
+                shot("//Marker events", "markers");
+            }
+            if (want("playback")) {
+                // The rail shows the file name, so give the file a name a recording would have.
+                const std::filesystem::path file =
+                    std::filesystem::temp_directory_path() / "sub-P001_ses-S001_task-Default_run-001_eeg.xdf";
+                writeReplayTestFile(file.string());
+                lslViewerRequestReplay(file.string().c_str());
+                const bool playing = waitFor([] { const auto p = replayProbe();
+                                                  return p.state == (int)XdfPlayer::State::playing && p.shown == 2; }, 15.0);
+                if (!playing) IM_ERRORF("%s", "the replay did not start");
+                pause(3.0);                               // some samples sent, for the counts in the rows
+                if (playing) shot("//Streams", "playback");
+                ctx->SetRef("//Streams");
+                ctx->ItemClick("Stop");
+                waitFor([] { return replayProbe().shown == 0; }, 3.0);
+                ctx->ItemClick("###replayclose");
+                ctx->Yield(3);
+                std::error_code ec; std::filesystem::remove(file, ec);
+            }
+        }
         if (want("montage") || want("spectrum")) {
             // The tab order is the connect order.
             if (!connect("mock-hd", "MockHighDensity") || !connect("mock-eeg", "MockEEG") ||
